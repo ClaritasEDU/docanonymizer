@@ -169,7 +169,7 @@ select {
   background: var(--bg-inset); color: var(--text-dim);
   border: 1px solid var(--border); cursor: not-allowed;
 }
-.btn:focus-visible, select:focus-visible, input:focus-visible, .tab:focus-visible {
+.btn:focus-visible, select:focus-visible, input:focus-visible, .tab:focus-visible, .placeholder:focus-visible {
   outline: 2px solid var(--border-focus); outline-offset: 1px;
 }
 
@@ -240,14 +240,16 @@ select {
   color: var(--warning); font-size: 10px;
   letter-spacing: 0.06em;
 }
-.pii-row input[type=checkbox] {
+.pii-row input[type=checkbox],
+.key-row input[type=checkbox] {
   appearance: none; -webkit-appearance: none;
   width: 14px; height: 14px;
   border: 1px solid var(--border); background: var(--bg-inset);
   position: relative; margin: 0;
   cursor: pointer;
 }
-.pii-row input[type=checkbox]:checked::after {
+.pii-row input[type=checkbox]:checked::after,
+.key-row input[type=checkbox]:checked::after {
   content: ""; position: absolute; inset: 2px; background: var(--text-primary);
 }
 
@@ -320,7 +322,7 @@ select {
 }
 .placeholder:hover { background: rgba(255, 170, 0, 0.12); }
 
-.preview-actions { display: flex; gap: 12px; align-items: center; margin-top: 14px; }
+.preview-actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 14px; }
 .preview-actions .grow { flex: 1; }
 .preview-hint { color: var(--text-secondary); font-size: 12px; }
 
@@ -330,6 +332,7 @@ select {
   padding: 14px;
   font-size: 13px; line-height: 1.7;
 }
+.results { overflow-x: auto; }   /* ASCII table scrolls inside its box, never the page */
 .results > div { white-space: pre; }
 .results .rule { color: var(--text-dim); }
 .results .verified { color: var(--success); }
@@ -355,6 +358,7 @@ select {
   border-radius: 0;
 }
 .screen-text:focus { outline: 2px solid var(--border-focus); outline-offset: 1px; }
+.screen-text.tabular { white-space: pre; overflow-x: auto; tab-size: 4; }
 
 /* ---------- Manager panels ---------- */
 .panel {
@@ -409,6 +413,39 @@ textarea:focus-visible { outline: 2px solid var(--border-focus); }
 
 /* ---------- Output ext note + warnings ---------- */
 .note { color: var(--warning); font-size: 12px; margin-top: 8px; }
+.note-plain { color: var(--text-secondary); font-size: 12px; margin-top: 10px; }
+.errline { color: var(--danger); font-size: 12px; margin-top: 12px; white-space: pre-wrap; }
+.sub { color: var(--text-secondary); font-size: 12px; }
+
+/* ---------- Unanonymize: key picker + restore ---------- */
+.key-list {
+  background: var(--bg-surface); border: 1px solid var(--border);
+  max-height: 260px; overflow-y: auto;
+}
+.key-list .empty { color: var(--text-secondary); font-size: 12px; padding: 12px; }
+.key-row {
+  display: grid; grid-template-columns: 14px 1fr auto;
+  column-gap: 12px; align-items: center;
+  padding: 7px 12px; border-bottom: 1px solid var(--border);
+  font-size: 12px; cursor: pointer;
+}
+.key-row:last-child { border-bottom: none; }
+.key-row .file { color: var(--text-primary); word-break: break-all; }
+.key-row .meta { color: var(--text-secondary); font-size: 11px; word-break: break-all; }
+.key-row .count { color: var(--text-primary); text-align: right; white-space: nowrap; }
+.key-row .legacy { color: var(--warning); font-size: 10px; letter-spacing: 0.06em; display: block; text-align: right; }
+.key-row input[type=checkbox]:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 1px; }
+.restore-input { min-height: 160px; }
+label.btn { user-select: none; }
+.results .unresolved { color: var(--warning); }
+
+/* ---------- Narrow screens ---------- */
+@media (max-width: 600px) {
+  main { padding: 16px 16px 40px; }
+  .pii-grid { grid-template-columns: 1fr; }
+  .pii-row { grid-template-columns: 96px 1fr auto; }
+  .form { grid-template-columns: 1fr; }
+}
 
 /* ---------- Misc ---------- */
 .hidden { display: none !important; }

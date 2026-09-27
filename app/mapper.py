@@ -1,23 +1,32 @@
 """Entity registry + replacement map.
 
-Implements PRD 5.1-5.3:
-  - 4-char uppercase hex IDs, range 0000-FFFF, unique across all tag types
-  - Same hex suffix shared across tag types for the same real-world entity
-  - Replacement order: sort by string length descending before applying
+Identifier rules (owner decision 2026-09-27, supersedes PRD 5.1-5.2 v1.3):
+  - Every distinct original value gets its own 12-char uppercase hex ID:
+    `[PERSON_3A4F9C2B1D0E]`, `[EMAIL_7C1B0A94E2D3]`.
+  - No ID is ever shared between two values and no ID is ever reused - not
+    within a file, not across files (see ids.py for how that is enforced).
+    One ID points back to exactly one original, so restoring AI output can
+    never mix up people, addresses, or contact details.
+  - The same exact value repeated anywhere in the document keeps one ID, so
+    counts and joins still work for analysis.
+  - When the model says a value belongs with an already-seen one (Jane's
+    email -> Jane), that relationship is recorded in the key file as
+    `linked_to`. It is never expressed by sharing an ID.
+  - Replacement order: longest original first (see replacer.py).
 
 Public surface:
-    EntityRegistry()         - in-memory accumulator
+    EntityRegistry(reserved=set())   - in-memory accumulator
     .add(text, tag, linked_to=None)  -> placeholder string
-    .as_replacement_map()    -> dict[original -> placeholder]
-    .as_serializable()       -> dict for the key file payload
+    .as_replacement_map()            -> dict[original -> placeholder]
+    .as_serializable()               -> dict for the key file payload
 """
 
 from __future__ import annotations
 
-import secrets
 from dataclasses import dataclass, field
 from typing import Optional
 
+from . import ids
 from .logging_setup import get_logger
 
 log = get_logger("mapper")
@@ -32,34 +41,39 @@ TAG_ORDER = [
 VALID_TAGS = set(TAG_ORDER)
 
 
-def _new_hex(used: set[str]) -> str:
-    """Generate a 4-char uppercase hex id not in `used`. 65,536 slots."""
-    if len(used) >= 0xFFFF + 1:
-        raise RuntimeError("hex id space exhausted (>65535 entities)")
-    while True:
-        candidate = f"{secrets.randbelow(0x10000):04X}"
-        if candidate not in used:
-            return candidate
-
-
 @dataclass
 class EntityRegistry:
-    # hex_id -> {tag: original_text}
+    # IDs already spoken for outside this session (key files + ledger).
+    reserved: set[str] = field(default_factory=set)
+    # hex_id -> {tag: original_text}. One original per ID; a second tag on the
+    # same text is recorded here too (first tag drives the placeholder).
     entities: dict[str, dict[str, str]] = field(default_factory=dict)
     # original_text -> placeholder (what the scrubber applies)
     replacements: dict[str, str] = field(default_factory=dict)
-    # original_text -> hex_id (so we never re-issue ids for repeats)
+    # original_text -> hex_id (so repeats keep their ID)
     text_to_hex: dict[str, str] = field(default_factory=dict)
+    # hex_id -> hex_id of the value the model linked it to
+    links: dict[str, str] = field(default_factory=dict)
 
-    def _used_ids(self) -> set[str]:
-        return set(self.entities.keys())
+    def _taken(self, candidate: str) -> bool:
+        return candidate in self.entities or candidate in self.reserved
+
+    def _resolve_link(self, linked_to: Optional[str]) -> Optional[str]:
+        if not linked_to:
+            return None
+        link = linked_to.strip()
+        up = link.upper()
+        if up in self.entities:
+            return up
+        if link in self.text_to_hex:
+            return self.text_to_hex[link]
+        return None
 
     def add(self, text: str, tag: str, linked_to: Optional[str] = None) -> str:
-        """Register a PII span. Returns the placeholder string (e.g. `[PERSON_3A4F]`).
+        """Register a PII span. Returns the placeholder (e.g. `[PERSON_3A4F9C2B1D0E]`).
 
-        `linked_to` may be either:
-          - a hex id (`"3A4F"`) to bind to an existing entity, or
-          - a previously-seen text value to look up.
+        `linked_to` may be an existing ID or a previously-seen text value. It
+        is recorded as a relationship only - the new value still gets its own ID.
         """
         if tag not in VALID_TAGS:
             raise ValueError(f"unknown tag: {tag}")
@@ -75,30 +89,19 @@ class EntityRegistry:
             self.entities.setdefault(hex_id, {}).setdefault(tag, text)
             return self.replacements[text]
 
-        # Resolve a hex id.
-        hex_id: Optional[str] = None
-        if linked_to:
-            link = linked_to.strip().upper()
-            if len(link) == 4 and all(c in "0123456789ABCDEF" for c in link):
-                if link in self.entities:
-                    hex_id = link
-            elif linked_to in self.text_to_hex:
-                hex_id = self.text_to_hex[linked_to]
-
-        if hex_id is None and text in self.text_to_hex:
-            # Same exact text already seen under a different tag.
-            hex_id = self.text_to_hex[text]
-        if hex_id is None:
-            hex_id = _new_hex(self._used_ids())
-
+        hex_id = ids.new_id(self._taken)
         placeholder = f"[{tag}_{hex_id}]"
-        self.entities.setdefault(hex_id, {})[tag] = text
+        self.entities[hex_id] = {tag: text}
         self.replacements[text] = placeholder
         self.text_to_hex[text] = hex_id
+
+        target = self._resolve_link(linked_to)
+        if target and target != hex_id:
+            self.links[hex_id] = target
         return placeholder
 
     def as_replacement_map(self) -> dict[str, str]:
-        """Sorted longest-first to prevent partial-match collisions in the scrubber."""
+        """Sorted longest-first (the order the key file has always used)."""
         return dict(sorted(self.replacements.items(), key=lambda kv: -len(kv[0])))
 
     def counts_per_type(self) -> dict[str, int]:
@@ -118,10 +121,13 @@ class EntityRegistry:
         """Build the entity_registry block used in the key file (PRD 5.7)."""
         out: dict[str, dict] = {}
         for hex_id, by_tag in self.entities.items():
-            out[hex_id] = {
+            rec: dict = {
                 "types": sorted(by_tag.keys()),
                 "values": dict(by_tag),
             }
+            if hex_id in self.links:
+                rec["linked_to"] = self.links[hex_id]
+            out[hex_id] = rec
         return out
 
     def merge_chunks(self, raw_items: list[dict]) -> None:
@@ -130,8 +136,14 @@ class EntityRegistry:
         Each item: {"text": str, "type": str, "linked_to": str | None}
         """
         for item in raw_items:
-            text = (item.get("text") or "").strip()
-            tag = (item.get("type") or "").strip().upper()
+            if not isinstance(item, dict):
+                continue
+            text = (item.get("text") or "")
+            tag = (item.get("type") or "")
+            if not isinstance(text, str) or not isinstance(tag, str):
+                continue
+            text = text.strip()
+            tag = tag.strip().upper()
             link = item.get("linked_to")
             if not text or tag not in VALID_TAGS:
                 continue
@@ -146,11 +158,10 @@ class EntityRegistry:
             return False
         hex_id = self.text_to_hex.pop(original_text, None)
         self.replacements.pop(original_text, None)
-        if hex_id and hex_id in self.entities:
-            # Strip whichever tags pointed at this exact text.
-            self.entities[hex_id] = {
-                t: v for t, v in self.entities[hex_id].items() if v != original_text
-            }
-            if not self.entities[hex_id]:
-                del self.entities[hex_id]
+        if hex_id:
+            self.entities.pop(hex_id, None)
+            self.links.pop(hex_id, None)
+            # Nothing may point at an ID that no longer exists.
+            for k in [k for k, v in self.links.items() if v == hex_id]:
+                del self.links[k]
         return True

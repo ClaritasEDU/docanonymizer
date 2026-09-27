@@ -130,10 +130,10 @@ The aesthetic is terminal-esque, black and white. Think `htop` or a monochrome I
 
 ## Key Business Rules (Do Not Break)
 
-1. Same hex suffix links all PII for the same entity: `[PERSON_3A4F]`, `[EMAIL_3A4F]`, `[PHONE_3A4F]`
-2. Hex identifiers are 4-character uppercase hex: `0000` to `FFFF`
-3. Replacement order: sort by string length descending before applying (prevents partial matches)
-4. All replacements must be reversible via the key file - unanonymize must restore exactly
+1. Every distinct PII value gets its own identifier: `[PERSON_3A4F9C2B1D0E]`, `[EMAIL_7C1B0A94E2D3]`. An identifier is NEVER shared by two values and NEVER reissued - not within a file, not across files (enforced against every key in `/keys` plus `keys/issued_ids.ledger`). This replaced the v1.3 shared-suffix rule on 2026-09-27 (owner decision) because a shared suffix makes AI output ambiguous to restore. Relationships the model reports (Jane's email belongs to Jane) are recorded as `linked_to` in the key file, never by sharing an ID.
+2. Identifiers are 12-character uppercase hex with at least one letter and one digit, and never digits-E-digits (Excel scientific notation)
+3. Replacement is single-pass, leftmost-longest (longest original wins at a position), and never rewrites inside an existing placeholder. Short numbers (no letters, under 7 digits) match only as whole numbers
+4. All replacements must be reversible via the key file - unanonymize must restore exactly, including AI output where the identifiers were lowercased, un-bracketed, markdown-escaped, relabeled, or reduced to the bare hex. Anything that cannot be resolved is reported, never guessed
 5. Key file records: session ID, original filename, endpoint used, model used, full replacement map, entity registry
 6. Preview is mandatory - user must confirm before any file is written. No skip path.
 7. Output file is always freshly constructed - never a modified copy of the original binary

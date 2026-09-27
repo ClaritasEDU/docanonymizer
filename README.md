@@ -41,6 +41,21 @@ python run.py
 
 Then open `http://localhost:5000`.
 
+---
+
+## The AI round trip
+
+1. **ANONYMIZE tab:** drop a spreadsheet (or any document), click `[ DETECT PII ]`, review the preview, click `[ CONFIRM AND SCRUB ]`.
+2. Every name, email, phone, and address is now a unique 12-character identifier like `[PERSON_3A4F9C2B1D0E]`. The verified output appears on screen.
+3. Click `[ COPY FOR AI ]` and paste into ChatGPT, Claude, or any AI tool. The copy starts with one sentence asking the AI to keep identifiers exactly as written.
+4. **UNANONYMIZE tab:** paste the AI's answer (or drop the file it gave you) and click `[ RESTORE TEXT ]` / `[ RESTORE FILE ]`. Every identifier becomes the real value again.
+
+Notes:
+
+- Leave all keys selected. Identifiers are never reused across files, so restoring against every key is safe, and it means you never have to remember which key goes with which answer.
+- The AI can lowercase identifiers, drop the brackets, escape them, relabel them (`[DONOR_...]`), or keep only the hex - all of those restore. Anything the keys can't resolve is listed in red and left as-is, never guessed.
+- To restore on another machine, copy the `.key.json` over and use `[ IMPORT KEY FILE ]`.
+
 The first time the app starts, it writes a default `endpoints.json` pointing at `http://localhost:11434` (Ollama). Use the `[ MANAGE ENDPOINTS ]` panel in the UI to add or change endpoints.
 
 ---
@@ -71,11 +86,14 @@ The test suite mocks the LLM and runs against an isolated temp directory. No net
     extractors.py        # per-format text extraction
     chunker.py           # token-aware chunking
     detector.py          # LLM detection orchestrator
-    mapper.py            # entity registry, hex IDs, replacement map
+    ids.py               # 12-char ID generation + uniqueness ledger
+    mapper.py            # entity registry, one unique ID per value, replacement map
+    replacer.py          # single-pass replacement engine (used by scrub, verify, preview)
+    restorer.py          # tolerant identifier matching for AI output
     scrubber.py          # surface replace + deep ZIP scrub
     verifier.py          # post-scrub verification (map + regex)
-    key_files.py         # key file save/load
-    unanonymize.py       # reverse pipeline
+    key_files.py         # key file save/load/list/import
+    unanonymize.py       # file restore pipeline
     github_mgr.py        # GitHub connections + push
     pipeline.py          # session orchestrator
   static/
@@ -84,7 +102,7 @@ The test suite mocks the LLM and runs against an isolated temp directory. No net
   templates/
     index.html           # single-page app shell
   tests/                 # pytest suite (LLM mocked)
-  uploads/  output/  keys/   # runtime data (gitignored)
+  uploads/  output/  keys/   # runtime data (gitignored); keys/ also holds issued_ids.ledger
   endpoints.json  github.json  anonymizer.log   # runtime config + log (gitignored)
 ```
 

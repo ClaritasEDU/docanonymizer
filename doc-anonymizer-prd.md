@@ -1,5 +1,5 @@
 # PRD: Local Document Anonymizer
-**Version:** 1.3  
+**Version:** 1.4 (2026-09-27: unique 12-char identifiers, AI round trip - sections 4.5, 5.1-5.3, 5.5, 5.7, 5.8)  
 **Status:** Ready for Build  
 **Target:** Claude Code
 
@@ -20,7 +20,8 @@ A single user (or small team) who needs to sanitize sensitive documents before s
 ## 3. User Stories
 
 - As a user, I want to drop in a PDF, Word doc, Excel, or CSV file and receive a clean copy with all PII replaced by consistent, labeled placeholders.
-- As a user, I want the same person's name, email, and phone to share a linked identifier so I can still analyze data patterns without exposing identities.
+- As a user, I want every name, email, phone, and address to get its own unique identifier that is never reused, so nothing can be mixed up when I restore.
+- As a user, I want to paste the anonymized output into any AI tool, bring the AI's answer back, and have every identifier turned back into the real value - even if the AI changed the brackets, case, or label.
 - As a user, I want to download the anonymized file in its original format (not converted to plain text).
 - As a user, I want to save a local key file so I can unanonymize a document at any time without depending on any external service.
 - As a user, I want to configure multiple local LLM endpoints and choose which one to use for each session.
@@ -91,11 +92,12 @@ Processing pipeline in order:
 7. **Output** - save anonymized file locally; save key file; offer download and optional GitHub push
 8. **Summary** - display count of replacements per PII type, verification result, processing time
 
-### 4.5 Unanonymize Mode
-- User uploads a previously anonymized document
-- User selects the matching key file from their local filesystem
-- App reverses all replacements
-- Outputs restored document in original format
+### 4.5 Unanonymize Mode (restore AI output)
+- **Keys:** a picker lists every saved key in `/keys` (original file, date, ID count). Current-format keys are selected by default - IDs never overlap across keys, so restoring against all of them is safe. Legacy 4-char keys are flagged `[LEGACY 4-CHAR]` and opt-in. `[ IMPORT KEY FILE ]` copies a key from another machine into `/keys`.
+- **Input A - paste text:** the AI's answer pasted into a text box. Restored on screen with `[ COPY ALL ]` and `[ DOWNLOAD .TXT ]`. Nothing is written to disk.
+- **Input B - a file:** the file the AI gave back (.txt .md .csv .xlsx .docx and the other supported formats) or the anonymized file itself. Output keeps the input's format: `{input_name}_restored.{ext}` (an `_anon_<session>` suffix is dropped). Restoring never strips the file's comments or metadata.
+- **Tolerant matching (see 5.8):** exact, lowercased, markdown-escaped, un-bracketed, relabeled, and bare-hex identifiers all restore.
+- **Report:** count restored per type; how many were relabeled by the AI or appeared as a bare ID (restored by ID); every unresolved identifier listed and left as-is; for files, any identifier that could not be written back (`residual`).
 - Never requires network access
 
 ### 4.6 Key File Management
@@ -173,32 +175,25 @@ Each connection stores:
 ## 5. Business Rules and Logic
 
 ### 5.1 Identifier Format
-- Format: `[TAG_XXXX]` where XXXX is a 4-character uppercase hexadecimal string
-- Range: `0000` to `FFFF` = 65,536 unique identifiers per PII type
-- Examples: `[PERSON_3A4F]`, `[EMAIL_3A4F]`, `[PHONE_7C1B]`, `[ADDRESS_002D]`
+- Format: `[TAG_XXXXXXXXXXXX]` where the suffix is 12 uppercase hexadecimal characters (48 bits)
+- Every ID contains at least one letter A-F and at least one digit (never mistaken for a number or a word in AI output), and never has the shape digits-E-digits (Excel would read it as scientific notation)
+- Examples: `[PERSON_3A4F9C2B1D0E]`, `[EMAIL_7C1B0A94E2D3]`, `[ADDRESS_0D1E2F3A4B5C]`
+- Where brackets are illegal (spreadsheet sheet names and the formula references to them) the bracket-free form is used: `ORG_B9442179E0EE`
+- v1.3 used 4-char IDs; those keys still restore (5.8)
 
-### 5.2 Entity Linking (Critical Rule)
-When the same real-world entity appears in multiple PII categories, all placeholders for that entity share the same hex suffix.
+### 5.2 Uniqueness (Critical Rule)
+**Owner decision 2026-09-27 - supersedes v1.3 entity linking.** v1.3 gave all of an entity's PII one shared suffix (`[PERSON_3A4F]`, `[EMAIL_3A4F]`). That made AI output ambiguous to restore (an answer citing just the ID could mean the name or the email) and could give two name variants one placeholder. Now:
 
-**Example:**
-- "Jane Smith" is first detected as `[PERSON_3A4F]`
-- "jane.smith@company.com" is later detected - the LLM or post-processing associates it with Jane Smith - it becomes `[EMAIL_3A4F]`
-- "555-234-9988" linked to Jane Smith becomes `[PHONE_3A4F]`
-
-**How linking works:**
-1. Ollama is prompted to return not just PII spans but also a `linked_to` field when it can confidently associate one PII item with an already-identified entity.
-2. The app maintains an entity registry mapping hex IDs to known associated values.
-3. If Ollama returns a `linked_to` reference, the app assigns the same hex suffix.
-4. If no link is determinable, a new unique hex ID is assigned independently.
-
-**Hex ID assignment:**
-- Generate a random 4-char hex string
-- Check against all IDs already in use for this session (across ALL tag types)
-- If collision, generate again
-- Once assigned to an entity, that hex ID is reserved for all tag types for that entity
+- Every distinct original value gets its own ID. One ID maps to exactly one value.
+- The same exact value repeated anywhere keeps its ID (counts and joins still work).
+- An ID is never issued twice, within a file or across files. A candidate is rejected if it is in the current session, in any key file in `/keys`, in `keys/issued_ids.ledger` (append-only list of every released ID - random IDs only, no PII), or already issued by the running process. IDs are recorded to the ledger when the key file is saved.
+- The model may still return `linked_to` (the ID of an already-seen value this one belongs with). It is stored on the entity in the key file as a relationship; it never changes the ID.
 
 ### 5.3 Replacement Application
-- Sort all known PII strings by length descending before applying (prevents "Jane" replacing before "Jane Smith")
+- Single pass, leftmost-longest: scanning left to right, the longest original starting at a position wins (prevents "Jane" replacing before "Jane Smith"). All originals are compiled into one trie-shaped pattern, so a text is scanned once (linear, not values x cells)
+- Existing placeholders are never rewritten - a short value like "2B1D" can't match inside `[PERSON_3A4F9C2B1D0E]`
+- Short numbers (no letters, under 7 digits: grades, room numbers, ZIPs) match only as whole numbers - "94" does not match in 1945, 94.5, 1,945, or a spreadsheet row index. Longer numbers keep substring matching
+- XLSX cells stored as numbers or dates are matched on the same text the model saw and become text cells when replaced
 - Replace ALL occurrences of each PII string, including in headers, footers, tables, metadata
 - Case-sensitive matching (LLM is instructed to return text exactly as it appears)
 - If the same string appears in multiple PII categories (edge case), the first-matched category wins
@@ -211,7 +206,7 @@ When the same real-world entity appears in multiple PII categories, all placehol
 ### 5.5 LLM Prompt Design
 System prompt instructs the local model to:
 - Return ONLY a JSON array, no explanation, no markdown fences
-- Each item: `{"text": "exact text as it appears", "type": "TAG", "linked_to": "hex_id or null"}`
+- Each item: `{"text": "exact text as it appears", "type": "TAG", "linked_to": "12-char id or null"}` (`linked_to` is recorded as a relationship only - see 5.2)
 - Temperature: 0 (deterministic)
 - Include every occurrence, even repeats
 
@@ -250,35 +245,35 @@ The prompt must include the current entity registry so the model can recognize a
   "session_id": "a3f9c1b2",
   "original_filename": "donor_list.xlsx",
   "created_at": "2026-05-01T14:32:00Z",
+  "id_format": "hex12",
   "llm_endpoint": "http://localhost:11434",
   "llm_api_style": "ollama",
   "model_used": "llama3.2",
   "pii_types_scrubbed": ["names", "emails", "phones"],
   "entity_registry": {
-    "3A4F": {
-      "types": ["PERSON", "EMAIL", "PHONE"],
-      "values": {
-        "PERSON": "Jane Smith",
-        "EMAIL": "jane.smith@company.com",
-        "PHONE": "555-234-9988"
-      }
-    }
+    "3A4F9C2B1D0E": {"types": ["PERSON"], "values": {"PERSON": "Jane Smith"}},
+    "7C1B0A94E2D3": {"types": ["EMAIL"], "values": {"EMAIL": "jane.smith@company.com"},
+                     "linked_to": "3A4F9C2B1D0E"},
+    "0D1E2F3A4B5C": {"types": ["PHONE"], "values": {"PHONE": "555-234-9988"},
+                     "linked_to": "3A4F9C2B1D0E"}
   },
   "replacement_map": {
-    "Jane Smith": "[PERSON_3A4F]",
-    "jane.smith@company.com": "[EMAIL_3A4F]",
-    "555-234-9988": "[PHONE_3A4F]",
-    "Bob Torres": "[PERSON_11C2]"
+    "Jane Smith": "[PERSON_3A4F9C2B1D0E]",
+    "jane.smith@company.com": "[EMAIL_7C1B0A94E2D3]",
+    "555-234-9988": "[PHONE_0D1E2F3A4B5C]",
+    "Bob Torres": "[PERSON_11C2D3E4F5A6]"
   }
 }
 ```
 
 ### 5.8 Unanonymize Logic
-- Load key file JSON
-- Invert `replacement_map`: `{"[PERSON_3A4F]": "Jane Smith", ...}`
-- Sort by placeholder length descending before applying (same collision-prevention as forward pass)
-- Apply to document using same file-type-specific writers as anonymize mode
-- Output filename: `{original_name}_restored.{ext}`
+- Load every selected key and merge into one index: 12-char ID -> (tag, original); legacy 4-char (tag, ID) -> original
+- If two selected keys give the same identifier different values: refuse, name both keys, restore nothing
+- One scan with a tolerant token grammar. Recognized forms: `[TAG_ID]`, any case, `\[TAG\_ID\]` (markdown-escaped), `TAG_ID` without brackets, a relabeled tag (`[DONOR_ID]` - restored by ID, counted as relabeled), and a bare 12-char ID (restored by ID, counted as untagged). Brackets are consumed only as a pair around one token, so `[A, B]` lists survive
+- Legacy 4-char IDs restore only with their tag present; a bare 4-char hex is never touched
+- Identifier-shaped tokens not in the keys (wrong length, unknown ID) are left untouched and reported
+- Files use the same format-aware writers as anonymize (split Word runs handled) with the deep-clean handlers off; the output is re-extracted afterwards and any identifier the keys could still resolve is reported as `residual`
+- Output filename: `{input_name}_restored.{ext}`
 
 ### 5.9 Deep Scrub - Zero Residual PII Guarantee
 
@@ -340,7 +335,7 @@ After the output file is written, before it is offered for download or pushed to
 
 **Process:**
 1. Re-extract all text from the output file using the same extraction pipeline used in step 1
-2. Run the full replacement map in reverse - search the extracted text for any string that appears as a value in the replacement map (i.e., any original PII string)
+2. Run the full replacement map in reverse - search the extracted text for any string that appears as a value in the replacement map (i.e., any original PII string) - outside of placeholders. A short original can legitimately occur inside a 12-char ID (`94` inside `[GRADE_3A94F2B1C0DE]`); that is not leaked PII. The raw-XML scan of DOCX/XLSX parts also ignores XLSX `<v>` cell values (numbers and shared-string indexes, already covered by the cell extraction) and number-only XML nodes with fewer than 7 digits (word counts, offsets)
 3. Also run a set of fast regex patterns for common PII formats as a secondary net:
    - Email pattern: `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`
    - Phone pattern: common North American and international formats

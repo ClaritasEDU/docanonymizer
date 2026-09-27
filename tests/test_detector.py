@@ -47,9 +47,43 @@ def test_detect_pii_uses_llm_call_and_builds_registry():
                                         "nickname": "test"}):
             r = detector.detect_pii("Jane Smith met jane@x.org")
     assert r.total_replacements() == 2
-    # entity linking applied: same hex_id for both PERSON and EMAIL
+    # Every value has its own 12-char ID; the link is recorded, not shared.
     hex_ids = {ph.split("_", 1)[1].rstrip("]") for ph in r.replacements.values()}
-    assert len(hex_ids) == 1
+    assert len(hex_ids) == 2
+    assert all(len(h) == 12 for h in hex_ids)
+    person = r.text_to_hex["Jane Smith"]
+    email = r.text_to_hex["jane@x.org"]
+    assert r.as_serializable()[email]["linked_to"] == person
+
+
+def test_detect_pii_never_reissues_ids_from_saved_keys(monkeypatch):
+    """IDs already in /keys (or the ledger) are reserved for detection."""
+    from app import detector, ids
+    from app.config import KEYS_DIR
+
+    (KEYS_DIR / "old_11111111.key.json").write_text(json.dumps({
+        "session_id": "11111111", "original_filename": "old.xlsx",
+        "replacement_map": {"Someone": "[PERSON_ABCDEF123456]"},
+    }))
+    ids.LEDGER_FILE.write_text("0A1B2C3D4E5F\n")
+    proposals = iter(["ABCDEF123456", "0A1B2C3D4E5F", "1234567890AB"])
+    monkeypatch.setattr(ids, "_random_id", lambda: next(proposals))
+
+    fake = json.dumps([{"text": "Jane Smith", "type": "PERSON"}])
+    with patch.object(detector.llm, "llm_call", return_value=fake):
+        with patch.object(detector.endpoints_mod, "get_active",
+                          return_value={"chunk_tokens": 2000, "api_style": "ollama",
+                                        "base_url": "http://localhost:1", "model": "m",
+                                        "nickname": "test"}):
+            r = detector.detect_pii("Jane Smith")
+    assert r.replacements["Jane Smith"] == "[PERSON_1234567890AB]"
+
+
+def test_prompt_describes_12_char_ids():
+    from app.detector import _build_prompt
+    from app.mapper import EntityRegistry
+    prompt = _build_prompt("x", ["PERSON"], EntityRegistry())
+    assert "12-character" in prompt and "4-character" not in prompt
 
 
 def test_detector_retries_transient_llm_error():

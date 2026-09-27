@@ -5,7 +5,7 @@ Single entry point: `extract(path: Path) -> ExtractResult`.
 Handles:
   Tier 1 (format-preserving output target):  PDF, XLSX, XLS, CSV
   Tier 2 (format-preserving output target):  DOCX, DOC
-  Tier 3 (text-only output):                 PPTX, PPT, ODT, ODS, ODP, TXT, RTF, HTML
+  Tier 3 (text-only output):                 PPTX, PPT, ODT, ODS, ODP, TXT, MD, RTF, HTML
 
 DOC, PPT, ODT, ODS, ODP require LibreOffice to convert into a supported
 format first. If LibreOffice is missing the extractor returns an error so
@@ -49,6 +49,7 @@ OUTPUT_NOTES: dict[str, tuple[str, str]] = {
     "ods":  (".xlsx", "formatting preserved (converted to xlsx)"),
     "odp":  (".txt",  "text only (converted via libreoffice)"),
     "txt":  (".txt",  "format preserved"),
+    "md":   (".md",   "format preserved"),
     "rtf":  (".txt",  "text only"),
     "html": (".txt",  "text only"),
     "htm":  (".txt",  "text only"),
@@ -116,7 +117,7 @@ def extract(path: Path) -> ExtractResult:
         result = _extract_docx(path)
     elif suffix == "pptx":
         result = _extract_pptx(path)
-    elif suffix in ("txt", "rtf", "html", "htm"):
+    elif suffix in ("txt", "md", "rtf", "html", "htm"):
         result = _extract_text(path)
         if suffix == "rtf":
             result.text = _strip_rtf(result.text)

@@ -1,7 +1,7 @@
 # Business Spec: Doc Anonymizer
 
-**Last updated:** 2026-07-17  
-**Status:** v1 implementation complete; web edition added; code review findings in CODE_REVIEW.md pending fixes
+**Last updated:** 2026-09-27  
+**Status:** v1.4 - unique 12-character identifiers and the AI round trip (anonymize -> analyze in any AI tool -> restore the answer) are built and tested
 
 ---
 
@@ -17,9 +17,19 @@ Existing anonymization tools are either cloud-based (defeating the purpose) or r
 
 A locally-hosted web app that runs entirely on the user's machine. It accepts any major document format, uses a locally-running LLM to detect PII, and replaces every instance with a consistent labeled placeholder. The original document never leaves the machine.
 
+The core flow the owner uses it for:
+
+1. Add a spreadsheet (or any document).
+2. Names, emails, phone numbers, addresses (and the other PII categories) become unique 12-character hex identifiers like `[PERSON_3A4F9C2B1D0E]`.
+3. See the anonymized output on screen, verified clean.
+4. Paste it into any AI tool for analysis.
+5. Bring the AI's answer back. Every identifier becomes the real value again - with no chance of mixing up two people, two addresses, or two phone numbers.
+
 The key design decisions that make this useful rather than just safe:
 
-**Consistent, linked identifiers.** Every PII type for the same real-world person shares a hex suffix. Jane Smith's name, email, and phone all become `_3A4F`. An analyst looking at the anonymized file can still observe that Person 3A4F emailed Address 3A4F from Phone 3A4F - the relational structure is intact even though the identities are hidden.
+**Unique identifiers, one per value, never reused.** (Owner decision 2026-09-27, replacing the v1.3 shared-suffix design.) Every distinct value gets its own 12-character hex identifier: Jane Smith is `[PERSON_3A4F9C2B1D0E]`, her email is `[EMAIL_7C1B0A94E2D3]`. The same value repeated anywhere keeps its identifier, so counts, rankings, and joins still work for analysis. No identifier is ever issued twice - not within a file and not across files - because every new ID is checked against all saved keys and a permanent ledger of issued IDs. Two spreadsheets pasted into the same AI chat can never collide.
+
+Why the change: under v1.3, Jane's name, email, and phone shared one suffix (`_3A4F`). When an AI answer referred to just the ID, or relabeled it, there was no way to know whether it meant her name or her email - and v1.3 could even give two different name variants the same placeholder. One ID per value makes every identifier a one-to-one pointer back to exactly one original. The relational structure an analyst needs is still there: in a spreadsheet the row carries it, and the key file records which values the model believed belong together (`linked_to`).
 
 **Comprehensive PII coverage.** 17 PII categories covering the full range of sensitive data types: names, email, phone, address, SSN/tax IDs, organizations, financial account data, dates of birth, student/employee IDs, IP addresses, usernames, grades/GPA, medical and health information, immigration status, race/ethnicity, religion, and gender/pronouns. A SANITIZE ALL mode covers everything by default. Sensitive categories are visually flagged so the operator knows what they are enabling.
 
@@ -29,7 +39,9 @@ The key design decisions that make this useful rather than just safe:
 
 **Verified clean before release.** After scrubbing, the app re-extracts all text from the output file and scans it against both the replacement map and a set of regex patterns for common PII formats. The download button stays disabled until this scan returns zero matches. The operator sees a visible VERIFIED confirmation before the file is available.
 
-**Full reversibility.** A local key file maps every placeholder back to the original value. The operator can unanonymize at any time, on any machine that has the key file, without any network access.
+**Full reversibility, including AI output.** A local key file maps every identifier back to the original value. The operator can restore at any time, on any machine that has the key file, without any network access. Restoring works on whatever the AI hands back - pasted text, or a .txt / .md / .csv / .xlsx / .docx file - and tolerates how AI tools mangle identifiers: lowercased, brackets dropped, markdown-escaped (`\[PERSON\_...\]`), relabeled (`[DONOR_...]`), or reduced to the bare 12-character hex. Because each ID is unique, the hex alone is enough to restore safely. Anything that looks like an identifier but isn't in the selected keys (a typo, a truncated ID) is left untouched and listed, never guessed. All saved keys can stay selected at once, since IDs never overlap; keys from another machine can be imported.
+
+**Copy for AI.** The anonymized output has a `[ COPY FOR AI ]` button that prepends one sentence asking the AI to keep identifiers exactly as written. That single instruction is the biggest factor in getting a cleanly restorable answer.
 
 **Any local LLM.** The app connects to any locally-running LLM server - Ollama, LM Studio, llama.cpp, or any OpenAI-compatible endpoint. Multiple endpoints can be configured and switched between. This future-proofs the tool against any single model or runtime becoming unavailable.
 
@@ -124,7 +136,12 @@ The PRD listed six open questions. Three are resolved as built; three are deferr
 5. **Operator-added PII terms.** A CUSTOM TERMS box on the anonymize panel takes one term per line (optional `ORG:`-style type prefix). Terms found in the document are guaranteed catches regardless of what the LLM finds. This replaces the deferred highlight-and-tag preview UI with something simpler.
 6. **Endpoint locality.** Enforced server-side, not just in the browser. Saving a non-local endpoint requires an explicit override flag, and every LLM call to a non-local endpoint logs a loud warning.
 
+7. **Identifier uniqueness (2026-09-27).** Enforced, not probabilistic: new IDs are checked against the session, every key in `/keys`, `keys/issued_ids.ledger` (append-only, random IDs only, no PII), and IDs issued by the running process.
+8. **Legacy 4-character keys (2026-09-27).** Still restore, but only with their tag present (`[PERSON_3A4F]`), since a bare 4-character hex is too common in ordinary text. Old keys that gave two values the same placeholder restore to the longer value and say so. They are opt-in in the key picker; if two selected keys disagree about an identifier, restore refuses and names both keys.
+9. **Short numbers (2026-09-27).** A value with no letters and fewer than 7 digits (a grade, room number, ZIP, 5-digit student ID) is replaced only where it stands as a whole number - a grade of 94 does not touch 1945, 94.5, or row 94 of a spreadsheet. Phones, SSNs, and account numbers keep plain substring matching.
+10. **Spreadsheet realities (2026-09-27).** Phones, ZIPs, and birthdays stored as numbers or dates are scrubbed (the cell becomes text). Sheet names that contain PII get the bracket-free form (`ORG_B9442179E0EE`, since Excel forbids brackets in sheet names) and every formula, defined name, and pivot reference follows the rename.
+
 **Deferred to v2:**
 
-7. Optional AES-encrypted key files at rest.
-8. In-place highlight-and-tag in the preview panel (custom terms cover the need for now).
+11. Optional AES-encrypted key files at rest.
+12. In-place highlight-and-tag in the preview panel (custom terms cover the need for now).

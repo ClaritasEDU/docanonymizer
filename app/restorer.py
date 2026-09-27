@@ -1,0 +1,244 @@
+"""Restore AI output - map identifiers back to the original values.
+
+The round trip this serves: anonymize a file -> paste it into an AI tool ->
+bring the AI's answer back here -> every identifier becomes the real value
+again, with no chance of mixing up two people or two phone numbers.
+
+AI tools rarely hand identifiers back byte-for-byte. Seen in the wild:
+    [PERSON_3A4F9C2B1D0E]        exact
+    [person_3a4f9c2b1d0e]        case changed
+    \\[PERSON\\_3A4F9C2B1D0E\\]  markdown-escaped
+    PERSON_3A4F9C2B1D0E          brackets dropped
+    [DONOR_3A4F9C2B1D0E]         label changed by the AI
+    3A4F9C2B1D0E                 only the ID survived
+Because every 12-char ID is unique to one value (ids.py), the hex alone is
+enough to restore safely - so all of the above resolve. When the label the
+AI used differs from the key's label, the value is still restored by ID and
+the report counts it as "relabeled" so the operator can glance at it.
+
+Anything that looks like one of our identifiers but is NOT in the selected
+keys (a typo, a truncated ID, a key that wasn't selected) is left untouched
+and listed as unresolved. Nothing is guessed.
+
+Legacy (v1.3) keys used 4-char IDs shared across an entity's tags. Those are
+matched only with their tag present ([PERSON_3A4F] / PERSON_3A4F) - a bare
+4-char hex is far too common in ordinary text to restore on its own.
+
+Never logs original values. Only counts.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Iterable, Optional
+
+from .ids import HEX_LEN, LEGACY_HEX_LEN
+from .logging_setup import get_logger
+from .mapper import VALID_TAGS
+from .replacer import Span, splice, xml_escape
+
+log = get_logger("restore")
+
+
+class KeyConflictError(ValueError):
+    """Two selected keys give the same identifier different values."""
+
+
+_KEY_PLACEHOLDER_RE = re.compile(r"\[([A-Z]+)_([0-9A-F]+)\]")
+
+# Tolerant token grammar. Alternatives are tried left to right at each
+# position; the regex scans the text once.
+#   br - bracketed:  [TAG_HEX]  \[TAG\_HEX\]  [ tag_hex ]
+#   nb - no brackets: TAG_HEX   TAG\_HEX
+#   xh - bare 12-char hex
+_TAG = r"[A-Za-z][A-Za-z_]{1,30}"
+_TOKEN_RE = re.compile(
+    rf"(?P<br>\\?\[[ \t]*(?P<bt>{_TAG})\\?_(?P<bh>[0-9A-Fa-f]{{4,16}})[ \t]*\\?\])"
+    rf"|(?<![0-9A-Za-z_])(?P<nb>(?P<nt>{_TAG})\\?_(?P<nh>[0-9A-Fa-f]{{4,16}}))(?![0-9A-Za-z_])"
+    rf"|(?<![0-9A-Za-z])(?P<xh>[0-9A-Fa-f]{{{HEX_LEN}}})(?![0-9A-Za-z_])"
+)
+
+
+@dataclass
+class KeyIndex:
+    by_hex: dict[str, tuple[str, str]] = field(default_factory=dict)           # HEX12 -> (tag, original)
+    legacy: dict[tuple[str, str], str] = field(default_factory=dict)          # (TAG, HEX4) -> original
+    key_names: list[str] = field(default_factory=list)
+    legacy_ambiguous: int = 0      # v1.3 placeholders that pointed at 2+ values
+
+    @property
+    def size(self) -> int:
+        return len(self.by_hex) + len(self.legacy)
+
+
+def build_index(keys: Iterable[tuple[str, dict]]) -> KeyIndex:
+    """Merge one or more (name, key_payload) pairs into a lookup index.
+
+    Raises KeyConflictError if two keys assign the same identifier to
+    different values - restoring through that would risk a mix-up, so we
+    refuse and say which keys disagree.
+    """
+    idx = KeyIndex()
+    hex_owner: dict[str, str] = {}
+    legacy_owner: dict[tuple[str, str], str] = {}
+    for name, payload in keys:
+        rmap = payload.get("replacement_map") or {}
+        if not isinstance(rmap, dict):
+            raise ValueError(f"key {name}: replacement_map is not an object")
+        idx.key_names.append(name)
+        # Longest original first, so a legacy placeholder shared by
+        # "Jane Smith" and "Jane" resolves to the fuller value.
+        for original, placeholder in sorted(rmap.items(), key=lambda kv: -len(kv[0])):
+            if not isinstance(original, str) or not isinstance(placeholder, str) or not original:
+                continue
+            m = _KEY_PLACEHOLDER_RE.fullmatch(placeholder)
+            if not m:
+                continue
+            tag, hx = m.group(1), m.group(2)
+            if len(hx) == HEX_LEN:
+                prev = idx.by_hex.get(hx)
+                if prev is not None and prev[1] != original:
+                    raise KeyConflictError(
+                        f"identifier {hx} means different values in "
+                        f"{hex_owner[hx]} and {name}. Select only the key(s) "
+                        "this output came from."
+                    )
+                if prev is None:
+                    idx.by_hex[hx] = (tag, original)
+                    hex_owner[hx] = name
+            elif len(hx) == LEGACY_HEX_LEN:
+                k = (tag, hx)
+                prev = idx.legacy.get(k)
+                if prev is not None and prev != original:
+                    if legacy_owner[k] != name:
+                        raise KeyConflictError(
+                            f"[{tag}_{hx}] means different values in "
+                            f"{legacy_owner[k]} and {name} (old 4-character "
+                            "keys reuse IDs). Select only the key this output came from."
+                        )
+                    idx.legacy_ambiguous += 1
+                    continue
+                if prev is None:
+                    idx.legacy[k] = original
+                    legacy_owner[k] = name
+    log.info(
+        "key index built: keys=%d ids=%d legacy_ids=%d legacy_ambiguous=%d",
+        len(idx.key_names), len(idx.by_hex), len(idx.legacy), idx.legacy_ambiguous,
+    )
+    return idx
+
+
+@dataclass
+class RestoreReport:
+    restored: int = 0
+    by_tag: dict[str, int] = field(default_factory=dict)
+    relabeled: int = 0          # AI changed the label; restored by ID
+    untagged: int = 0           # only the bare hex survived; restored by ID
+    unresolved: list[str] = field(default_factory=list)   # distinct tokens, in order seen
+    unresolved_count: int = 0
+    residual: int = 0           # file restores: tokens still present after writing
+    legacy_ambiguous: int = 0
+    keys_used: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return {
+            "restored": self.restored,
+            "by_tag": dict(sorted(self.by_tag.items())),
+            "relabeled": self.relabeled,
+            "untagged": self.untagged,
+            "unresolved": self.unresolved,
+            "unresolved_count": self.unresolved_count,
+            "residual": self.residual,
+            "legacy_ambiguous": self.legacy_ambiguous,
+            "keys_used": self.keys_used,
+        }
+
+
+class TokenRestorer:
+    """Replacer (see replacer.py) that maps identifiers back to originals."""
+
+    def __init__(self, index: KeyIndex, escape_xml: bool = False):
+        self.index = index
+        self.escape_xml = escape_xml
+
+    def _resolve(self, m: re.Match) -> tuple[Optional[str], str, dict]:
+        """Returns (original or None, key_tag, flags)."""
+        if m.group("xh") is not None:
+            hx = m.group("xh").upper()
+            hit = self.index.by_hex.get(hx)
+            if hit is None:
+                return None, "", {"ignore": True}   # ordinary hex in the text
+            return hit[1], hit[0], {"untagged": True}
+
+        bracketed = m.group("br") is not None
+        tag = (m.group("bt") if bracketed else m.group("nt")).upper()
+        hx = (m.group("bh") if bracketed else m.group("nh")).upper()
+        tag_known = tag in VALID_TAGS
+
+        if len(hx) == HEX_LEN:
+            hit = self.index.by_hex.get(hx)
+            if hit is not None:
+                return hit[1], hit[0], {"relabeled": hit[0] != tag}
+            return None, "", {"report": True}
+        if len(hx) == LEGACY_HEX_LEN:
+            original = self.index.legacy.get((tag, hx))
+            if original is not None:
+                return original, tag, {}
+            return None, "", {"report": bracketed and tag_known}
+        # Wrong length: a truncated or padded ID. Report it if it clearly
+        # was meant to be one of ours.
+        report = tag_known and (bracketed or len(hx) >= 8)
+        return None, "", {"report": report}
+
+    def find(self, text: str) -> list[Span]:
+        return self._scan(text, None)
+
+    def scan(self, text: str, report: RestoreReport) -> list[Span]:
+        """find() that also tallies what happened into `report`."""
+        return self._scan(text, report)
+
+    def _scan(self, text: str, report: Optional[RestoreReport]) -> list[Span]:
+        if not text or self.index.size == 0:
+            return []
+        spans: list[Span] = []
+        seen_unresolved = set(report.unresolved) if report else set()
+        for m in _TOKEN_RE.finditer(text):
+            original, key_tag, flags = self._resolve(m)
+            if original is None:
+                if report is not None and flags.get("report"):
+                    report.unresolved_count += 1
+                    tok = m.group(0)
+                    if tok not in seen_unresolved:
+                        seen_unresolved.add(tok)
+                        report.unresolved.append(tok)
+                continue
+            spans.append((m.start(), m.end(),
+                          xml_escape(original) if self.escape_xml else original))
+            if report is not None:
+                report.restored += 1
+                report.by_tag[key_tag] = report.by_tag.get(key_tag, 0) + 1
+                if flags.get("relabeled"):
+                    report.relabeled += 1
+                if flags.get("untagged"):
+                    report.untagged += 1
+        return spans
+
+    def for_raw_xml(self) -> "TokenRestorer":
+        return TokenRestorer(self.index, escape_xml=True)
+
+
+def new_report(index: KeyIndex) -> RestoreReport:
+    return RestoreReport(keys_used=list(index.key_names),
+                         legacy_ambiguous=index.legacy_ambiguous)
+
+
+def restore_text(text: str, index: KeyIndex) -> tuple[str, RestoreReport]:
+    """Restore a block of pasted text. Returns (restored_text, report)."""
+    report = new_report(index)
+    out = splice(text, TokenRestorer(index).scan(text, report))
+    log.info(
+        "text restore: chars_in=%d restored=%d relabeled=%d untagged=%d unresolved=%d",
+        len(text), report.restored, report.relabeled, report.untagged, report.unresolved_count,
+    )
+    return out, report

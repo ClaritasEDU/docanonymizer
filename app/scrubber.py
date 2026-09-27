@@ -27,21 +27,31 @@ Key scrub layers per format:
     - Clear xl/comments*.xml
     - Zero docProps/core.xml: <dc:creator>, <cp:lastModifiedBy>
     - Flag formula strings that contain a matched PII value (do not silently scrub)
+
+Every writer takes either a replacement map (original -> placeholder) or a
+Replacer (replacer.py). Matching is single-pass and never rewrites inside an
+existing placeholder. Unanonymize reuses these same writers with a
+TokenRestorer and `deep_clean=False` - restoring a file must not strip the
+comments or metadata of the document the AI handed back.
 """
 
 from __future__ import annotations
 
 import csv
+import datetime as dt
 import io
 import re
 import shutil
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Union
 
 from .extractors import ExtractResult
 from .logging_setup import get_logger
+from .replacer import Replacer, apply, as_replacer, is_short_number, splice, xml_escape
+
+MapOrReplacer = Union[dict, Replacer]
 
 log = get_logger("scrubber")
 
@@ -54,14 +64,13 @@ class ScrubResult:
     bytes_written: int = 0
 
 
-def apply_replacements_text(text: str, replacement_map: dict[str, str]) -> str:
-    """Plain-string substitution. Map MUST be sorted longest-first by caller."""
-    out = text
-    for original, placeholder in replacement_map.items():
-        if not original:
-            continue
-        out = out.replace(original, placeholder)
-    return out
+def apply_replacements_text(text: str, replacement_map: MapOrReplacer) -> str:
+    """Single-pass substitution (leftmost-longest, placeholders protected).
+
+    Passing a dict compiles a matcher on every call - hot loops should call
+    `as_replacer()` once and pass the Replacer in.
+    """
+    return apply(text, as_replacer(replacement_map))
 
 
 # ---------------------------------------------------------------------------
@@ -71,8 +80,9 @@ def apply_replacements_text(text: str, replacement_map: dict[str, str]) -> str:
 # <w:r>/<w:t> runs after edits, so neither a per-run pass nor a raw string
 # substitution can see it. These helpers join the text runs of each paragraph
 # (or shared-string item), find matches in the joined text, and write the
-# placeholder back into the run where the match starts - removing the matched
+# replacement back into the run where the match starts - removing the matched
 # characters from the following runs. Formatting outside the match survives.
+# The same pass restores split identifiers in unanonymize.
 # ---------------------------------------------------------------------------
 
 _WP_BLOCK_RE = re.compile(r"<w:p[ >].*?</w:p>", re.DOTALL)
@@ -101,14 +111,12 @@ def _xml_unescape(s: str) -> str:
     return _ENTITY_RE.sub(repl, s)
 
 
-def _xml_escape(s: str) -> str:
-    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-             .replace('"', "&quot;").replace("'", "&apos;"))
+_xml_escape = xml_escape
 
 
 def _replace_in_blocks(xml: str, block_re: re.Pattern, t_re: re.Pattern,
-                       t_name: str, replacement_map: dict[str, str]) -> str:
-    """Apply the map inside each text-run block, spanning split runs."""
+                       t_name: str, replacer: Replacer) -> str:
+    """Apply the replacer inside each text-run block, spanning split runs."""
 
     def process_block(bm: re.Match) -> str:
         block = bm.group(0)
@@ -123,25 +131,9 @@ def _replace_in_blocks(xml: str, block_re: re.Pattern, t_re: re.Pattern,
         if not joined:
             return block
 
-        # Claim non-overlapping ranges, longest originals first (map order).
-        ranges: list[tuple[int, int, str]] = []
-        for original, placeholder in replacement_map.items():
-            if not original:
-                continue
-            idx = 0
-            while True:
-                f = joined.find(original, idx)
-                if f == -1:
-                    break
-                end = f + len(original)
-                if not any(f < r_end and end > r_start for r_start, r_end, _ in ranges):
-                    ranges.append((f, end, placeholder))
-                    idx = end
-                else:
-                    idx = f + 1
+        ranges = replacer.find(joined)
         if not ranges:
             return block
-        ranges.sort()
 
         # Map each joined-text character back to its owning node.
         owner: list[int] = []
@@ -173,17 +165,17 @@ def _replace_in_blocks(xml: str, block_re: re.Pattern, t_re: re.Pattern,
     return block_re.sub(process_block, xml)
 
 
-def _structured_replace_docx(name: str, xml: str, replacement_map: dict[str, str]) -> str:
+def _structured_replace_docx(name: str, xml: str, replacer: Replacer) -> str:
     if _DOCX_RUN_PARTS.fullmatch(name):
-        return _replace_in_blocks(xml, _WP_BLOCK_RE, _WT_RE, "w:t", replacement_map)
+        return _replace_in_blocks(xml, _WP_BLOCK_RE, _WT_RE, "w:t", replacer)
     return xml
 
 
-def _structured_replace_xlsx(name: str, xml: str, replacement_map: dict[str, str]) -> str:
+def _structured_replace_xlsx(name: str, xml: str, replacer: Replacer) -> str:
     if name == "xl/sharedStrings.xml":
-        return _replace_in_blocks(xml, _SI_BLOCK_RE, _T_RE, "t", replacement_map)
+        return _replace_in_blocks(xml, _SI_BLOCK_RE, _T_RE, "t", replacer)
     if _XLSX_SHEET_PARTS.fullmatch(name):
-        return _replace_in_blocks(xml, _IS_BLOCK_RE, _T_RE, "t", replacement_map)
+        return _replace_in_blocks(xml, _IS_BLOCK_RE, _T_RE, "t", replacer)
     return xml
 
 
@@ -191,8 +183,8 @@ def _structured_replace_xlsx(name: str, xml: str, replacement_map: dict[str, str
 # Format-specific writers
 # ---------------------------------------------------------------------------
 
-def scrub_text(extract: ExtractResult, replacement_map: dict[str, str], out_path: Path) -> ScrubResult:
-    new_text = apply_replacements_text(extract.text, replacement_map)
+def scrub_text(extract: ExtractResult, replacement_map: MapOrReplacer, out_path: Path) -> ScrubResult:
+    new_text = apply(extract.text, as_replacer(replacement_map))
     out_path.write_text(new_text, encoding="utf-8")
     return ScrubResult(
         output_path=out_path,
@@ -201,11 +193,12 @@ def scrub_text(extract: ExtractResult, replacement_map: dict[str, str], out_path
     )
 
 
-def scrub_csv(extract: ExtractResult, replacement_map: dict[str, str], out_path: Path) -> ScrubResult:
+def scrub_csv(extract: ExtractResult, replacement_map: MapOrReplacer, out_path: Path) -> ScrubResult:
+    replacer = as_replacer(replacement_map)
     rows = extract.payload.get("rows") or []
     new_rows: list[list[str]] = []
     for row in rows:
-        new_rows.append([apply_replacements_text(cell, replacement_map) for cell in row])
+        new_rows.append([apply(cell, replacer) for cell in row])
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerows(new_rows)
@@ -216,9 +209,16 @@ def scrub_csv(extract: ExtractResult, replacement_map: dict[str, str], out_path:
     )
 
 
-def scrub_docx(working_path: Path, replacement_map: dict[str, str], out_path: Path) -> ScrubResult:
-    """DOCX scrub: surface replace via python-docx, then ZIP-level deep scrub."""
+def scrub_docx(working_path: Path, replacement_map: MapOrReplacer, out_path: Path,
+               deep_clean: bool = True) -> ScrubResult:
+    """DOCX scrub: surface replace via python-docx, then ZIP-level deep scrub.
+
+    `deep_clean=False` (unanonymize) still runs every replacement pass but
+    leaves comments, tracked changes, alt text, and metadata alone.
+    """
     from docx import Document
+
+    replacer = as_replacer(replacement_map)
 
     # Stage 1 - format-aware surface replacement on a temp copy.
     staged = out_path.with_suffix(".staged.docx")
@@ -228,7 +228,7 @@ def scrub_docx(working_path: Path, replacement_map: dict[str, str], out_path: Pa
     def _replace_runs(runs):
         for run in runs:
             if run.text:
-                new = apply_replacements_text(run.text, replacement_map)
+                new = apply(run.text, replacer)
                 if new != run.text:
                     run.text = new
 
@@ -249,7 +249,7 @@ def scrub_docx(working_path: Path, replacement_map: dict[str, str], out_path: Pa
     layers = _deep_scrub_zip(
         staged,
         out_path,
-        replacement_map=replacement_map,
+        replacer=replacer,
         structured_replace=_structured_replace_docx,
         per_part_handlers={
             "word/document.xml":   _strip_revision_marks,
@@ -259,7 +259,7 @@ def scrub_docx(working_path: Path, replacement_map: dict[str, str], out_path: Pa
             "word/commentsExtended.xml": _empty_comments_ex_xml,
             "docProps/core.xml":   _zero_core_authors,
             "docProps/app.xml":    _zero_app_company,
-        },
+        } if deep_clean else {},
     )
     staged.unlink(missing_ok=True)
 
@@ -270,9 +270,15 @@ def scrub_docx(working_path: Path, replacement_map: dict[str, str], out_path: Pa
     )
 
 
-def scrub_xlsx(working_path: Path, replacement_map: dict[str, str], out_path: Path) -> ScrubResult:
-    """XLSX scrub: surface replace via openpyxl, ZIP-level deep scrub, formula warnings."""
+def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Path,
+               deep_clean: bool = True) -> ScrubResult:
+    """XLSX scrub: surface replace via openpyxl, ZIP-level deep scrub, formula warnings.
+
+    `deep_clean=False` (unanonymize) skips the comment/metadata handlers.
+    """
     from openpyxl import load_workbook
+
+    replacer = as_replacer(replacement_map)
 
     staged = out_path.with_suffix(".staged.xlsx")
     shutil.copyfile(working_path, staged)
@@ -288,34 +294,56 @@ def scrub_xlsx(working_path: Path, replacement_map: dict[str, str], out_path: Pa
                 if isinstance(v, str):
                     if v.startswith("="):
                         # Formula - flag if a PII string is embedded; don't silently rewrite.
-                        for original in replacement_map:
-                            if original and original in v:
-                                formula_warnings.append(
-                                    f"sheet={ws.title!r} cell={cell.coordinate} formula references PII"
-                                )
-                                break
+                        if deep_clean and replacer.find(v):
+                            formula_warnings.append(
+                                f"sheet={ws.title!r} cell={cell.coordinate} formula references PII"
+                            )
                     else:
-                        new = apply_replacements_text(v, replacement_map)
+                        new = apply(v, replacer)
                         if new != v:
                             cell.value = new
+                elif deep_clean and _is_numeric_or_date(v):
+                    # A phone typed without dashes, a ZIP, or a date of birth is
+                    # stored as a number/date, not text. Match against the same
+                    # str() form the extractor showed the model; a hit turns the
+                    # cell into text. Skipping these used to leave the value in
+                    # place for the raw XML pass to jam a placeholder into a
+                    # numeric cell - a workbook Excel has to "repair".
+                    sv = str(v)
+                    new = apply(sv, replacer)
+                    if new != sv:
+                        cell.value = new
+
+    # Sheet names can carry PII ("Smith Family") but can't contain [ or ], so
+    # they get the bracket-free token form. References to the old name in
+    # formulas, defined names, and pivot sources are rewritten to match.
+    renames = _rename_sheets(wb, replacer) if deep_clean else {}
     wb.save(str(staged))
+
+    def structured(name: str, xml: str, r: Replacer) -> str:
+        if renames:
+            xml = _rewrite_sheet_refs(xml, renames)
+        return _structured_replace_xlsx(name, xml, r)
 
     layers = _deep_scrub_zip(
         staged,
         out_path,
-        replacement_map=replacement_map,
-        structured_replace=_structured_replace_xlsx,
+        replacer=replacer,
+        structured_replace=structured,
+        raw_protect=_protect_cell_values,
         per_part_handlers={
             re.compile(r"xl/comments\d*\.xml"): _empty_xlsx_comments_xml,
             "docProps/core.xml": _zero_core_authors,
             "docProps/app.xml":  _zero_app_company,
-        },
+        } if deep_clean else {},
     )
     staged.unlink(missing_ok=True)
 
     if formula_warnings:
         log.warning("xlsx formula warnings: %d", len(formula_warnings))
 
+    if renames:
+        layers.append("sheet_names")
     return ScrubResult(
         output_path=out_path,
         layers_cleaned=["xlsx_cells"] + layers,
@@ -324,38 +352,123 @@ def scrub_xlsx(working_path: Path, replacement_map: dict[str, str], out_path: Pa
     )
 
 
+def _is_numeric_or_date(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    return isinstance(v, (int, float, dt.date, dt.time, dt.timedelta))
+
+
+_BAD_SHEET_CHARS = re.compile(r"[\[\]:*?/\\']")
+_BRACKETED_ID = re.compile(r"\[([A-Z]+_[0-9A-F]{12})\]")
+
+
+def _rename_sheets(wb, replacer: Replacer) -> dict[str, str]:
+    """Replace PII in sheet titles with bracket-free tokens. Returns old -> new."""
+    renames: dict[str, str] = {}
+    taken = {ws.title for ws in wb.worksheets}
+    for ws in wb.worksheets:
+        old = ws.title
+        new = apply(old, replacer)
+        if new == old:
+            continue
+        new = _BAD_SHEET_CHARS.sub("_", _BRACKETED_ID.sub(r"\1", new))[:31] or "Sheet"
+        base, i = new, 1
+        while new in taken:
+            suffix = f"_{i}"
+            new = base[: 31 - len(suffix)] + suffix
+            i += 1
+        taken.discard(old)
+        taken.add(new)
+        renames[old] = new
+    for old, new in renames.items():
+        wb[old].title = new
+    if renames:
+        log.info("xlsx sheet titles anonymized: %d", len(renames))
+    return renames
+
+
+def _rewrite_sheet_refs(xml: str, renames: dict[str, str]) -> str:
+    """Point formula / defined-name / pivot references at the renamed sheets."""
+    def text_safe(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    for old, new in renames.items():
+        quoted_new = text_safe(f"'{new}'!")
+        oq = old.replace("'", "''")
+        for o in {oq, text_safe(oq), xml_escape(oq)}:
+            xml = xml.replace(f"'{o}'!", quoted_new)
+            xml = xml.replace(f"&apos;{o}&apos;!", quoted_new)
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", old):
+            xml = re.sub(rf"(?<![A-Za-z0-9_.']){re.escape(old)}!", lambda _m: quoted_new, xml)
+        xml = xml.replace(f'sheet="{xml_escape(old)}"', f'sheet="{xml_escape(new)}"')
+    return xml
+
+
+# In worksheet XML, <v> holds numbers and shared-string indexes. Real cell
+# text was already handled by openpyxl and the shared-strings pass, so the
+# raw pass must never rewrite a <v>.
+def _protect_cell_values(name: str) -> bool:
+    return _XLSX_SHEET_PARTS.fullmatch(name) is not None
+
+
+_NUMERIC_NODE_RE = re.compile(r"[\s\d.,:+\-]*")
+
+
+def _apply_raw(text: str, replacer: Replacer, protect_v: bool = False) -> str:
+    """Raw-XML substitution that never damages markup.
+
+    By the time this runs, real document text has been handled by the
+    format-aware passes. What is left is hidden layers (metadata, formula
+    literals, alt text) - and markup. A short number such as a grade "94"
+    must never be written into markup (row r="94", cell r="A94", style ids)
+    or into a number-only data node (word counts, drawing offsets). Letters
+    and long numbers (phones, SSNs) are still replaced everywhere.
+    """
+    spans = replacer.find(text)
+    if not spans:
+        return text
+    keep = []
+    for s0, e0, r in spans:
+        lt, gt = text.rfind("<", 0, s0), text.rfind(">", 0, s0)
+        if lt > gt:                                   # inside a tag
+            if is_short_number(text[s0:e0]):
+                continue
+        else:
+            a = gt + 1
+            if protect_v and text[max(0, a - 3):a] == "<v>":
+                continue
+            b = text.find("<", e0)
+            node = text[a:(b if b != -1 else len(text))]
+            if is_short_number(text[s0:e0]) and _NUMERIC_NODE_RE.fullmatch(node):
+                continue
+        keep.append((s0, e0, r))
+    return splice(text, keep)
+
+
 # ---------------------------------------------------------------------------
 # Deep scrub primitives
 # ---------------------------------------------------------------------------
 
-def _augment_map_with_escapes(replacement_map: dict[str, str]) -> dict[str, str]:
-    """Add XML-escaped variants so originals containing & < > " ' are caught
-    in their encoded form inside XML parts. Order (longest-first) preserved."""
-    out: dict[str, str] = {}
-    for original, placeholder in replacement_map.items():
-        out[original] = placeholder
-        esc = _xml_escape(original)
-        if esc != original:
-            out[esc] = _xml_escape(placeholder)
-    return dict(sorted(out.items(), key=lambda kv: -len(kv[0])))
-
-
 def _deep_scrub_zip(
     src: Path,
     dst: Path,
-    replacement_map: dict[str, str],
+    replacer: Replacer,
     per_part_handlers: dict | None = None,
     structured_replace=None,
+    raw_protect=None,
 ) -> list[str]:
     """Walk every part in `src`, run handlers and the raw map substitution, repack to `dst`.
 
     `structured_replace(name, xml, map) -> xml` runs first on text parts - it
     is the run-aware pass that catches strings split across XML runs.
+    `raw_protect(name) -> bool` marks parts whose <v> cell values are off-limits.
     Returns a list of layer labels for logging.
     """
     per_part_handlers = per_part_handlers or {}
     layers_touched: set[str] = set()
-    raw_map = _augment_map_with_escapes(replacement_map)
+    # Raw XML variant: matches XML-escaped originals ("Smith &amp; Sons") and
+    # writes XML-safe replacements.
+    raw_replacer = replacer.for_raw_xml()
 
     with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
         for info in zin.infolist():
@@ -376,10 +489,11 @@ def _deep_scrub_zip(
                     text = data.decode("utf-8")
                     new_text = text
                     if structured_replace is not None:
-                        new_text = structured_replace(info.filename, new_text, replacement_map)
+                        new_text = structured_replace(info.filename, new_text, replacer)
                         if new_text != text:
                             layers_touched.add("run_aware_substitution")
-                    substituted = apply_replacements_text(new_text, raw_map)
+                    protect_v = bool(raw_protect and raw_protect(info.filename))
+                    substituted = _apply_raw(new_text, raw_replacer, protect_v)
                     if substituted != new_text:
                         layers_touched.add("raw_xml_substitution")
                     if substituted != text:

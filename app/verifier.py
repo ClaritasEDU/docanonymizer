@@ -15,6 +15,10 @@ Two scans over the output:
      clean documents (confirmed false positives: any 10-digit number,
      version strings). Warnings are surfaced to the operator for review.
 
+Placeholders are excluded from the map scan. A short original ("94", "2B")
+can legitimately occur inside a 12-char ID like [GRADE_3A94F2B1C0DE]; that is
+not leaked PII, and counting it would dead-end clean documents.
+
 Logs pass/fail and match types only - never matched values.
 """
 
@@ -24,10 +28,10 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 from .extractors import extract
 from .logging_setup import get_logger
+from .replacer import PLACEHOLDER_RE, LiteralReplacer
 
 log = get_logger("verify")
 
@@ -61,8 +65,21 @@ PATTERNS: dict[str, re.Pattern] = {
     "CREDIT_CARD": re.compile(r"\b(?:\d{4}[\s\-]){3}\d{4}\b|\b\d{15,16}\b"),
 }
 
-_PLACEHOLDER_RE = re.compile(r"\[[A-Z]+_[0-9A-F]{4}\]")
+_PLACEHOLDER_RE = PLACEHOLDER_RE
 _TAG_RE = re.compile(r"<[^>]+>")
+_SHEET_PART_RE = re.compile(r"xl/worksheets/sheet\d*\.xml")
+_V_RE = re.compile(r"<v>[^<]*</v>")
+# A number-only text node with fewer than 7 digits is XML bookkeeping (word
+# counts, offsets, indexes), not document content - real content numbers are
+# covered by the format-native extraction above. Matches the scrubber's rule.
+_SHORT_NUMERIC_NODE_RE = re.compile(r">([\s\d.,:+\-]+)<")
+
+
+def _blank_short_numbers(xml: str) -> str:
+    def repl(m: re.Match) -> str:
+        node = m.group(1)
+        return ">" + (node if sum(c.isdigit() for c in node) >= 7 else "") + "<"
+    return _SHORT_NUMERIC_NODE_RE.sub(repl, xml)
 _ZIP_SUFFIXES = {".docx", ".xlsx"}
 _TEXT_PART_RE = re.compile(r"\.(xml|rels|txt|vml)$", re.IGNORECASE)
 
@@ -75,12 +92,9 @@ class VerifyResult:
     total_matches: int = 0                                       # map matches only
 
 
-def _values_from_map(replacement_map: dict[str, str]) -> Iterable[tuple[str, str]]:
-    """Yield (original_value, tag) so we can count types without leaking values."""
-    for original, placeholder in replacement_map.items():
-        body = placeholder.strip("[]")
-        tag = body.split("_", 1)[0] if "_" in body else "UNKNOWN"
-        yield original, tag
+def _tag_of(placeholder: str) -> str:
+    body = placeholder.strip("[]")
+    return body.split("_", 1)[0] if "_" in body else "UNKNOWN"
 
 
 def _xml_unescape(s: str) -> str:
@@ -105,6 +119,9 @@ def _deep_zip_text(path: Path) -> str:
                     raw = zf.read(name).decode("utf-8")
                 except (UnicodeDecodeError, KeyError):
                     continue
+                if _SHEET_PART_RE.fullmatch(name):
+                    raw = _V_RE.sub("", raw)     # numbers + shared-string indexes
+                raw = _blank_short_numbers(raw)
                 chunks.append(_xml_unescape(_TAG_RE.sub("\n", raw)))
     except (zipfile.BadZipFile, OSError) as exc:
         log.warning("deep zip scan unavailable: %s", type(exc).__name__)
@@ -118,15 +135,15 @@ def verify_output(output_path: Path, replacement_map: dict[str, str]) -> VerifyR
     if output_path.suffix.lower() in _ZIP_SUFFIXES:
         texts.append(_deep_zip_text(output_path))
 
+    # One pass per text with the same engine the scrubber used. Placeholder
+    # regions are protected, so only text outside them can count as residue.
     map_match_types: set[str] = set()
     map_total = 0
-    for original, tag in _values_from_map(replacement_map):
-        if not original:
-            continue
-        for text in texts:
-            if original in text:
-                map_match_types.add(tag)
-                map_total += text.count(original)
+    finder = LiteralReplacer(replacement_map, protect_placeholders=True)
+    for text in texts:
+        for _, _, placeholder in finder.find(text):
+            map_match_types.add(_tag_of(placeholder))
+            map_total += 1
 
     # Regex residue - warnings only. Strip placeholders first (replaced with a
     # newline so surrounding digits can't fuse into a false phone/card match).

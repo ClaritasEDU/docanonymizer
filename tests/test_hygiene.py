@@ -157,3 +157,27 @@ def test_double_confirm_is_ignored():
     assert res2["verify_result"]["passed"] is True
     assert not res2["error"]
     assert c.get(f"/api/anonymize/{sid}/download/file").status_code == 200
+
+
+def test_verify_crash_surfaces_error_and_quarantines_output(tmp_path):
+    """An exception during verification must end the run with an error the UI
+    can show - never a silently dead worker - and nothing is released."""
+    import json as _json
+    from unittest.mock import patch as _patch
+    from app import detector, pipeline
+    from app.config import OUTPUT_DIR, UPLOADS_DIR
+
+    up = UPLOADS_DIR / "memo.txt"
+    up.write_text("Hello Jane Smith")
+    sess = pipeline.new_session(up, "memo.txt", ["PERSON"],
+                                endpoint={"base_url": "http://localhost:1", "model": "m",
+                                          "api_style": "ollama", "nickname": "t"})
+    fake = _json.dumps([{"text": "Jane Smith", "type": "PERSON"}])
+    with _patch.object(detector.llm, "llm_call", return_value=fake):
+        pipeline.run_extract_and_detect(sess)
+    with _patch("app.pipeline.verify_output", side_effect=ValueError("bad workbook")):
+        pipeline.confirm_and_scrub(sess)
+    assert sess.error and "verification could not run" in sess.error
+    assert sess.key_path is None
+    assert list(OUTPUT_DIR.iterdir()) == []
+    assert not up.exists()

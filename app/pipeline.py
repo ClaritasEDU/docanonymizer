@@ -49,6 +49,7 @@ class Session:
     key_path: Optional[Path] = None
     verify_result: Optional[dict] = None
     formula_warnings: list[str] = field(default_factory=list)
+    preview: Optional[dict] = None     # built once after detection; polled often
     error: Optional[str] = None
     created_at: float = field(default_factory=time.monotonic)
 
@@ -236,18 +237,29 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None) -> 
     sess.output_path = result.output_path
 
     sess.scrub_steps.append({"step": "verification scan running", "status": "active"})
-    verify = verify_output(result.output_path, rmap)
-    sess.scrub_steps[-1]["status"] = "done" if verify.passed else "err"
+    try:
+        verify = verify_output(result.output_path, rmap)
+        sess.scrub_steps[-1]["status"] = "done" if verify.passed else "err"
+        if verify.passed:
+            sess.key_path = save_key_file(
+                session_id=sess.id,
+                original_filename=sess.original_filename,
+                endpoint=sess.endpoint,
+                pii_types_scrubbed=sorted(sess.registry.counts_per_type().keys()),
+                registry=sess.registry,
+            )
+    except Exception as exc:
+        # An output that can't be verified is never released. Without this,
+        # an exception here killed the worker thread silently and the UI sat
+        # on "verification scan running" forever.
+        log.exception("session %s verify failed: %s", sess.id, type(exc).__name__)
+        sess.scrub_steps[-1]["status"] = "err"
+        cleanup_session_files(sess, remove_output=True)
+        sess.error = f"verification could not run ({type(exc).__name__}): {exc}"
+        return sess
 
     if verify.passed:
         sess.scrub_steps.append({"step": "output ready", "status": "done"})
-        sess.key_path = save_key_file(
-            session_id=sess.id,
-            original_filename=sess.original_filename,
-            endpoint=sess.endpoint,
-            pii_types_scrubbed=sorted(sess.registry.counts_per_type().keys()),
-            registry=sess.registry,
-        )
         # Success: the upload (and any conversion dir) has served its purpose.
         cleanup_session_files(sess)
     else:
@@ -296,7 +308,7 @@ def anonymized_text(sess: Session) -> str:
         raise RuntimeError("verification has not passed - text view blocked")
 
     suffix = sess.output_path.suffix.lower().lstrip(".")
-    if suffix in ("txt", "csv", "html", "htm", "rtf"):
+    if suffix in ("txt", "md", "csv", "html", "htm", "rtf"):
         return sess.output_path.read_text(encoding="utf-8", errors="replace")
     # Binary formats - re-extract.
     from .extractors import extract  # local import to avoid bootstrap cycles

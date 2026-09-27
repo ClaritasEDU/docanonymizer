@@ -38,8 +38,21 @@
     preview: null,
     polling: null,
     anonFile: null,                       // selected file for anonymize
-    unanon: { file: null, key: null },
+    unanon: { file: null },               // file to restore
+    keys: [],                             // saved keys from /api/keys
+    keysSelected: new Set(),              // key names ticked in the picker
+    keysSeen: new Set(),                  // names already shown (new ones default on)
+    restoredText: "",
+    restoredName: "",
   };
+
+  // Prepended by [ COPY FOR AI ]. Asking the AI to keep identifiers intact is
+  // the single biggest factor in getting a restorable answer back.
+  const AI_NOTE =
+    "Note: this data has been anonymized. Tokens like [PERSON_3A4F9C2B1D0E] stand in for " +
+    "real names, emails, phone numbers, addresses, and other personal details. Each token " +
+    "is unique to one real value. When you refer to any of them in your answer, copy the " +
+    "token exactly as written, brackets included. Do not shorten, merge, or invent tokens.";
 
   // ----- DOM helpers -----
   const $ = (id) => document.getElementById(id);
@@ -372,7 +385,6 @@
   const ZONE_TO_INPUT = {
     "dropzone": "file-input",
     "dropzone-unanon": "unanon-file-input",
-    "dropzone-key": "key-file-input",
   };
 
   function showFileLoaded(zoneId, file) {
@@ -392,7 +404,6 @@
       inp.type = "file";
       inp.id = inputId;
       inp.style.display = "none";
-      if (zoneId === "dropzone-key") inp.accept = ".json";
       zone.append(inp);
       // Re-bind so click/change still flow.
       // (inputs cannot have their FileList programmatically reassigned in
@@ -549,6 +560,7 @@
 
   async function confirmScrub() {
     if (!state.sessionId) return;
+    hide($("lbl-preview"));
     hide($("block-preview"));
     show($("lbl-scrub"));
     show($("progress-scrub"));
@@ -647,9 +659,11 @@
     $("btn-dl-key").disabled = !verified;
     $("btn-view-text").disabled = !verified;
     $("btn-push-github").disabled = !verified;
-    // Reset the view-on-screen panel for each new run.
+    // Reset the view-on-screen panel for each new run, then show the verified
+    // output straight away - seeing it is the next step in the flow.
     hide($("block-screen-text"));
     $("screen-text").value = "";
+    if (verified) loadScreenText(false);
 
     if ((r.formula_warnings || []).length) {
       const w = create("div", { class: "note" }, [document.createTextNode(
@@ -698,7 +712,115 @@
     $("btn-detect").disabled = true;
   }
 
+  // ----- On-screen anonymized output -----
+  async function loadScreenText(focus) {
+    if (!state.sessionId) return;
+    try {
+      const data = await api(`/api/anonymize/${state.sessionId}/text`);
+      setTabular($("screen-text"), data.filename);
+      $("screen-text").value = data.text;
+      $("screen-text-meta").textContent =
+        `${data.char_count.toLocaleString()} chars · re-extracted from ${data.filename}`;
+      show($("block-screen-text"));
+      if (focus) { $("screen-text").focus(); $("screen-text").select(); }
+    } catch (exc) {
+      alert(`Could not load text: ${exc.message}`);
+    }
+  }
+
+  // Spreadsheet output reads as one row per line; wrapping splits rows.
+  function setTabular(textarea, filename) {
+    const tabular = /\.(xlsx|xls|ods|csv)$/i.test(filename || "");
+    textarea.setAttribute("wrap", tabular ? "off" : "soft");
+    textarea.classList.toggle("tabular", tabular);
+  }
+
+  async function copyText(text, btn) {
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      // Fallback for browsers that block the async clipboard API.
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.append(ta);
+      ta.select();
+      try { ok = document.execCommand("copy"); } catch { ok = false; }
+      ta.remove();
+    }
+    const original = btn.textContent;
+    btn.textContent = ok ? "[ COPIED ]" : "[ COPY FAILED ]";
+    setTimeout(() => { btn.textContent = original; }, 1200);
+  }
+
   // ----- Unanonymize flow -----
+  async function loadKeys() {
+    let data;
+    try {
+      data = await api("/api/keys");
+    } catch (exc) {
+      $("key-list").textContent = `could not load keys: ${exc.message}`;
+      return;
+    }
+    state.keys = data.keys || [];
+    const names = new Set(state.keys.map((k) => k.name));
+    // Keys that disappeared are dropped; newly seen current-format keys start
+    // selected (IDs are unique across keys, so selecting them is always safe).
+    for (const n of [...state.keysSelected]) if (!names.has(n)) state.keysSelected.delete(n);
+    for (const k of state.keys) {
+      if (!state.keysSeen.has(k.name)) {
+        state.keysSeen.add(k.name);
+        if (k.format !== "legacy") state.keysSelected.add(k.name);
+      }
+    }
+    renderKeys();
+  }
+
+  function renderKeys() {
+    const host = $("key-list");
+    host.innerHTML = "";
+    if (!state.keys.length) {
+      host.append(create("div", { class: "empty" }, [document.createTextNode(
+        "No keys yet. Anonymize a file first, or [ IMPORT KEY FILE ] from another machine.")]));
+    }
+    for (const k of state.keys) {
+      const cb = create("input", { type: "checkbox", "data-name": k.name, "aria-label": `use key ${k.name}` });
+      cb.checked = state.keysSelected.has(k.name);
+      cb.addEventListener("change", () => {
+        if (cb.checked) state.keysSelected.add(k.name); else state.keysSelected.delete(k.name);
+        updateKeysMeta();
+      });
+      const info = create("div", {}, [
+        create("div", { class: "file" }, [document.createTextNode(k.original_filename || k.name)]),
+        create("div", { class: "meta" }, [document.createTextNode(
+          `${(k.created_at || k.modified || "").replace("T", " ").replace("Z", "")} · ${k.name}`)]),
+      ]);
+      const count = create("div", { class: "count" }, [document.createTextNode(
+        `${Number(k.ids).toLocaleString()} ids`)]);
+      if (k.format === "legacy") {
+        count.append(create("span", { class: "legacy" }, [document.createTextNode("[LEGACY 4-CHAR]")]));
+      }
+      const row = create("label", { class: "key-row" }, [cb, info, count]);
+      host.append(row);
+    }
+    updateKeysMeta();
+  }
+
+  function updateKeysMeta() {
+    const n = state.keysSelected.size;
+    $("keys-meta").textContent = `${n} of ${state.keys.length} selected`;
+    maybeEnableUnanon();
+  }
+
+  function maybeEnableUnanon() {
+    const haveKeys = state.keysSelected.size > 0;
+    $("btn-restore-text").disabled = !(haveKeys && $("restore-input").value.trim());
+    $("btn-unanonymize").disabled = !(haveKeys && state.unanon.file);
+  }
+
   function bindUnanonymize() {
     bindDropzone("dropzone-unanon", "unanon-file-input", (file) => {
       state.unanon.file = file;
@@ -706,32 +828,172 @@
       rebindDropzones();
       maybeEnableUnanon();
     });
-    bindDropzone("dropzone-key", "key-file-input", (file) => {
-      state.unanon.key = file;
-      showFileLoaded("dropzone-key", file);
-      rebindDropzones();
-      maybeEnableUnanon();
-    });
+    $("restore-input").addEventListener("input", maybeEnableUnanon);
+    $("btn-restore-text").addEventListener("click", runRestoreText);
     $("btn-unanonymize").addEventListener("click", runUnanonymize);
+    $("btn-keys-all").addEventListener("click", () => {
+      for (const k of state.keys) state.keysSelected.add(k.name);
+      renderKeys();
+    });
+    $("btn-keys-none").addEventListener("click", () => {
+      state.keysSelected.clear();
+      renderKeys();
+    });
+    $("btn-key-import").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("key-import-input").click(); }
+    });
+    $("key-import-input").addEventListener("change", async (e) => {
+      const f = e.target.files && e.target.files[0];
+      e.target.value = "";
+      if (!f) return;
+      const fd = new FormData();
+      fd.append("key", f);
+      try {
+        const resp = await fetch("/api/keys/import", { method: "POST", body: fd });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || "import failed");
+        state.keysSeen.add(data.imported);
+        state.keysSelected.add(data.imported);   // an import is an explicit choice
+        await loadKeys();
+      } catch (exc) {
+        showUnanonError(`Import failed: ${exc.message}`);
+      }
+      refreshLog();
+    });
+    $("btn-copy-restored").addEventListener("click", () =>
+      copyText($("restored-text").value, $("btn-copy-restored")));
+    $("btn-dl-restored-text").addEventListener("click", () => {
+      const blob = new Blob([state.restoredText], { type: "text/plain;charset=utf-8" });
+      const a = create("a", { href: URL.createObjectURL(blob), download: state.restoredName || "restored.txt" });
+      document.body.append(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+    });
   }
-  function maybeEnableUnanon() {
-    $("btn-unanonymize").disabled = !(state.unanon.file && state.unanon.key);
+
+  function showUnanonError(msg) {
+    const el = $("unanon-result");
+    el.textContent = `[!] ${msg}`;
+    show(el);
   }
+
+  function clearRestoreOutput() {
+    hide($("unanon-result"));
+    hide($("lbl-restore"));
+    hide($("block-restore"));
+    hide($("btn-dl-restored-file"));
+    $("restore-report").innerHTML = "";
+    $("restored-text").value = "";
+  }
+
+  async function runRestoreText() {
+    clearRestoreOutput();
+    const btn = $("btn-restore-text");
+    btn.disabled = true;
+    try {
+      const data = await api("/api/unanonymize/text", {
+        method: "POST",
+        body: JSON.stringify({ text: $("restore-input").value, keys: [...state.keysSelected] }),
+      });
+      showRestored(data.text, data.report, "restored.txt", null);
+    } catch (exc) {
+      showUnanonError(exc.message);
+    }
+    maybeEnableUnanon();
+    refreshLog();
+  }
+
   async function runUnanonymize() {
+    clearRestoreOutput();
     const fd = new FormData();
     fd.append("file", state.unanon.file);
-    fd.append("key", state.unanon.key);
-    const out = $("unanon-result");
-    out.textContent = "running...";
+    fd.append("keys", JSON.stringify([...state.keysSelected]));
+    const btn = $("btn-unanonymize");
+    btn.disabled = true;
     try {
       const resp = await fetch("/api/unanonymize", { method: "POST", body: fd });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || "failed");
-      out.innerHTML = `restored: <a href="${data.download_url}" download>${escapeHtml(data.output_filename)}</a>`;
+      const txtName = data.output_filename.replace(/\.[^.]+$/, "") + ".txt";
+      showRestored(data.text, data.report, txtName, data);
     } catch (exc) {
-      out.textContent = `failed: ${exc.message}`;
+      showUnanonError(exc.message);
     }
+    maybeEnableUnanon();
     refreshLog();
+  }
+
+  function showRestored(text, report, txtName, fileData) {
+    state.restoredText = text || "";
+    state.restoredName = txtName;
+    renderRestoreReport(report, fileData);
+    setTabular($("restored-text"), fileData ? fileData.output_filename : "");
+    $("restored-text").value = state.restoredText;
+    $("restored-meta").textContent = `${state.restoredText.length.toLocaleString()} chars`;
+    const link = $("btn-dl-restored-file");
+    if (fileData) {
+      link.href = fileData.download_url;
+      link.setAttribute("download", fileData.output_filename);
+      link.textContent = `[ DOWNLOAD ${fileData.output_filename.split(".").pop().toUpperCase()} ]`;
+      show(link);
+    }
+    show($("lbl-restore"));
+    show($("block-restore"));
+    $("lbl-restore").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function renderRestoreReport(r, fileData) {
+    const tbl = $("restore-report");
+    tbl.innerHTML = "";
+    const rule = "─".repeat(44);
+    const lines = [];
+    const W = 14, N = 8;
+    lines.push({ text: rule, cls: "rule" });
+    if (fileData) lines.push({ text: `FILE: ${fileData.output_filename}` });
+    const clean = r.unresolved_count === 0 && r.residual === 0;
+    lines.push({
+      text: `RESTORED: ${r.restored.toLocaleString()} identifier(s) -> original values`,
+      cls: r.restored > 0 && clean ? "verified" : "",
+    });
+    lines.push({ text: `KEYS USED: ${r.keys_used.length}` });
+    lines.push({ text: rule, cls: "rule" });
+    const tags = Object.keys(r.by_tag || {}).sort();
+    for (const t of tags) {
+      lines.push({ text: padRight(t, W) + String(r.by_tag[t].toLocaleString()).padStart(N) });
+    }
+    if (tags.length) lines.push({ text: rule, cls: "rule" });
+    if (r.restored === 0 && r.unresolved_count === 0) {
+      lines.push({ text: "No identifiers found in this input.", cls: "unresolved" });
+    }
+    if (r.relabeled) {
+      lines.push({ text: `[i] ${r.relabeled} had a different label from the AI - restored by ID`, cls: "" });
+    }
+    if (r.untagged) {
+      lines.push({ text: `[i] ${r.untagged} appeared as a bare ID - restored by ID`, cls: "" });
+    }
+    if (r.legacy_ambiguous) {
+      lines.push({ text: `[!] ${r.legacy_ambiguous} old 4-char ID(s) pointed at more than one value;`, cls: "unresolved" });
+      lines.push({ text: `    restored to the longest. Check those names.`, cls: "unresolved" });
+    }
+    if (r.unresolved_count) {
+      lines.push({ text: `[!] ${r.unresolved_count} NOT RESTORED - not in the selected keys, left as-is:`, cls: "failed" });
+      const shown = r.unresolved.slice(0, 20);
+      for (const tok of shown) lines.push({ text: `    ${tok}`, cls: "failed" });
+      if (r.unresolved.length > shown.length) {
+        lines.push({ text: `    (+${r.unresolved.length - shown.length} more)`, cls: "failed" });
+      }
+      lines.push({ text: `    Select more keys, or check the AI did not alter these.`, cls: "failed" });
+    }
+    if (r.residual) {
+      lines.push({ text: `[!] ${r.residual} identifier(s) could not be written back into the file.`, cls: "failed" });
+      lines.push({ text: `    Use the text below, or paste the content instead.`, cls: "failed" });
+    }
+    if (r.unresolved_count || r.residual) lines.push({ text: rule, cls: "rule" });
+    for (const l of lines) {
+      const div = create("div", l.cls ? { class: l.cls } : {});
+      div.textContent = l.text;
+      tbl.append(div);
+    }
   }
 
   // Re-attach dropzones after innerHTML rewrites.
@@ -745,12 +1007,6 @@
     bindDropzone("dropzone-unanon", "unanon-file-input", (file) => {
       state.unanon.file = file;
       showFileLoaded("dropzone-unanon", file);
-      rebindDropzones();
-      maybeEnableUnanon();
-    });
-    bindDropzone("dropzone-key", "key-file-input", (file) => {
-      state.unanon.key = file;
-      showFileLoaded("dropzone-key", file);
       rebindDropzones();
       maybeEnableUnanon();
     });
@@ -771,6 +1027,7 @@
     renderPiiGrid();
     rebindDropzones();
     bindUnanonymize();
+    loadKeys();
 
     await loadEndpoints();
     await loadGithub();
@@ -877,38 +1134,12 @@
     $("btn-dl-key").addEventListener("click", () => {
       window.location.href = `/api/anonymize/${state.sessionId}/download/key`;
     });
-    $("btn-view-text").addEventListener("click", async () => {
-      if (!state.sessionId) return;
-      try {
-        const data = await api(`/api/anonymize/${state.sessionId}/text`);
-        $("screen-text").value = data.text;
-        $("screen-text-meta").textContent =
-          `${data.char_count.toLocaleString()} chars · re-extracted from ${data.filename}`;
-        show($("block-screen-text"));
-        $("screen-text").focus();
-        $("screen-text").select();
-      } catch (exc) {
-        alert(`Could not load text: ${exc.message}`);
-      }
-    });
+    $("btn-view-text").addEventListener("click", () => loadScreenText(true));
     $("btn-hide-text").addEventListener("click", () => hide($("block-screen-text")));
-    $("btn-copy-text").addEventListener("click", async () => {
-      const ta = $("screen-text");
-      ta.focus();
-      ta.select();
-      const text = ta.value;
-      let ok = false;
-      try {
-        await navigator.clipboard.writeText(text);
-        ok = true;
-      } catch {
-        try { ok = document.execCommand("copy"); } catch { ok = false; }
-      }
-      const btn = $("btn-copy-text");
-      const original = btn.textContent;
-      btn.textContent = ok ? "[ COPIED ]" : "[ COPY FAILED ]";
-      setTimeout(() => { btn.textContent = original; }, 1200);
-    });
+    $("btn-copy-text").addEventListener("click", () =>
+      copyText($("screen-text").value, $("btn-copy-text")));
+    $("btn-copy-ai").addEventListener("click", () =>
+      copyText(`${AI_NOTE}\n\n${$("screen-text").value}`, $("btn-copy-ai")));
     $("btn-push-github").addEventListener("click", () => {
       show($("panel-push"));
       const sel = $("push-conn");
@@ -961,6 +1192,7 @@
   });
 
   function switchTab(which) {
+    if (which === "unanonymize") loadKeys();   // pick up keys from recent runs
     if (which === "anonymize") {
       $("tab-anonymize").classList.add("active");
       $("tab-anonymize").setAttribute("aria-selected", "true");

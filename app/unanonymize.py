@@ -1,23 +1,44 @@
-"""Unanonymize pipeline (PRD 5.8).
+"""Unanonymize pipeline (PRD 5.8, extended 2026-09-27 for AI round trips).
 
-Inverts the replacement map (placeholder -> original), sorts by placeholder
-length descending (collision prevention - same as forward pass), and applies
-to the document using the same writers.
+Restores a file - the anonymized file itself, or anything an AI tool gave
+back after analyzing it (.txt .md .csv .xlsx .docx ...) - using one or more
+key files. Identifier matching is tolerant of how AI tools mangle tokens
+(see restorer.py) and uses the same format-aware writers as anonymize, so
+formatting survives and identifiers split across Word runs are still found.
 
-Output filename: `{original_name}_restored.{ext}`
+After writing, the output is re-extracted and scanned again. Any identifier
+that the keys could resolve but that is still present is counted as
+`residual` in the report, so a partial restore is never silent.
+
+Output filename: `{input_name}_restored.{ext}` (an `_anon_<session>` suffix
+from our own anonymized files is dropped, so `donors_anon_ab12cd34.xlsx`
+restores to `donors_restored.xlsx`).
 """
 
 from __future__ import annotations
 
+import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Union
 
 from .config import OUTPUT_DIR
 from .extractors import extract
 from .logging_setup import get_logger
+from .restorer import KeyIndex, RestoreReport, TokenRestorer, build_index, new_report
 from .scrubber import scrub_csv, scrub_docx, scrub_text, scrub_xlsx
 
 log = get_logger("unanon")
+
+_ANON_SUFFIX_RE = re.compile(r"_anon_[0-9a-f]{8}$")
+
+
+@dataclass
+class RestoreResult:
+    output_path: Path
+    report: RestoreReport
+    text: str            # re-extracted text of the restored output (for the UI)
 
 
 def _unique_path(base: Path) -> Path:
@@ -32,46 +53,62 @@ def _unique_path(base: Path) -> Path:
         i += 1
 
 
-def reverse_map(replacement_map: dict[str, str]) -> dict[str, str]:
-    """Invert and sort longest-placeholder-first."""
-    inverted = {placeholder: original for original, placeholder in replacement_map.items()}
-    return dict(sorted(inverted.items(), key=lambda kv: -len(kv[0])))
-
-
-def unanonymize_file(input_path: Path, key_payload: dict) -> Path:
-    """Restore an anonymized file using the loaded key payload."""
-    rmap = reverse_map(key_payload.get("replacement_map") or {})
-    if not rmap:
-        raise ValueError("key file has empty replacement_map")
+def restore_file(input_path: Path, index: KeyIndex, display_name: str = "") -> RestoreResult:
+    """Restore `input_path` using the merged key `index`."""
+    if index.size == 0:
+        raise ValueError("the selected key(s) contain no identifiers")
 
     extracted = extract(input_path)
     suffix = extracted.original_suffix
     out_ext = extracted.output_ext
 
-    base = key_payload.get("original_filename") or input_path.name
-    out_path = _unique_path(OUTPUT_DIR / f"{Path(base).stem}_restored{out_ext}")
+    stem = _ANON_SUFFIX_RE.sub("", Path(display_name or input_path.name).stem) or "document"
+    out_path = _unique_path(OUTPUT_DIR / f"{stem}_restored{out_ext}")
+
+    restorer = TokenRestorer(index)
+    # Tally from the text the operator actually sees, once - the writers make
+    # several passes and would double count.
+    report = new_report(index)
+    restorer.scan(extracted.text, report)
 
     log.info(
-        "unanonymize start: input_suffix=%s output=%s entities=%d",
-        suffix, out_path.name, len(key_payload.get("entity_registry") or {}),
+        "unanonymize start: input_suffix=%s output=%s keys=%d ids=%d",
+        suffix, out_path.name, len(index.key_names), index.size,
     )
 
     try:
         if suffix in ("xlsx", "xls", "ods"):
-            result = scrub_xlsx(extracted.working_path, rmap, out_path)
+            result = scrub_xlsx(extracted.working_path, restorer, out_path, deep_clean=False)
         elif suffix in ("docx", "doc", "odt"):
-            result = scrub_docx(extracted.working_path, rmap, out_path)
+            result = scrub_docx(extracted.working_path, restorer, out_path, deep_clean=False)
         elif suffix == "csv":
-            result = scrub_csv(extracted, rmap, out_path)
-        else:  # txt / rtf / html / pdf / pptx / etc - text output
-            # If the input is a previously-anonymized .txt that we need to invert,
-            # treat it as text directly even if its source was PDF/PPTX.
-            result = scrub_text(extracted, rmap, out_path)
+            result = scrub_csv(extracted, restorer, out_path)
+        else:  # txt / md / rtf / html / pdf / pptx - text output
+            result = scrub_text(extracted, restorer, out_path)
     finally:
         # LibreOffice conversion dirs must not outlive the run (temp hygiene).
         wp = extracted.working_path
         if wp and wp != input_path and Path(wp).parent.name.startswith("docanon-conv-"):
             shutil.rmtree(Path(wp).parent, ignore_errors=True)
 
-    log.info("unanonymize complete: out=%s bytes=%d", out_path.name, result.bytes_written)
-    return result.output_path
+    # Post-restore check: nothing the keys can resolve may remain.
+    restored_text = extract(out_path).text
+    residual = RestoreReport()
+    restorer.scan(restored_text, residual)
+    report.residual = residual.restored
+
+    log.info(
+        "unanonymize complete: out=%s bytes=%d restored=%d relabeled=%d untagged=%d "
+        "unresolved=%d residual=%d",
+        out_path.name, result.bytes_written, report.restored, report.relabeled,
+        report.untagged, report.unresolved_count, report.residual,
+    )
+    return RestoreResult(output_path=result.output_path, report=report, text=restored_text)
+
+
+def unanonymize_file(input_path: Path, key: Union[dict, KeyIndex]) -> Path:
+    """Restore a file with a single key payload (or a prebuilt index)."""
+    index = key if isinstance(key, KeyIndex) else build_index(
+        [(key.get("original_filename") or "key", key)]
+    )
+    return restore_file(input_path, index).output_path

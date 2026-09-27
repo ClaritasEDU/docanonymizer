@@ -544,3 +544,103 @@ gate; and the web edition's CSP (`connect-src 'none'`).
 
 1. None for this repo — B50 (in parentpoint) is the pointer if the
    pipeline-integration question ever becomes a build.
+
+---
+
+## Session 007 - 2026-09-27 (Claude Code, branch `claude/great-tesla-hoj1yy`)
+
+**Type:** Feature + hardening - unique 12-character identifiers and the AI round trip
+
+### The request
+
+"Add a spreadsheet -> names, emails, phones, and physical addresses become
+unique 12-character hexadecimal identifiers -> show me the output -> I run
+analyses through AI platforms -> whatever comes back is de-anonymized with no
+mixing up of names, people, addresses, or contact information. Hexadecimals
+assigned must be unique."
+
+### Decisions made
+
+1. **One ID per distinct value, never shared.** The v1.3 rule gave all of an
+   entity's PII one suffix (`[PERSON_3A4F]`, `[EMAIL_3A4F]`). That violates
+   "must be unique" and makes AI output ambiguous: an answer citing only the
+   ID could mean the name or the email. v1.3 could also give two name
+   variants the same placeholder (then restore picked one arbitrarily). Now
+   each distinct value gets its own `[TAG_XXXXXXXXXXXX]`. The model's
+   `linked_to` is kept in the key file as a relationship only.
+2. **Uniqueness is enforced across files, for all time.** New IDs are checked
+   against the session, every key in `/keys`, an append-only
+   `keys/issued_ids.ledger` (random IDs only, no PII), and IDs issued by the
+   running process. Two spreadsheets pasted into one AI chat can never
+   collide. IDs always have a letter and a digit and never look like Excel
+   scientific notation.
+3. **Restore tolerates what AI tools do to tokens** - lowercase, dropped
+   brackets, markdown escaping, relabeled tags, bare hex. The unique hex is
+   what makes that safe. Unresolvable tokens are listed, never guessed.
+4. **All keys selected by default** in the restore picker (safe because IDs
+   never overlap). Legacy 4-char keys are opt-in; conflicting keys refuse.
+5. **[ COPY FOR AI ]** prepends one sentence asking the AI to keep
+   identifiers exactly as written.
+
+### What was built or changed
+
+- `app/ids.py` (new): ID rules, reserved-ID loading, ledger.
+- `app/replacer.py` (new): single-pass, leftmost-longest trie-regex engine.
+  Fixes two bugs in the old per-entry `str.replace` loop: (a) a short value
+  could rewrite INSIDE an earlier placeholder (`2B1D` inside
+  `[PERSON_3A4F9C2B1D0E]`), breaking reversal; (b) quadratic time - 1,000
+  rows took 3.2s, 5,000 rows ~80s. Now 3,000 rows is well under a second of
+  matching. Short numbers (no letters, <7 digits) match whole numbers only.
+- `app/restorer.py` (new): tolerant token grammar, merged multi-key index,
+  conflict detection, legacy 4-char support, restore report.
+- `app/mapper.py`: unique ID per value; `linked_to` recorded, not shared.
+- `app/scrubber.py`: every pass on the shared engine; `deep_clean=False`
+  mode for restores (never strips the AI file's comments/metadata);
+  XLSX numeric/date cells scrubbed; PII sheet names get the bracket-free
+  token and all formula / defined-name / pivot references follow; the raw
+  XML pass never writes a short number into markup or number-only nodes.
+- `app/verifier.py`: same engine; ignores text inside placeholders and XML
+  bookkeeping numbers (a 2-digit grade occurs inside ~4% of random 12-char
+  IDs and would otherwise dead-end clean files).
+- `app/unanonymize.py`: `restore_file()` with post-restore residual check.
+- `app/key_files.py`: `id_format: "hex12"`, ledger write on save, richer
+  listing, import, traversal-safe name resolution.
+- `app/server.py`: `POST /api/unanonymize/text` (nothing written to disk),
+  `POST /api/keys/import`, `/api/unanonymize` accepts a list of saved keys,
+  cached preview (was recomputed every 800ms poll), error paths logged,
+  app no longer built twice at startup (startup was logged twice).
+- `app/pipeline.py`: an exception during verification now ends the run with
+  an error and quarantines the output (before: worker died silently and the
+  UI showed "verification scan running" forever).
+- `app/extractors.py`: `.md` supported (AI tools answer in markdown).
+- Frontend: output opens on screen automatically once verified, spreadsheet
+  output shown one row per line, `[ COPY FOR AI ]` / `[ COPY TEXT ONLY ]`;
+  UNANONYMIZE tab rebuilt - key picker, paste-to-restore, file restore,
+  import key, monospace restore report; narrow-screen layout fixed.
+- Docs: CLAUDE.md business rules 1-4, business_spec.md, PRD 4.5 / 5.1-5.3 /
+  5.5 / 5.7 / 5.8 / 5.10, README round-trip guide.
+
+### Pre-existing bugs found and fixed along the way
+
+- Phones/ZIPs stored as numbers and birthdays stored as dates were skipped
+  by the cell pass, then the raw XML pass wrote a placeholder into a numeric
+  cell - a workbook Excel had to repair.
+- A sheet named after a family ("Smith Family") became `[ORG_...]`; brackets
+  are illegal in sheet names, openpyxl refused the file, and verification
+  crashed the worker (the UI hang above).
+- The raw XML pass rewrote cell coordinates: with a grade "94" in the map,
+  `row r="94"` / `c r="A94"` became `r="A[GRADE_...]"`.
+
+### Tests
+
+- pytest: 76 -> 151 passing, stable across repeated runs. New suites:
+  `test_ids.py`, `test_replacer.py` (fuzzed against a brute-force
+  reference), `test_restorer.py` (every mangled form, 1,000 values x 4,000
+  randomly mangled mentions with zero mix-ups, multi-key, conflicts, legacy,
+  md/csv/xlsx/docx restores incl. split runs and `&`/`<` escaping, numeric
+  cells, sheet-name round trip), `test_restore_api.py` (routes + the full
+  spreadsheet -> AI -> restore flow through the API).
+- Live browser (Playwright + real Flask + mock Ollama): 52/52 checks - the
+  whole flow clicked through as an operator would, clipboard contents,
+  downloads, key import, legacy key, errors, 375px layout, zero requests
+  off localhost, uploads/ empty afterwards, no PII in the log.

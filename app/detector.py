@@ -17,6 +17,7 @@ import time
 from typing import Callable, Iterable, Optional
 
 from . import endpoints as endpoints_mod
+from . import ids
 from . import llm
 from .chunker import chunk_text, count_tokens
 from .logging_setup import get_logger
@@ -36,14 +37,14 @@ OUTPUT RULES (STRICT):
 - Each item: {{"text": "exact text as it appears", "type": "TAG", "linked_to": "<hex_id or null>"}}
 - "type" MUST be one of: {tags}
 - Include EVERY occurrence, including repeats. Match text exactly as it appears in the chunk.
-- "linked_to" is a 4-character uppercase hex id from the registry below if you can confidently associate this PII item with an entity already there. Otherwise null.
+- "linked_to" is a 12-character uppercase hex id from the registry below if this PII item clearly belongs to an entity already there (for example the email of a person already listed). Otherwise null.
 - Do NOT invent entities. Do NOT paraphrase the text.
 - If a chunk has no PII, return [].
 
 ALLOWED TAGS (only these; ignore everything else):
 {tag_table}
 
-ENTITY REGISTRY (already-known entities from previous chunks; use linked_to to bind):
+ENTITY REGISTRY (already-known entities from previous chunks; use linked_to to relate):
 {registry}
 
 CHUNK TEXT:
@@ -169,7 +170,8 @@ def detect_pii(
     chunks = chunk_text(text, chunk_tokens=chunk_budget) if chunk_budget else chunk_text(text)
     log.info("detection start: chunks=%d total_chars=%d", len(chunks), len(text))
 
-    registry = EntityRegistry()
+    # IDs already released in earlier files are off-limits (ids.py).
+    registry = EntityRegistry(reserved=ids.load_reserved())
     for idx, chunk in enumerate(chunks, start=1):
         prompt = _build_prompt(chunk, allowed, registry)
         tokens = count_tokens(prompt)
