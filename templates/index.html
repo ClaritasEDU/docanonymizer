@@ -140,16 +140,16 @@
     <div class="section-label hidden" id="lbl-preview">PREVIEW - REVIEW BEFORE SCRUB</div>
     <div class="hidden" id="block-preview">
       <div class="preview-summary">
-        <span><b>DETECTED:</b> <span id="prev-entities">0</span> entities</span>
-        <span><b>REPLACEMENTS:</b> <span id="prev-replacements">0</span></span>
-        <span><b>TYPES:</b> <span id="prev-types">-</span></span>
+        <span><b>DETECTED:</b> <span id="prev-entities">0</span> values</span>
       </div>
+      <div class="type-toggles" id="prev-types" role="group" aria-label="replace these types"></div>
+      <div class="note-plain hidden" id="prev-amounts"></div>
       <div class="preview-body" id="preview-body"></div>
       <div class="preview-actions">
         <button type="button" class="btn" id="btn-confirm">[ CONFIRM AND SCRUB ]</button>
         <button type="button" class="btn secondary" id="btn-cancel">[ CANCEL ]</button>
         <span class="grow"></span>
-        <span class="preview-hint">Click any placeholder to deselect a false positive</span>
+        <span class="preview-hint">Click a placeholder, or a type above, to keep it as original text</span>
       </div>
     </div>
 

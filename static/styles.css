@@ -322,6 +322,8 @@ select {
 }
 .placeholder:hover { background: rgba(255, 170, 0, 0.12); }
 
+.type-toggles { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.type-toggles .btn[aria-pressed="false"] { color: var(--text-secondary); text-decoration: line-through; }
 .preview-actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 14px; }
 .preview-actions .grow { flex: 1; }
 .preview-hint { color: var(--text-secondary); font-size: 12px; }

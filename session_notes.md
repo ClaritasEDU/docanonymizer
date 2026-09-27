@@ -725,3 +725,59 @@ parity on thousands of randomized cases (replacer, number boundaries, raw
 XML, reference rewrites, sheet titles, overlap unions, formula literals,
 restore) with zero mismatches, and docx/xlsx round trips validated by
 python-docx and openpyxl.
+
+---
+
+## Session 007 (continued) - 2026-09-27 - "Have you tested comprehensively?"
+
+Owner asked. Honest answer at that point: extensively, but every run had
+used a mocked LLM, no output had been opened in a real office suite, and
+LibreOffice formats, PDF/PPTX, non-English names, cross-edition keys, and
+concurrent runs were untested. This round closed those gaps. The gaps found
+real problems.
+
+### What real-world testing found (all fixed, all with regression tests)
+
+1. **Accented / non-Latin names leaked from spreadsheets** (pre-existing).
+   openpyxl writes "José" as `Jos&#233;`. No raw-XML pass could match it, so
+   a name in formula text or document properties shipped, and the verifier
+   was blind to it. Found by opening outputs in LibreOffice (#NAME? errors).
+   Scrubber now decodes non-ASCII character references first; verifier
+   decodes all of them and also scans sheet names referenced in formulas.
+2. **Detection timed out on a 25-row sheet with a real model.** The app
+   waited for llama3.2's whole answer with a 120s cap. Calls now stream and
+   fail only on a stall (LLM_STALL_TIMEOUT_S, default 180).
+3. **Silent-truncation risks.** Ollama's default context could drop the
+   start of a prompt; an answer cut off for length, or unreadable, was
+   treated as "no PII". Now: explicit num_ctx (OLLAMA_NUM_CTX 8192), JSON
+   schema output, split-and-rescan on truncation, unreadable = failed scan.
+4. **Real llama3.2 recall was 81% on dense data** and it tagged pledge
+   amounts as PII (FINANCIAL, ID, even PERSON). Added: amount filter (every
+   type except SID/GRADE), pattern backstop (email, phone, SSN, card, IP,
+   street address), spreadsheet column consensus, preview type toggles.
+   Same sheet, same model: 111/112 caught, pledge column intact.
+5. **Uploads could linger** (pre-existing): starting a second file or
+   closing the tab at the preview left the original on disk indefinitely.
+   Now cancelled by the page, expired server-side after 2h at preview, and
+   purged at startup.
+6. **Race in the upload route** (pre-existing): a corrupt file's worker
+   could delete the upload before the route read its size - 500 instead of
+   the real error. Found as a 1-in-5 flake under CPU load.
+7. Unquoted sheet references (`=José!A1`) came back quoted - equivalent but
+   not text-exact. Now keep their style.
+8. Prompt asks for each distinct value once (repeats were most of the
+   runtime and are replaced automatically anyway).
+
+### Test inventory at end of round
+
+- pytest: 193, stable over 10 consecutive full runs under heavy CPU load.
+- Local app browser (Playwright, desktop): 60/60, incl. type toggles and
+  upload hygiene (second file mid-preview, tab closed at preview).
+- Gap suite (real pipeline, stubbed LLM): 39/39 - Unicode in txt/csv/docx/
+  xlsx byte- or value-exact; LibreOffice opens and recalculates anonymized
+  and restored xlsx/docx; .xls/.ods/.odt/.doc via LibreOffice; PDF; PPTX
+  incl. speaker notes; two concurrent sessions share zero IDs.
+- Real LLM (Ollama 0.34.4, llama3.2 on a 4-core CPU): donor sheet 16/16
+  caught, amounts intact, exact restore; pledge sheet 111/112.
+- Web edition: 203 checks incl. JS-vs-Python parity and cross-edition keys
+  (web key restores in the local app and vice versa, exact).

@@ -75,19 +75,23 @@ _V_RE = re.compile(r"<v>[^<]*</v>")
 _SHORT_NUMERIC_NODE_RE = re.compile(r">([\s\d.,:+\-]+)<")
 
 
-# Formula text (cells, defined names, chart refs): only "string literals" can
-# hold PII. The rest is references and operators - a PII value like "B7"
+# Formula text (cells, defined names, chart refs): PII can live in "string
+# literals" and in the sheet names it references ('Smith Family'!A1). Cell
+# references and operators are not scanned - a PII value like "B7"
 # legitimately remains there as a cell reference and must not fail the scan.
 _FORMULA_EL_RE = re.compile(
     r"(<(?:\w+:)?(f|definedName)(?:\s[^>]*)?(?<!/)>)(.*?)(</(?:\w+:)?\2>)", re.DOTALL)
 _STRING_LIT_RE = re.compile(r'"(?:[^"]|"")*"')
+_SHEET_REF_RE = re.compile(r"'((?:[^']|'')+)'!|([^\W\d][\w.]*)!")
 
 
 def _formula_literals_only(xml: str) -> str:
     def repl(m: re.Match) -> str:
-        inner = m.group(3).replace("&quot;", '"')
+        inner = m.group(3).replace("&quot;", '"').replace("&apos;", "'")
         lits = [x[1:-1].replace('""', '"') for x in _STRING_LIT_RE.findall(inner)]
-        return m.group(1) + "\n".join(lits) + m.group(4)
+        rest = _STRING_LIT_RE.sub(" ", inner)
+        refs = [q.replace("''", "'") if q else u for q, u in _SHEET_REF_RE.findall(rest)]
+        return m.group(1) + "\n".join(lits + refs) + m.group(4)
     return _FORMULA_EL_RE.sub(repl, xml)
 
 
@@ -113,7 +117,21 @@ def _tag_of(placeholder: str) -> str:
     return body.split("_", 1)[0] if "_" in body else "UNKNOWN"
 
 
+_CHAR_REF_RE = re.compile(r"&#(x[0-9A-Fa-f]+|[0-9]+);")
+
+
+def _char_ref(m: re.Match) -> str:
+    ref = m.group(1)
+    try:
+        cp = int(ref[1:], 16) if ref[0] in "xX" else int(ref)
+        return chr(cp)
+    except (ValueError, OverflowError):
+        return m.group(0)
+
+
 def _xml_unescape(s: str) -> str:
+    # Numeric references too: openpyxl writes "José" as "Jos&#233;".
+    s = _CHAR_REF_RE.sub(_char_ref, s)
     return (s.replace("&lt;", "<").replace("&gt;", ">")
              .replace("&quot;", '"').replace("&apos;", "'").replace("&amp;", "&"))
 

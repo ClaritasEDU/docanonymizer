@@ -670,3 +670,67 @@ def test_sheet_titles_that_differ_only_by_case_stay_distinct(tmp_path):
     assert len({t.casefold() for t in anon.sheetnames}) == len(anon.sheetnames)
     assert restored.sheetnames == titles + ["Summary"]
     assert res.report.residual == 0
+
+
+def test_non_ascii_names_in_formulas_and_metadata_are_scrubbed(tmp_path):
+    """Found by opening outputs in a real office suite: openpyxl writes "José"
+    as "Jos&#233;", so accented names in formula references and literals were
+    never matched - they shipped, and the verifier could not see them."""
+    import zipfile
+    from openpyxl import Workbook, load_workbook
+    from app.mapper import EntityRegistry
+    from app.restorer import build_index
+    from app.scrubber import scrub_xlsx
+    from app.unanonymize import restore_file
+    from app.verifier import verify_output
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "José Álvarez"
+    ws["E2"], ws["E3"] = 250, 75
+    s2 = wb.create_sheet("Summary")
+    s2["A1"] = "='José Álvarez'!E2+'José Álvarez'!E3"
+    s2["A2"] = '="Gift from Nguyễn Thị Minh Khai"'
+    s2["A3"] = "=José!A1"
+    wb.create_sheet("José")
+    wb.properties.title = "Pledges from 王小明"
+    src = tmp_path / "u.xlsx"
+    wb.save(src)
+    reg = EntityRegistry()
+    for v in ("José Álvarez", "Nguyễn Thị Minh Khai", "王小明", "José"):
+        reg.add(v, "PERSON")
+    rmap = reg.as_replacement_map()
+    out = tmp_path / "u_anon_ab12cd34.xlsx"
+    result = scrub_xlsx(src, rmap, out)
+
+    raw = "".join(zipfile.ZipFile(out).read(n).decode("utf-8", "ignore")
+                  for n in zipfile.ZipFile(out).namelist() if n.endswith(".xml"))
+    for leaked in ("Jos&#233;", "&#193;lvarez", "Nguy&#7877;n", "&#29579;", "José", "王小明", "Nguyễn"):
+        assert leaked not in raw, leaked
+    anon = load_workbook(out)
+    t_ja = reg.replacements["José Álvarez"].strip("[]")
+    t_j = reg.replacements["José"].strip("[]")
+    assert anon["Summary"]["A1"].value == f"='{t_ja}'!E2+'{t_ja}'!E3"
+    assert anon["Summary"]["A3"].value == f"={t_j}!A1"            # unquoted stays unquoted
+    assert verify_output(out, rmap).passed
+
+    res = restore_file(out, build_index([("k", {"replacement_map": rmap,
+                                                 "sheet_titles": result.sheet_titles})]))
+    back = load_workbook(res.output_path)
+    assert back.sheetnames == ["José Álvarez", "Summary", "José"]
+    assert [c.value for c in back["Summary"]["A"]] == [
+        "='José Álvarez'!E2+'José Álvarez'!E3", '="Gift from Nguyễn Thị Minh Khai"', "=José!A1"]
+
+
+def test_verifier_sees_numeric_character_references(tmp_path):
+    """A leaky file where the name only exists as &#NNN; references must fail."""
+    import zipfile
+    from openpyxl import Workbook
+    from app.verifier import verify_output
+    wb = Workbook()
+    wb.active["A1"] = '="Gift from José"'
+    wb.create_sheet("Summary")["A1"] = "='José Smith'!A1"
+    leaky = tmp_path / "leak.xlsx"
+    wb.save(leaky)
+    assert "&#233;" in zipfile.ZipFile(leaky).read("xl/worksheets/sheet1.xml").decode()
+    assert not verify_output(leaky, {"José": "[PERSON_3A4F9C2B1D0E]"}).passed
+    assert not verify_output(leaky, {"José Smith": "[PERSON_3A4F9C2B1D0E]"}).passed

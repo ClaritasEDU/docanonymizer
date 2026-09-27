@@ -17,11 +17,12 @@ from typing import Optional
 
 from . import endpoints as endpoints_mod
 from .config import KEYS_DIR, OUTPUT_DIR, UPLOADS_DIR
-from .detector import detect_pii
+from .detector import detect_pii, is_plain_amount
 from .extractors import ExtractResult, extract
 from .key_files import new_session_id, save_key_file
 from .logging_setup import get_logger
-from .mapper import EntityRegistry
+from .backstop import column_consensus, pattern_hits
+from .mapper import VALID_TAGS, EntityRegistry
 from .replacer import overlap_unions
 from .scrubber import scrub_csv, scrub_docx, scrub_text, scrub_xlsx
 from .verifier import verify_output
@@ -53,6 +54,7 @@ class Session:
     preview: Optional[dict] = None     # built once after detection; polled often
     error: Optional[str] = None
     created_at: float = field(default_factory=time.monotonic)
+    detected_at: Optional[float] = None   # when the preview became ready
 
 
 def new_session(upload_path: Path, original_filename: str, allowed_tags: list[str],
@@ -77,6 +79,54 @@ def new_session(upload_path: Path, original_filename: str, allowed_tags: list[st
 def get_session(sid: str) -> Optional[Session]:
     with _SESSIONS_LOCK:
         return _SESSIONS.get(sid)
+
+
+# A session parked at the preview this long was abandoned (tab closed without
+# the page reaching the server, browser crash). Its upload still holds the
+# original document, so it is discarded.
+ABANDONED_AFTER_S = 2 * 60 * 60
+
+
+def expire_abandoned(max_idle_s: float = ABANDONED_AFTER_S) -> int:
+    """Discard sessions waiting at the preview for longer than `max_idle_s`.
+
+    Only sessions whose detection finished and that were never confirmed -
+    a detection still running (slow LLM, huge file) is never touched.
+    """
+    now = time.monotonic()
+    with _SESSIONS_LOCK:
+        stale = [s.id for s in _SESSIONS.values()
+                 if s.detected_at is not None and s.verify_result is None
+                 and s.error is None and not s.scrub_steps
+                 and now - s.detected_at > max_idle_s]
+    for sid in stale:
+        discard_session(sid)
+    if stale:
+        log.info("abandoned sessions discarded: %d", len(stale))
+    return len(stale)
+
+
+def purge_stale_uploads() -> int:
+    """Startup: anything already in /uploads belongs to a run that never
+    finished (crash, restart, closed tab). It still holds original documents,
+    so it is deleted - as are leftover LibreOffice conversion temp dirs."""
+    import tempfile
+    removed = 0
+    for p in UPLOADS_DIR.iterdir():
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink()
+            removed += 1
+        except OSError as exc:
+            log.warning("stale upload not removed: %s", type(exc).__name__)
+    for d in Path(tempfile.gettempdir()).glob("docanon-conv-*"):
+        shutil.rmtree(d, ignore_errors=True)
+        removed += 1
+    if removed:
+        log.info("startup cleanup: %d stale upload(s) / conversion dir(s) deleted", removed)
+    return removed
 
 
 def discard_session(sid: str) -> None:
@@ -172,6 +222,8 @@ def run_extract_and_detect(sess: Session) -> Session:
             except (ValueError, RuntimeError) as exc:
                 log.warning("custom term skipped: tag=%s reason=%s", tag, exc)
 
+    _backstop(sess)
+
     # Overlapping detections ("Patient Jane" + "Jane Smith") would leave a
     # fragment ("Smith") behind whichever wins. Register the overlapping
     # stretch as one value so it is replaced whole.
@@ -186,6 +238,7 @@ def run_extract_and_detect(sess: Session) -> Session:
     if unions:
         log.info("session %s overlapping detections merged: %d", sess.id, len(unions))
 
+    sess.detected_at = time.monotonic()
     sess.detection_complete = True
     counts = sess.registry.counts_per_type()
     log.info(
@@ -198,11 +251,42 @@ def run_extract_and_detect(sess: Session) -> Session:
     return sess
 
 
-def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None) -> Session:
+def _backstop(sess: Session) -> None:
+    """Deterministic recall on top of the LLM (see backstop.py)."""
+    reg = sess.registry
+    allowed = set(sess.allowed_tags or [])
+    tables = sess.extract.payload.get("tables")
+    if tables is None and sess.extract.payload.get("rows") is not None:
+        tables = [sess.extract.payload["rows"]]            # CSV
+    added: dict[str, int] = {}
+
+    def add(value: str, tag: str, source: str) -> None:
+        if value in reg.replacements or (allowed and tag not in allowed):
+            return
+        try:
+            reg.add(value, tag)
+            added[source] = added.get(source, 0) + 1
+        except (ValueError, RuntimeError) as exc:
+            log.warning("backstop value skipped: tag=%s reason=%s", tag, exc)
+
+    if tables:
+        detected = {o: ph.strip("[]").split("_", 1)[0] for o, ph in reg.replacements.items()}
+        for v, tag in column_consensus(tables, detected, is_plain_amount):
+            add(v, tag, "column")
+    for v, tag in pattern_hits(sess.extract.text, allowed or VALID_TAGS):
+        add(v, tag, "pattern")
+    if added:
+        log.info("session %s backstop added: column_consensus=%d patterns=%d",
+                 sess.id, added.get("column", 0), added.get("pattern", 0))
+
+
+def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None,
+                      deselected_types: Optional[list[str]] = None) -> Session:
     """Apply replacements + deep scrub + verification.
 
     `deselected` is a list of original PII strings the operator removed in
-    the preview panel.
+    the preview panel; `deselected_types` removes every value of those types
+    (whole document, not just the part the preview showed).
     """
     if sess.registry is None or sess.extract is None:
         sess.error = "session not detected yet"
@@ -214,6 +298,10 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None) -> 
 
     for original in deselected or []:
         sess.registry.drop(original)
+    if deselected_types:
+        n = sess.registry.drop_types(deselected_types)
+        log.info("session %s types kept as original text: %s (%d values)",
+                 sess.id, ",".join(sorted(deselected_types)), n)
 
     rmap = sess.registry.as_replacement_map()
     if not rmap:

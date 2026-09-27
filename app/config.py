@@ -37,6 +37,12 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 CHUNK_TOKENS = _int("CHUNK_TOKENS", 2000)
 CHUNK_OVERLAP_TOKENS = _int("CHUNK_OVERLAP_TOKENS", 200)
 PORT = _int("PORT", 5000)
+# Local LLM calls stream their answer; give up only after this many seconds
+# with no new output (a slow machine is fine, a hung model is not).
+LLM_STALL_TIMEOUT_S = _int("LLM_STALL_TIMEOUT_S", 180)
+# Ollama context window. Its built-in default can be smaller than a chunk
+# prompt, and Ollama then silently drops the start of the prompt.
+OLLAMA_NUM_CTX = _int("OLLAMA_NUM_CTX", 8192)
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 

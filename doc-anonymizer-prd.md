@@ -135,6 +135,8 @@ Before any file is written, the app presents a preview panel showing exactly wha
 
 **Preview is mandatory.** There is no "skip preview" option. The confirm step is the last human checkpoint before irreversible replacement.
 
+**Type toggles (v1.4):** above the preview, one `[x] TYPE count` button per detected type. Toggling one off keeps every value of that type as original text across the whole document (sent to the server as `deselected_types`, applied beyond the visible preview window). A note reports how many amount-like values the model tagged but the app kept as original text (see 5.5).
+
 **Large documents:** if extracted text exceeds 50,000 characters, show the first 10,000 chars with a `[ LOAD MORE ]` control and a note: "Showing first 10,000 of N characters. All detected PII will be scrubbed regardless of scroll position."
 
 ### 4.10 GitHub Repository Push
@@ -204,13 +206,19 @@ Each connection stores:
 - Text is chunked to fit within the selected model's context window (default 2,000 tokens per chunk; configurable per endpoint)
 - Chunks overlap by 200 tokens to avoid splitting entities across boundaries
 - After all chunks are processed, the full replacement map is deduplicated before application
+- If the model's answer for a chunk runs out of room (length stop), the chunk is split in half at a line break (small overlap) and each half is rescanned. A chunk that cannot be split further stops the run
+- Calls stream; a chunk fails only if the model produces no output for `LLM_STALL_TIMEOUT_S` (default 180). Ollama requests set `num_ctx` (`OLLAMA_NUM_CTX`, default 8192) so the prompt is never silently truncated
 
 ### 5.5 LLM Prompt Design
 System prompt instructs the local model to:
 - Return ONLY a JSON array, no explanation, no markdown fences
 - Each item: `{"text": "exact text as it appears", "type": "TAG", "linked_to": "12-char id or null"}` (`linked_to` is recorded as a relationship only - see 5.2)
 - Temperature: 0 (deterministic)
-- Include every occurrence, even repeats
+- List each distinct value once (v1.4 - every occurrence is replaced automatically; repeats only slowed the model)
+- Ollama: the answer is constrained by a JSON schema (array of {text, type in allowed tags, optional linked_to}); older Ollama builds that reject a schema fall back to no schema
+- An answer that cannot be parsed as a JSON array is a failed scan (retry, then abort) - never "no PII". Only an explicit `[]` means none
+- Amount filter: a value the model tags as anything other than SID or GRADE is dropped when it is plainly an amount (currency sign, cents, percent, or a bare number under 7 digits). Custom terms are never filtered
+- Deterministic backstop after the model (backstop.py): pattern detectors (email, phone, SSN, Luhn-valid card, IPv4, US street address) and, for XLSX/CSV, column consensus - if the model tagged at least half of a column's values with one type, every other value in the column gets that type (the first non-empty cell is treated as the header; amount-like values excluded unless SID/GRADE)
 
 The prompt must include the current entity registry so the model can recognize already-seen entities and return the correct `linked_to` value.
 
@@ -387,6 +395,8 @@ MAX_UPLOAD_MB=50
 CHUNK_TOKENS=2000
 CHUNK_OVERLAP_TOKENS=200
 PORT=5000
+LLM_STALL_TIMEOUT_S=180     # seconds of model silence before a chunk call fails
+OLLAMA_NUM_CTX=8192         # Ollama context window per request (prompt + answer)
 LOG_LEVEL=INFO
 GITHUB_API_URL=https://api.github.com
 ```

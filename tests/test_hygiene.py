@@ -181,3 +181,79 @@ def test_verify_crash_surfaces_error_and_quarantines_output(tmp_path):
     assert sess.key_path is None
     assert list(OUTPUT_DIR.iterdir()) == []
     assert not up.exists()
+
+
+def test_startup_purges_uploads_left_by_an_unfinished_run():
+    """Anything in uploads/ at startup is an original document from a run
+    that never finished (crash, restart, closed tab) - delete it."""
+    import tempfile
+    from pathlib import Path
+    from app.config import UPLOADS_DIR
+    (UPLOADS_DIR / "donors.xlsx").write_bytes(b"original document bytes")
+    (UPLOADS_DIR / "memo_1.txt").write_text("Jane Smith")
+    conv = Path(tempfile.mkdtemp(prefix="docanon-conv-"))
+    (conv / "x.docx").write_bytes(b"converted copy")
+    from app.server import create_app
+    create_app()
+    assert list(UPLOADS_DIR.iterdir()) == []
+    assert not conv.exists()
+
+
+def test_session_abandoned_at_preview_is_discarded():
+    import json as _json
+    from unittest.mock import patch as _patch
+    from app import detector, pipeline
+    from app.config import UPLOADS_DIR
+    up = UPLOADS_DIR / "memo.txt"
+    up.write_text("Hello Jane Smith")
+    sess = pipeline.new_session(up, "memo.txt", ["PERSON"],
+                                endpoint={"base_url": "http://localhost:1", "model": "m",
+                                          "api_style": "ollama", "nickname": "t"})
+    with _patch.object(detector.llm, "llm_call",
+                       return_value=_json.dumps([{"text": "Jane Smith", "type": "PERSON"}])):
+        pipeline.run_extract_and_detect(sess)
+    assert pipeline.expire_abandoned() == 0          # fresh: kept
+    assert up.exists()
+    sess.detected_at -= pipeline.ABANDONED_AFTER_S + 1
+    assert pipeline.expire_abandoned() == 1          # stale: discarded
+    assert not up.exists()
+    assert pipeline.get_session(sess.id) is None
+
+
+def test_expiry_never_touches_running_or_finished_sessions():
+    from pathlib import Path
+    from app import pipeline
+    from app.config import UPLOADS_DIR
+    running = pipeline.new_session(UPLOADS_DIR / "a.txt", "a.txt", ["PERSON"], endpoint={})
+    running.upload_path.write_text("x")                  # detection never finished
+    done = pipeline.new_session(UPLOADS_DIR / "b.txt", "b.txt", ["PERSON"], endpoint={})
+    done.detected_at = 0.0
+    done.verify_result = {"passed": True}                # finished long ago
+    assert pipeline.expire_abandoned(max_idle_s=0) == 0
+    assert running.upload_path.exists()
+
+
+def test_upload_route_survives_worker_finishing_first():
+    """Race found under load: a corrupt file's worker fails and deletes the
+    upload before the route builds its response - which then crashed (500)
+    reading the file size. Force the worker to finish first."""
+    import io as _io
+    from unittest.mock import patch as _patch
+    from app.config import UPLOADS_DIR
+
+    class Inline:
+        def __init__(self, target=None, args=(), daemon=None, **kw):
+            self.target, self.args = target, args
+
+        def start(self):
+            self.target(*self.args)
+
+    c = _client()
+    with _patch("app.server.threading.Thread", Inline):
+        r = c.post("/api/anonymize/upload", data={"file": (_io.BytesIO(b"not a zip"), "broken.xlsx"),
+                                                  "tags": "ALL"}, content_type="multipart/form-data")
+    assert r.status_code == 200, r.data
+    body = r.get_json()
+    assert body["size"] == 9
+    status = c.get(f"/api/anonymize/{body['session_id']}/status").get_json()
+    assert status["error"] and list(UPLOADS_DIR.iterdir()) == []

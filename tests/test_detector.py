@@ -24,10 +24,16 @@ def test_extract_json_array_with_prose():
     assert _extract_json_array(raw) == [{"text": "x", "type": "EMAIL"}]
 
 
-def test_extract_json_array_empty():
+def test_extract_json_array_empty_vs_unreadable():
+    """Only a real empty array means "no PII". Anything unreadable is a
+    failed scan - it must never let a chunk through unscrubbed."""
     from app.detector import _extract_json_array
-    assert _extract_json_array("") == []
-    assert _extract_json_array("nothing here") == []
+    assert _extract_json_array("[]") == []
+    assert _extract_json_array("") is None
+    assert _extract_json_array("nothing here") is None
+    assert _extract_json_array('[{"text": "Jane Sm') is None          # cut off
+    assert _extract_json_array('{"pii": [{"text": "x", "type": "PERSON"}]}') == [
+        {"text": "x", "type": "PERSON"}]                              # wrapper object
 
 
 def test_detect_pii_uses_llm_call_and_builds_registry():
@@ -134,3 +140,80 @@ def test_detector_aborts_when_chunk_permanently_fails():
                 detector.detect_pii("Jane Smith met Bob.", on_chunk=progress.append)
     # The chunk error was surfaced to the progress stream before aborting.
     assert any(p.get("error") for p in progress)
+
+
+def test_is_plain_amount():
+    from app.detector import is_plain_amount
+    for v in ("250", "1000", "$1,250.00", "1,945", "12.50", "15%", "$ 40", "€300", "999999"):
+        assert is_plain_amount(v), v
+    for v in ("123456789", "4111111111111111", "021000021", "123-45-6789", "Acct #4482",
+              "(512) 555-0101", "SID 40021", "Jane"):
+        assert not is_plain_amount(v), v
+
+
+def test_amounts_tagged_financial_or_id_are_kept_as_text():
+    """Real llama3.2 tagged a donor sheet's Gift column (250, 500...) as
+    FINANCIAL/ID, turning the numbers to analyze into tokens."""
+    from app import detector
+    fake = json.dumps([
+        {"text": "Jane Smith", "type": "PERSON"},
+        {"text": "250", "type": "FINANCIAL"}, {"text": "$1,000.00", "type": "ID"},
+        {"text": "021000021", "type": "FINANCIAL"},      # routing number: kept as PII
+        {"text": "94", "type": "GRADE"},                  # a grade is not an amount
+        {"text": "40021", "type": "SID"},                 # student ID is not an amount
+    ])
+    with patch.object(detector.llm, "llm_call", return_value=fake), \
+         patch.object(detector.endpoints_mod, "get_active",
+                      return_value={"chunk_tokens": 2000, "api_style": "ollama",
+                                    "base_url": "http://localhost:1", "model": "m", "nickname": "t"}):
+        r = detector.detect_pii("Jane Smith gave 250 and $1,000.00 routing 021000021 grade 94 SID 40021")
+    assert set(r.replacements) == {"Jane Smith", "021000021", "94", "40021"}
+    assert r.skipped_amounts == {"250", "$1,000.00"}
+
+
+
+def _ep():
+    return {"chunk_tokens": 2000, "api_style": "ollama", "base_url": "http://localhost:1",
+            "model": "m", "nickname": "test"}
+
+
+def test_unreadable_answer_aborts_instead_of_passing_as_clean():
+    import pytest
+    from app import detector
+    with patch.object(detector.llm, "llm_call", return_value="Sure! Jane Smith is a name."), \
+         patch.object(detector.time, "sleep"):
+        with pytest.raises(detector.llm.LLMError, match="not the JSON list"):
+            detector.detect_pii("Jane Smith", endpoint=_ep())
+
+
+def test_truncated_answer_splits_the_chunk_and_finds_everything():
+    """A dense chunk whose answer runs out of room is halved and rescanned."""
+    from app import detector
+    rows = [f"Donor{i} Person{i},donor{i}@x.org" for i in range(60)]
+    text = "\n".join(rows)
+    calls = {"n": 0}
+
+    def llm(prompt, endpoint=None, schema=None, **kw):
+        calls["n"] += 1
+        chunk = prompt.split('CHUNK TEXT:\n"""', 1)[1]
+        present = [r for r in rows if r in chunk]
+        if len(present) > 20:
+            raise detector.llm.LLMTruncated("out of room")
+        assert schema["items"]["properties"]["type"]["enum"]
+        return json.dumps([{"text": r.split(",")[0], "type": "PERSON"} for r in present]
+                          + [{"text": r.split(",")[1], "type": "EMAIL"} for r in present])
+
+    with patch.object(detector.llm, "llm_call", side_effect=llm):
+        reg = detector.detect_pii(text, endpoint=dict(_ep(), chunk_tokens=4000))
+    assert calls["n"] > 1
+    for r in rows:
+        name, email = r.split(",")
+        assert name in reg.replacements and email in reg.replacements
+
+
+def test_truncation_on_a_tiny_chunk_aborts():
+    import pytest
+    from app import detector
+    with patch.object(detector.llm, "llm_call", side_effect=detector.llm.LLMTruncated("x")):
+        with pytest.raises(detector.llm.LLMError, match="could not be scanned"):
+            detector.detect_pii("Jane Smith", endpoint=_ep())

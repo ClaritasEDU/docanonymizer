@@ -205,18 +205,23 @@ def _extract_xlsx(path: Path) -> ExtractResult:
     # Sheet titles can carry PII ("Smith Family"), so they go to detection
     # and verification. A lone default-named sheet adds no header line.
     show_titles = len(wb.worksheets) > 1 or not _DEFAULT_SHEET_RE.fullmatch(wb.worksheets[0].title)
+    tables: list[list[list[str]]] = []
     for ws in wb.worksheets:
         if show_titles:
             text_parts.append(f"Sheet: {ws.title}")
+        rows: list[list[str]] = []
         for row in ws.iter_rows(values_only=True):
             cells = [str(c) if c is not None else "" for c in row]
+            rows.append(cells)
             text_parts.append("\t".join(cells))
+        tables.append(rows)
         text_parts.append("")  # blank line between sheets
     text = "\n".join(text_parts)
     return ExtractResult(
         text=text,
         char_count=len(text),
         sheet_count=len(wb.worksheets),
+        payload={"tables": tables},
     )
 
 

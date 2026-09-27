@@ -35,6 +35,7 @@
     sessionId: null,
     sanitizeAll: true,
     deselected: new Set(),
+    deselectedTypes: new Set(),           // whole types kept as original text
     preview: null,
     polling: null,
     anonFile: null,                       // selected file for anonymize
@@ -44,6 +45,7 @@
     keysSeen: new Set(),                  // names already shown (new ones default on)
     restoredText: "",
     restoredName: "",
+    finished: false,                      // current session reached verify
   };
 
   // Prepended by [ COPY FOR AI ]. Asking the AI to keep identifiers intact is
@@ -425,7 +427,18 @@
   }
 
   // ----- Anonymize flow -----
+  // An unfinished session still holds the original upload on the server.
+  // Cancel it (never a finished one - its output is the user's work product).
+  function cancelUnfinished(useBeacon) {
+    const sid = state.sessionId;
+    if (!sid || state.finished) return;
+    const url = `/api/anonymize/${sid}/cancel`;
+    if (useBeacon && navigator.sendBeacon) navigator.sendBeacon(url);
+    else fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+  }
+
   async function uploadAndDetect(file) {
+    cancelUnfinished(false);
     resetAnonymizeFlow();
     const fd = new FormData();
     fd.append("file", file);
@@ -521,8 +534,12 @@
     show($("lbl-preview"));
     show($("block-preview"));
     $("prev-entities").textContent = prev.entities;
-    $("prev-replacements").textContent = prev.replacements;
-    $("prev-types").textContent = Object.keys(prev.counts || {}).sort().join(" · ") || "-";
+    renderTypeToggles(prev.counts || {});
+    const kept = prev.kept_amounts || 0;
+    $("prev-amounts").textContent = kept
+      ? `${kept} amount-like value(s) the model tagged FINANCIAL/ID (gifts, totals, prices) are kept as original text. If any is a real account or ID number, add it under CUSTOM TERMS and detect again.`
+      : "";
+    $("prev-amounts").classList.toggle("hidden", !kept);
 
     const body = $("preview-body");
     body.innerHTML = "";
@@ -536,6 +553,7 @@
         class: "placeholder",
         title: `Original: ${span.original}`,
         "data-original": span.original,
+        "data-tag": span.placeholder.replace(/^\[|\]$/g, "").split("_")[0],
       });
       ph.textContent = span.placeholder;
       ph.addEventListener("click", () => {
@@ -558,6 +576,30 @@
     }
   }
 
+  function renderTypeToggles(counts) {
+    const host = $("prev-types");
+    host.innerHTML = "";
+    for (const tag of Object.keys(counts).sort()) {
+      const b = create("button", { type: "button", class: "btn secondary sm", "data-tag": tag });
+      const paint = () => {
+        const on = !state.deselectedTypes.has(tag);
+        b.setAttribute("aria-pressed", String(on));
+        b.textContent = `[${on ? "x" : " "}] ${tag} ${counts[tag]}`;
+        b.title = on ? `Click to keep every ${tag} value as original text` : `Click to replace every ${tag} value again`;
+        document.querySelectorAll(`#preview-body .placeholder[data-tag="${tag}"]`).forEach((p) => {
+          p.classList.toggle("deselected", !on || state.deselected.has(p.dataset.original));
+        });
+      };
+      b.addEventListener("click", () => {
+        if (state.deselectedTypes.has(tag)) state.deselectedTypes.delete(tag);
+        else state.deselectedTypes.add(tag);
+        paint();
+      });
+      host.append(b);
+      paint();
+    }
+  }
+
   async function confirmScrub() {
     if (!state.sessionId) return;
     hide($("lbl-preview"));
@@ -569,7 +611,7 @@
     try {
       await api(`/api/anonymize/${state.sessionId}/confirm`, {
         method: "POST",
-        body: JSON.stringify({ deselected: [...state.deselected] }),
+        body: JSON.stringify({ deselected: [...state.deselected], deselected_types: [...state.deselectedTypes] }),
       });
     } catch (exc) {
       renderScrubSteps([{ glyph: "[!]", text: `confirm failed: ${exc.message}`, kind: "err" }]);
@@ -615,6 +657,7 @@
   }
 
   function renderResults(r) {
+    state.finished = true;
     show($("lbl-results"));
     show($("block-results"));
     const tbl = $("results-table");
@@ -676,8 +719,10 @@
 
   function resetAnonymizeFlow() {
     state.sessionId = null;
+    state.finished = false;
     state.preview = null;
     state.deselected.clear();
+    state.deselectedTypes.clear();
     if (state.polling) clearInterval(state.polling);
     state.polling = null;
     hide($("lbl-detection"));
@@ -1189,6 +1234,9 @@
 
     // Periodic light health check.
     setInterval(healthCheck, 30000);
+
+    // Closing or reloading the tab mid-run must not strand the upload.
+    window.addEventListener("pagehide", () => cancelUnfinished(true));
   });
 
   function switchTab(which) {

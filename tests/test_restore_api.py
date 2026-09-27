@@ -257,3 +257,31 @@ def test_restore_text_rejects_non_object_json():
     c = _client()
     for body in ([1], "text", 5):
         assert c.post("/api/unanonymize/text", json=body).status_code == 400
+
+
+def test_preview_type_toggle_keeps_whole_type_as_text():
+    """[x] ORG toggled off in the preview keeps every ORG value as original
+    text across the whole document - including past the preview window."""
+    from app import detector
+    c = _client()
+    body = ("Jane Smith of Acme Corp. " + "x" * 11000 + " Acme Corp again, and Jane Smith.").encode()
+    fake = json.dumps([{"text": "Jane Smith", "type": "PERSON"}, {"text": "Acme Corp", "type": "ORG"},
+                       {"text": "250", "type": "FINANCIAL"}])
+    with patch.object(detector.llm, "llm_call", return_value=fake):
+        sid = c.post("/api/anonymize/upload", data={"file": (io.BytesIO(body), "memo.txt"), "tags": "ALL"},
+                     content_type="multipart/form-data").get_json()["session_id"]
+        for _ in range(100):
+            s = c.get(f"/api/anonymize/{sid}/status").get_json()
+            if s.get("detection_complete"):
+                break
+            time.sleep(0.05)
+        assert s["preview"]["kept_amounts"] == 1
+        c.post(f"/api/anonymize/{sid}/confirm", json={"deselected": [], "deselected_types": ["ORG", "BOGUS"]})
+        for _ in range(100):
+            res = c.get(f"/api/anonymize/{sid}/results").get_json()
+            if res.get("verify_result"):
+                break
+            time.sleep(0.05)
+    assert res["verify_result"]["passed"]
+    text = c.get(f"/api/anonymize/{sid}/text").get_json()["text"]
+    assert text.count("Acme Corp") == 2 and "Jane Smith" not in text

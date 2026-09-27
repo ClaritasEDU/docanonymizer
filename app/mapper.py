@@ -54,6 +54,9 @@ class EntityRegistry:
     text_to_hex: dict[str, str] = field(default_factory=dict)
     # hex_id -> hex_id of the value the model linked it to
     links: dict[str, str] = field(default_factory=dict)
+    # Distinct amount-like values the model tagged FINANCIAL/ID and the
+    # detector kept as original text (see detector.is_plain_amount).
+    skipped_amounts: set[str] = field(default_factory=set)
 
     def _taken(self, candidate: str) -> bool:
         return candidate in self.entities or candidate in self.reserved
@@ -151,6 +154,15 @@ class EntityRegistry:
                 self.add(text, tag, link if isinstance(link, str) else None)
             except (ValueError, RuntimeError) as exc:
                 log.warning("skipped span: tag=%s reason=%s", tag, exc)
+
+    def drop_types(self, tags) -> int:
+        """Remove every value whose placeholder carries one of `tags`."""
+        wanted = {t for t in tags if t in VALID_TAGS}
+        victims = [o for o, ph in self.replacements.items()
+                   if ph.strip("[]").split("_", 1)[0] in wanted]
+        for o in victims:
+            self.drop(o)
+        return len(victims)
 
     def drop(self, original_text: str) -> bool:
         """Remove a span (used when the operator deselects a false positive)."""

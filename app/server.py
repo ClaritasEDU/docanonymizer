@@ -77,6 +77,7 @@ def create_app() -> Flask:
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
     endpoints_mod.ensure_initialized()
+    pipeline.purge_stale_uploads()
     _log_startup()
 
     # -----------------------------------------------------------------------
@@ -131,6 +132,9 @@ def create_app() -> Flask:
 
     @app.post("/api/endpoints/health")
     def ep_health():
+        # The open page polls this every 30s - a cheap moment to discard
+        # sessions abandoned at the preview.
+        pipeline.expire_abandoned()
         payload = request.get_json(silent=True) or {}
         eid = payload.get("id")
         if eid:
@@ -203,6 +207,7 @@ def create_app() -> Flask:
     # -----------------------------------------------------------------------
     @app.post("/api/anonymize/upload")
     def anon_upload():
+        pipeline.expire_abandoned()
         if "file" not in request.files:
             return jsonify({"error": "no file"}), 400
         f = request.files["file"]
@@ -251,8 +256,11 @@ def create_app() -> Flask:
                 upload_path = UPLOADS_DIR / f"{stem}_{i}{ext}"
                 i += 1
         f.save(upload_path)
+        # Read the size now: the worker may finish (or fail and delete the
+        # upload) before this request builds its response.
+        upload_size = upload_path.stat().st_size
         log.info("upload received: name=%s size=%d type=%s",
-                 upload_path.name, upload_path.stat().st_size, suffix)
+                 upload_path.name, upload_size, suffix)
 
         sess = pipeline.new_session(upload_path, safe, allowed, endpoint=endpoint,
                                     custom_terms=custom_terms)
@@ -269,7 +277,7 @@ def create_app() -> Flask:
             "suffix": suffix,
             "output_ext": OUTPUT_NOTES[suffix][0],
             "output_note": OUTPUT_NOTES[suffix][1],
-            "size": upload_path.stat().st_size,
+            "size": upload_size,
         })
 
     @app.get("/api/anonymize/<sid>/status")
@@ -295,9 +303,11 @@ def create_app() -> Flask:
         if not sess.detection_complete:
             return jsonify({"error": "detection not complete"}), 409
         payload = request.get_json(silent=True) or {}
-        deselected = payload.get("deselected") or []
+        deselected = [d for d in (payload.get("deselected") or []) if isinstance(d, str)]
+        types = [t for t in (payload.get("deselected_types") or [])
+                 if isinstance(t, str) and t in VALID_TAGS]
         threading.Thread(
-            target=pipeline.confirm_and_scrub, args=(sess, deselected), daemon=True,
+            target=pipeline.confirm_and_scrub, args=(sess, deselected, types), daemon=True,
         ).start()
         return jsonify({"session_id": sid, "started": True})
 
@@ -558,6 +568,7 @@ def _preview_payload(sess) -> dict:
         "counts": sess.registry.counts_per_type(),
         "entities": sess.registry.total_entities(),
         "replacements": sess.registry.total_replacements(),
+        "kept_amounts": len(sess.registry.skipped_amounts),
     }
     return sess.preview
 

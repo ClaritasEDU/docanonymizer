@@ -117,6 +117,26 @@ def _xml_unescape(s: str) -> str:
 
 _xml_escape = xml_escape
 
+_CHAR_REF_RE = re.compile(r"&#(x[0-9A-Fa-f]+|[0-9]+);")
+
+
+def _decode_char_refs(xml: str) -> str:
+    """Turn numeric character references for non-ASCII characters into the
+    characters themselves: openpyxl writes "José" as "Jos&#233;". Without
+    this, no text pass can match an accented or non-Latin name in formula
+    text, metadata, or any other raw XML - and it would ship. ASCII
+    references (&#10;, &#38;...) are left alone: they can carry meaning."""
+    def repl(m: re.Match) -> str:
+        ref = m.group(1)
+        try:
+            cp = int(ref[1:], 16) if ref[0] in "xX" else int(ref)
+        except ValueError:
+            return m.group(0)
+        if cp < 0x80 or cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
+            return m.group(0)
+        return chr(cp)
+    return _CHAR_REF_RE.sub(repl, xml)
+
 
 def _replace_in_blocks(xml: str, block_re: re.Pattern, t_re: re.Pattern,
                        t_name: str, replacer: Replacer) -> str:
@@ -424,8 +444,11 @@ def _rewrite_sheet_refs(xml: str, renames: dict[str, str]) -> str:
         for o in {oq, text_safe(oq), xml_escape(oq)}:
             xml = xml.replace(f"'{o}'!", quoted_new)
             xml = xml.replace(f"&apos;{o}&apos;!", quoted_new)
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", old):
-            xml = re.sub(rf"(?<![A-Za-z0-9_.']){re.escape(old)}!", lambda _m: quoted_new, xml)
+        if re.fullmatch(r"[^\W\d][\w.]*", old):          # unquoted refs: Smith!A1, José!A1
+            # Keep the reference's own style: unquoted stays unquoted when the
+            # new name allows it (tokens do), so a restore is text-exact.
+            bare_new = text_safe(new + "!") if re.fullmatch(r"[^\W\d][\w.]*", new) else quoted_new
+            xml = re.sub(rf"(?<![\w.']){re.escape(old)}!", lambda _m: bare_new, xml)
         xml = xml.replace(f'sheet="{xml_escape(old)}"', f'sheet="{xml_escape(new)}"')
     return xml
 
@@ -565,7 +588,7 @@ def _deep_scrub_zip(
             if _is_text_part(info.filename):
                 try:
                     text = data.decode("utf-8")
-                    new_text = text
+                    new_text = _decode_char_refs(text)
                     if structured_replace is not None:
                         new_text = structured_replace(info.filename, new_text, replacer)
                         if new_text != text:
