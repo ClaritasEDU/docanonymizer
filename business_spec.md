@@ -118,6 +118,11 @@ Differences from the local app, accepted as scope:
 - Outputs three artifacts per run: the anonymized file, a human-readable
   decoder ring (.txt), and a key.json interchangeable with the local app's
   key files. Either the decoder ring or the key.json drives deanonymize.
+- Same identifier rules as the local app (2026-09-27): unique 12-character
+  IDs, the same single-pass engine, and the same tolerant restore. The AI
+  round trip works in the browser too (copy for AI, paste the answer back,
+  one or more keys). Issued IDs are remembered in browser storage (random
+  IDs only); if storage is blocked, uniqueness holds within the tab.
 - Verification hard-blocks release only on actual replacement-map residue.
   Generic pattern residue is a warning, not a dead end.
 

@@ -707,3 +707,21 @@ verifies in 1.3s. pytest: 167 passing. Browser: 53/53.
    output into an AI tool and restore the answer.
 2. Web edition (`web/index.html`) is being brought to the same rules; see
    the follow-up entry.
+
+### Follow-up - web edition brought to the same rules (same session)
+
+`web/index.html` (v0.2) now matches the local app: 12-character unique IDs
+(ledger in browser storage, every access guarded), the single-pass engine
+with exact placeholder protection and the whole-number rule, raw-XML markup
+rules, formula-literal verification, overlap unions, reversible sheet
+titles (`sheet_titles` in key.json and `#sheet` lines in the decoder ring),
+and the tolerant restorer with multi-key merge and conflict refusal. New:
+on-screen output with `[ COPY FOR AI ]`, and a paste box that restores the
+AI's answer. Still zero network calls (CSP `connect-src 'none'` verified).
+Logs go to the browser console only - counts and file names, never values.
+
+Tests: 181/181 Playwright checks at desktop 1280x900, including JS-vs-Python
+parity on thousands of randomized cases (replacer, number boundaries, raw
+XML, reference rewrites, sheet titles, overlap unions, formula literals,
+restore) with zero mismatches, and docx/xlsx round trips validated by
+python-docx and openpyxl.

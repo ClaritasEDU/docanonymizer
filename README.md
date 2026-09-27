@@ -141,7 +141,13 @@ document and they are guaranteed to be caught. The preview step still shows
 every match for you to confirm or reject before anything is produced.
 
 Key files are interchangeable: a key.json produced by the web edition works in
-the local app's unanonymize tab, and vice versa.
+the local app's unanonymize tab (use `[ IMPORT KEY FILE ]`), and vice versa.
+Both editions use the same unique 12-character identifiers and the same
+matching and restore rules. The web edition supports the same AI round trip:
+`[ COPY FOR AI ]` on the output, and a paste box on the DEANONYMIZE tab that
+restores the AI's answer against one or more key files. Its record of issued
+IDs lives in the browser's own storage (random IDs only, never document
+content).
 
 ### Deploy to Netlify (one-time, ~2 minutes)
 
