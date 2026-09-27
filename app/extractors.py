@@ -5,7 +5,7 @@ Single entry point: `extract(path: Path) -> ExtractResult`.
 Handles:
   Tier 1 (format-preserving output target):  PDF, XLSX, XLS, CSV
   Tier 2 (format-preserving output target):  DOCX, DOC
-  Tier 3 (text-only output):                 PPTX, PPT, ODT, ODS, ODP, TXT, RTF, HTML
+  Tier 3 (text-only output):                 PPTX, PPT, ODT, ODS, ODP, TXT, MD, RTF, HTML
 
 DOC, PPT, ODT, ODS, ODP require LibreOffice to convert into a supported
 format first. If LibreOffice is missing the extractor returns an error so
@@ -49,6 +49,7 @@ OUTPUT_NOTES: dict[str, tuple[str, str]] = {
     "ods":  (".xlsx", "formatting preserved (converted to xlsx)"),
     "odp":  (".txt",  "text only (converted via libreoffice)"),
     "txt":  (".txt",  "format preserved"),
+    "md":   (".md",   "format preserved"),
     "rtf":  (".txt",  "text only"),
     "html": (".txt",  "text only"),
     "htm":  (".txt",  "text only"),
@@ -116,7 +117,7 @@ def extract(path: Path) -> ExtractResult:
         result = _extract_docx(path)
     elif suffix == "pptx":
         result = _extract_pptx(path)
-    elif suffix in ("txt", "rtf", "html", "htm"):
+    elif suffix in ("txt", "md", "rtf", "html", "htm"):
         result = _extract_text(path)
         if suffix == "rtf":
             result.text = _strip_rtf(result.text)
@@ -193,21 +194,34 @@ def _extract_csv(path: Path) -> ExtractResult:
     )
 
 
+_DEFAULT_SHEET_RE = re.compile(r"Sheet\d*")
+
+
 def _extract_xlsx(path: Path) -> ExtractResult:
     from openpyxl import load_workbook  # local import keeps cold-start fast
 
     wb = load_workbook(filename=str(path), data_only=True)
     text_parts: list[str] = []
+    # Sheet titles can carry PII ("Smith Family"), so they go to detection
+    # and verification. A lone default-named sheet adds no header line.
+    show_titles = len(wb.worksheets) > 1 or not _DEFAULT_SHEET_RE.fullmatch(wb.worksheets[0].title)
+    tables: list[list[list[str]]] = []
     for ws in wb.worksheets:
+        if show_titles:
+            text_parts.append(f"Sheet: {ws.title}")
+        rows: list[list[str]] = []
         for row in ws.iter_rows(values_only=True):
             cells = [str(c) if c is not None else "" for c in row]
+            rows.append(cells)
             text_parts.append("\t".join(cells))
+        tables.append(rows)
         text_parts.append("")  # blank line between sheets
     text = "\n".join(text_parts)
     return ExtractResult(
         text=text,
         char_count=len(text),
         sheet_count=len(wb.worksheets),
+        payload={"tables": tables},
     )
 
 

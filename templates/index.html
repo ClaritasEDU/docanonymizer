@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <title>DOC-ANON</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
 <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
 <body>
@@ -11,7 +12,7 @@
 
   <header class="app-header">
     <span class="title">DOC-ANON</span>
-    <span class="ver">v1.3</span>
+    <span class="ver">v1.4</span>
   </header>
 
   <!-- ============================================
@@ -139,16 +140,16 @@
     <div class="section-label hidden" id="lbl-preview">PREVIEW - REVIEW BEFORE SCRUB</div>
     <div class="hidden" id="block-preview">
       <div class="preview-summary">
-        <span><b>DETECTED:</b> <span id="prev-entities">0</span> entities</span>
-        <span><b>REPLACEMENTS:</b> <span id="prev-replacements">0</span></span>
-        <span><b>TYPES:</b> <span id="prev-types">-</span></span>
+        <span><b>DETECTED:</b> <span id="prev-entities">0</span> values</span>
       </div>
+      <div class="type-toggles" id="prev-types" role="group" aria-label="replace these types"></div>
+      <div class="note-plain hidden" id="prev-amounts"></div>
       <div class="preview-body" id="preview-body"></div>
       <div class="preview-actions">
         <button type="button" class="btn" id="btn-confirm">[ CONFIRM AND SCRUB ]</button>
         <button type="button" class="btn secondary" id="btn-cancel">[ CANCEL ]</button>
         <span class="grow"></span>
-        <span class="preview-hint">Click any placeholder to deselect a false positive</span>
+        <span class="preview-hint">Click a placeholder, or a type above, to keep it as original text</span>
       </div>
     </div>
 
@@ -165,19 +166,21 @@
         <button type="button" class="btn secondary" id="btn-push-github" disabled>[ PUSH TO GITHUB ]</button>
       </div>
 
-      <!-- Anonymized text panel (opens on VIEW ON SCREEN) -->
+      <!-- Anonymized text panel (opens automatically once verified) -->
       <div class="hidden" id="block-screen-text">
-        <div class="section-label" style="margin-top: 22px;">ANONYMIZED TEXT</div>
+        <div class="section-label" style="margin-top: 22px;">ANONYMIZED OUTPUT - READY FOR AI</div>
         <div class="preview-summary">
-          <span class="muted">Read-only. Re-extracted from the verified output. Safe to copy / paste anywhere - all PII has been replaced.</span>
+          <span class="muted">Re-extracted from the verified output. Every identifier is unique to one real value. [ COPY FOR AI ] adds a one-line note asking the AI to keep identifiers exactly as written, which makes the answer restorable.</span>
         </div>
         <textarea id="screen-text" class="screen-text" readonly aria-label="anonymized text"></textarea>
         <div class="preview-actions">
-          <button type="button" class="btn sm" id="btn-copy-text">[ COPY ALL ]</button>
+          <button type="button" class="btn sm" id="btn-copy-ai">[ COPY FOR AI ]</button>
+          <button type="button" class="btn secondary sm" id="btn-copy-text">[ COPY TEXT ONLY ]</button>
           <button type="button" class="btn secondary sm" id="btn-hide-text">[ HIDE ]</button>
           <span class="grow"></span>
           <span class="preview-hint" id="screen-text-meta"></span>
         </div>
+        <div class="note-plain">NEXT: paste into your AI tool. Bring its answer back to the [ UNANONYMIZE ] tab to put the real names back.</div>
       </div>
     </div>
 
@@ -204,23 +207,44 @@
        UNANONYMIZE FLOW
        ============================================ -->
   <section id="mode-unanonymize" class="hidden">
-    <div class="section-label">ANONYMIZED FILE</div>
+    <div class="section-label">1. KEYS</div>
+    <div class="sub" style="margin-bottom: 8px;">Every identifier is unique across all of your keys, so leaving them all selected is safe. Older 4-character keys are opt-in.</div>
+    <div class="key-list" id="key-list" role="group" aria-label="saved keys"></div>
+    <div class="preview-actions" style="margin-top: 8px;">
+      <button type="button" class="btn secondary sm" id="btn-keys-all">[ SELECT ALL ]</button>
+      <button type="button" class="btn secondary sm" id="btn-keys-none">[ SELECT NONE ]</button>
+      <label class="btn secondary sm" id="btn-key-import" tabindex="0">[ IMPORT KEY FILE ]<input type="file" id="key-import-input" accept=".json" class="hidden" /></label>
+      <span class="grow"></span>
+      <span class="preview-hint" id="keys-meta"></span>
+    </div>
+
+    <div class="section-label">2. AI OUTPUT - PASTE TEXT</div>
+    <textarea id="restore-input" class="screen-text restore-input" spellcheck="false" aria-label="AI output to restore" placeholder="Paste the AI's answer here. Identifiers like [PERSON_3A4F9C2B1D0E] become real values again - even if the AI dropped the brackets, changed the case, or relabeled them."></textarea>
+    <div style="height: 10px;"></div>
+    <button type="button" class="btn block" id="btn-restore-text" disabled>[ RESTORE TEXT ]</button>
+
+    <div class="section-label">OR - A FILE THE AI GAVE YOU (or the anonymized file itself)</div>
     <label class="dropzone" id="dropzone-unanon">
-      <div>&gt; DROP ANONYMIZED FILE HERE</div>
-      <div class="sub">&nbsp;&nbsp;or [ BROWSE ]</div>
+      <div>&gt; DROP FILE HERE</div>
+      <div class="sub">&nbsp;&nbsp;or [ BROWSE ] &middot; .txt .md .csv .xlsx .docx and more</div>
       <input type="file" id="unanon-file-input" />
     </label>
+    <div style="height: 10px;"></div>
+    <button type="button" class="btn block" id="btn-unanonymize" disabled>[ RESTORE FILE ]</button>
 
-    <div class="section-label">KEY FILE</div>
-    <label class="dropzone" id="dropzone-key">
-      <div>&gt; DROP KEY FILE HERE</div>
-      <div class="sub">&nbsp;&nbsp;or [ BROWSE ]</div>
-      <input type="file" id="key-file-input" accept=".json" />
-    </label>
-
-    <div style="height: 22px;"></div>
-    <button type="button" class="btn block" id="btn-unanonymize" disabled>[ RUN UNANONYMIZE ]</button>
-    <div id="unanon-result" class="muted" style="font-size: 12px; margin-top: 12px;"></div>
+    <div class="section-label hidden" id="lbl-restore">RESTORED</div>
+    <div class="hidden" id="block-restore">
+      <div class="results" id="restore-report"></div>
+      <textarea id="restored-text" class="screen-text" readonly aria-label="restored text" style="margin-top: 12px;"></textarea>
+      <div class="preview-actions">
+        <button type="button" class="btn sm" id="btn-copy-restored">[ COPY ALL ]</button>
+        <button type="button" class="btn secondary sm" id="btn-dl-restored-text">[ DOWNLOAD .TXT ]</button>
+        <a class="btn secondary sm hidden" id="btn-dl-restored-file" href="#" download>[ DOWNLOAD FILE ]</a>
+        <span class="grow"></span>
+        <span class="preview-hint" id="restored-meta"></span>
+      </div>
+    </div>
+    <div id="unanon-result" class="errline hidden" role="alert"></div>
   </section>
 
   <!-- ============================================

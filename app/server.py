@@ -24,10 +24,12 @@ Routes:
   GET  /api/anonymize/<sid>/download/key   - download key.json
   POST /api/anonymize/<sid>/cancel    - discard session, delete upload
 
-  POST /api/unanonymize               - upload anon file + key, run inverse
-  GET  /api/unanonymize/<sid>/download - download restored file
+  POST /api/unanonymize               - restore a file (AI output or anonymized file)
+  POST /api/unanonymize/text          - restore pasted text (AI output)
+  GET  /api/unanonymize/download/<n>  - download restored file
 
   GET  /api/keys                       - list keys for the unanonymize picker
+  POST /api/keys/import                - copy an external key file into /keys
   GET  /api/log/tail                   - tail the log file (last N lines)
 """
 
@@ -56,9 +58,11 @@ from .config import (
     UPLOADS_DIR,
 )
 from .extractors import OUTPUT_NOTES, SUPPORTED, libreoffice_available
-from .key_files import list_recent, load_key_file
+from .key_files import import_key_file, list_recent, load_key_file, saved_key_path
 from .logging_setup import get_logger
 from .mapper import TAG_ORDER, VALID_TAGS
+from .replacer import LiteralReplacer
+from .restorer import KeyConflictError, KeyIndex, build_index, restore_text
 
 log = get_logger("server")
 
@@ -73,6 +77,7 @@ def create_app() -> Flask:
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
     endpoints_mod.ensure_initialized()
+    pipeline.purge_stale_uploads()
     _log_startup()
 
     # -----------------------------------------------------------------------
@@ -127,6 +132,9 @@ def create_app() -> Flask:
 
     @app.post("/api/endpoints/health")
     def ep_health():
+        # The open page polls this every 30s - a cheap moment to discard
+        # sessions abandoned at the preview.
+        pipeline.expire_abandoned()
         payload = request.get_json(silent=True) or {}
         eid = payload.get("id")
         if eid:
@@ -199,6 +207,7 @@ def create_app() -> Flask:
     # -----------------------------------------------------------------------
     @app.post("/api/anonymize/upload")
     def anon_upload():
+        pipeline.expire_abandoned()
         if "file" not in request.files:
             return jsonify({"error": "no file"}), 400
         f = request.files["file"]
@@ -247,8 +256,11 @@ def create_app() -> Flask:
                 upload_path = UPLOADS_DIR / f"{stem}_{i}{ext}"
                 i += 1
         f.save(upload_path)
+        # Read the size now: the worker may finish (or fail and delete the
+        # upload) before this request builds its response.
+        upload_size = upload_path.stat().st_size
         log.info("upload received: name=%s size=%d type=%s",
-                 upload_path.name, upload_path.stat().st_size, suffix)
+                 upload_path.name, upload_size, suffix)
 
         sess = pipeline.new_session(upload_path, safe, allowed, endpoint=endpoint,
                                     custom_terms=custom_terms)
@@ -265,7 +277,7 @@ def create_app() -> Flask:
             "suffix": suffix,
             "output_ext": OUTPUT_NOTES[suffix][0],
             "output_note": OUTPUT_NOTES[suffix][1],
-            "size": upload_path.stat().st_size,
+            "size": upload_size,
         })
 
     @app.get("/api/anonymize/<sid>/status")
@@ -291,9 +303,11 @@ def create_app() -> Flask:
         if not sess.detection_complete:
             return jsonify({"error": "detection not complete"}), 409
         payload = request.get_json(silent=True) or {}
-        deselected = payload.get("deselected") or []
+        deselected = [d for d in (payload.get("deselected") or []) if isinstance(d, str)]
+        types = [t for t in (payload.get("deselected_types") or [])
+                 if isinstance(t, str) and t in VALID_TAGS]
         threading.Thread(
-            target=pipeline.confirm_and_scrub, args=(sess, deselected), daemon=True,
+            target=pipeline.confirm_and_scrub, args=(sess, deselected, types), daemon=True,
         ).start()
         return jsonify({"session_id": sid, "started": True})
 
@@ -373,58 +387,111 @@ def create_app() -> Flask:
     # -----------------------------------------------------------------------
     # Unanonymize
     # -----------------------------------------------------------------------
+    def _unique_upload(name: str) -> Path:
+        path = UPLOADS_DIR / name
+        stem, ext = path.stem, path.suffix
+        i = 1
+        while path.exists():
+            path = UPLOADS_DIR / f"{stem}_{i}{ext}"
+            i += 1
+        return path
+
+    def _selected_keys(names, extra: Optional[tuple[str, dict]] = None) -> KeyIndex:
+        """Build the restore index from saved key names (+ an uploaded key)."""
+        if isinstance(names, str):
+            try:
+                names = json.loads(names) if names.strip() else []
+            except ValueError:
+                raise ValueError("keys must be a JSON list of key file names")
+        if not isinstance(names, list):
+            raise ValueError("keys must be a list of key file names")
+        pairs: list[tuple[str, dict]] = []
+        for name in names:
+            path = saved_key_path(name)
+            if path is None:
+                raise ValueError(f"key not found: {name}")
+            pairs.append((path.name, load_key_file(path)))
+        if extra is not None:
+            pairs.append(extra)
+        if not pairs:
+            raise ValueError("select at least one key")
+        return build_index(pairs)
+
     @app.post("/api/unanonymize")
     def unanon():
-        if "file" not in request.files or "key" not in request.files:
-            return jsonify({"error": "need file and key"}), 400
+        """Restore a file. Keys come from `keys` (JSON list of saved key
+        names) and/or an uploaded `key` file."""
+        if "file" not in request.files:
+            return jsonify({"error": "need a file to restore"}), 400
         in_f = request.files["file"]
-        in_k = request.files["key"]
-        if not in_f.filename or not in_k.filename:
+        if not in_f.filename:
             return jsonify({"error": "empty filename"}), 400
-
         safe_in = secure_filename(in_f.filename)
-        safe_key = secure_filename(in_k.filename)
-        upload_path = UPLOADS_DIR / safe_in
-        if upload_path.exists():
-            stem, ext = upload_path.stem, upload_path.suffix
-            i = 1
-            while upload_path.exists():
-                upload_path = UPLOADS_DIR / f"{stem}_{i}{ext}"
-                i += 1
+        suffix = Path(safe_in).suffix.lower().lstrip(".")
+        if suffix not in SUPPORTED:
+            return jsonify({"error": f"unsupported file type: .{suffix}"}), 400
+
+        upload_path = _unique_upload(safe_in)
         in_f.save(upload_path)
-        key_path = UPLOADS_DIR / safe_key
-        if key_path.exists():
-            stem, ext = key_path.stem, key_path.suffix
-            i = 1
-            while key_path.exists():
-                key_path = UPLOADS_DIR / f"{stem}_{i}{ext}"
-                i += 1
-        in_k.save(key_path)
+        key_path: Optional[Path] = None
+        in_k = request.files.get("key")
+        if in_k is not None and in_k.filename:
+            key_path = _unique_upload(secure_filename(in_k.filename) or "key.json")
+            in_k.save(key_path)
 
         try:
-            payload = load_key_file(key_path)
-            log.info(
-                "unanonymize start: file=%s key=%s entities=%d",
-                upload_path.name, key_path.name,
-                len(payload.get("entity_registry") or {}),
-            )
-            out_path = unan.unanonymize_file(upload_path, payload)
-        except Exception as exc:
+            extra = None
+            if key_path is not None:
+                extra = (key_path.name, load_key_file(key_path))
+            index = _selected_keys(request.form.get("keys", ""), extra)
+            log.info("unanonymize start: file=%s keys=%d ids=%d",
+                     upload_path.name, len(index.key_names), index.size)
+            result = unan.restore_file(upload_path, index, display_name=safe_in)
+        except KeyConflictError as exc:
+            log.error("unanonymize refused: key conflict")
+            return jsonify({"error": str(exc)}), 409
+        except ValueError as exc:
             log.error("unanonymize failed: %s", exc)
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            log.exception("unanonymize failed: %s", type(exc).__name__)
             return jsonify({"error": str(exc)}), 500
         finally:
             for tmp in (upload_path, key_path):
                 try:
-                    if tmp.exists():
+                    if tmp is not None and tmp.exists():
                         tmp.unlink()
                 except OSError:
                     pass
 
-        log.info("unanonymize complete: out=%s", out_path.name)
+        out_path = result.output_path
         return jsonify({
             "output_filename": out_path.name,
             "download_url": f"/api/unanonymize/download/{out_path.name}",
+            "report": result.report.as_dict(),
+            "text": result.text,
         })
+
+    @app.post("/api/unanonymize/text")
+    def unanon_text():
+        """Restore pasted text (an AI tool's answer). Nothing is written to disk."""
+        payload = request.get_json(force=True, silent=True)
+        if not isinstance(payload, dict):
+            payload = {}
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            log.warning("text restore refused: empty input")
+            return jsonify({"error": "paste some text to restore"}), 400
+        try:
+            index = _selected_keys(payload.get("keys") or [])
+            restored, report = restore_text(text, index)
+        except KeyConflictError as exc:
+            log.error("text restore refused: key conflict")
+            return jsonify({"error": str(exc)}), 409
+        except ValueError as exc:
+            log.warning("text restore refused: %s", exc)
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"text": restored, "report": report.as_dict()})
 
     @app.get("/api/unanonymize/download/<name>")
     def unanon_download(name: str):
@@ -439,7 +506,23 @@ def create_app() -> Flask:
     # -----------------------------------------------------------------------
     @app.get("/api/keys")
     def keys_index():
-        return jsonify({"keys": list_recent(50)})
+        return jsonify({"keys": list_recent()})
+
+    @app.post("/api/keys/import")
+    def keys_import():
+        in_k = request.files.get("key")
+        if in_k is None or not in_k.filename:
+            return jsonify({"error": "no key file"}), 400
+        tmp = _unique_upload(secure_filename(in_k.filename) or "key.json")
+        in_k.save(tmp)
+        try:
+            dest = import_key_file(tmp, in_k.filename)
+        except (ValueError, OSError) as exc:
+            log.warning("key import refused: %s", type(exc).__name__)
+            return jsonify({"error": f"not a valid key file: {exc}"}), 400
+        finally:
+            tmp.unlink(missing_ok=True)
+        return jsonify({"imported": dest.name})
 
     @app.get("/api/log/tail")
     def log_tail():
@@ -456,43 +539,28 @@ def create_app() -> Flask:
 
 
 def _preview_payload(sess) -> dict:
-    """Build the preview body for the UI - first 10,000 chars + spans."""
+    """Build the preview body for the UI - first 10,000 chars + spans.
+
+    Built once and cached on the session: the UI polls status repeatedly and
+    the registry does not change until confirm.
+    """
     if sess.registry is None or sess.extract is None:
         return {}
+    if sess.preview is not None:
+        return sess.preview
     text = sess.extract.text
     truncated = False
     head = text
     if len(head) > 10_000:
         head = head[:10_000]
         truncated = True
-    spans: list[dict] = []
-    # Longest-first map order, claiming non-overlapping regions - a shorter
-    # original that is a substring of a longer one can't garble the preview
-    # (CODE_REVIEW M2). Mirrors how the scrubber actually applies the map.
-    claimed: list[tuple[int, int]] = []
-    rmap = sess.registry.as_replacement_map()
-    for original, placeholder in rmap.items():
-        if not original:
-            continue
-        idx = 0
-        while True:
-            found = head.find(original, idx)
-            if found == -1:
-                break
-            end = found + len(original)
-            if not any(found < c_end and end > c_start for c_start, c_end in claimed):
-                spans.append({
-                    "start": found,
-                    "end": end,
-                    "original": original,
-                    "placeholder": placeholder,
-                })
-                claimed.append((found, end))
-                idx = end
-            else:
-                idx = found + 1
-    spans.sort(key=lambda s: s["start"])
-    return {
+    # Same single-pass engine the scrubber uses, so the preview shows exactly
+    # what will be written (non-overlapping, longest match wins - M2).
+    spans = [
+        {"start": s0, "end": e0, "original": head[s0:e0], "placeholder": ph}
+        for s0, e0, ph in LiteralReplacer(sess.registry.as_replacement_map()).find(head)
+    ]
+    sess.preview = {
         "text_head": head,
         "char_count": len(text),
         "truncated": truncated,
@@ -500,7 +568,9 @@ def _preview_payload(sess) -> dict:
         "counts": sess.registry.counts_per_type(),
         "entities": sess.registry.total_entities(),
         "replacements": sess.registry.total_replacements(),
+        "kept_amounts": len(sess.registry.skipped_amounts),
     }
+    return sess.preview
 
 
 def _log_startup() -> None:
@@ -513,8 +583,7 @@ def _log_startup() -> None:
     )
 
 
-# Convenience entrypoint (`python -m app.server`).
-app = create_app()
-
+# Convenience entrypoint (`python -m app.server`). Not built at import time -
+# run.py creates the app, and a second instance here doubled startup logging.
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=PORT, debug=False)
+    create_app().run(host="127.0.0.1", port=PORT, debug=False)

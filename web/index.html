@@ -131,6 +131,7 @@ textarea, select, input[type="text"] {
   width: 100%;
 }
 textarea:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--border-focus); }
+textarea.out-text { min-height: 160px; resize: vertical; }
 label { display: block; margin: 10px 0 4px; color: var(--text-secondary); font-size: 13px; }
 
 .steps { margin: 8px 0; }
@@ -138,6 +139,7 @@ label { display: block; margin: 10px 0 4px; color: var(--text-secondary); font-s
 .step .glyph { color: var(--text-secondary); }
 .step.done .glyph { color: var(--success); }
 .step.active .glyph { color: var(--text-primary); }
+.step.warn .glyph { color: var(--warning); }
 .step.err { color: var(--danger); }
 .step.err .glyph { color: var(--danger); }
 .blink::after { content: "▋"; animation: blink 1s steps(1) infinite; }
@@ -163,14 +165,24 @@ label { display: block; margin: 10px 0 4px; color: var(--text-secondary); font-s
 .results-table .warn { color: var(--warning); }
 .dl-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 .note { margin-top: 10px; color: var(--warning); font-size: 13px; }
-.errline { color: var(--danger); margin-top: 8px; }
+.errline { color: var(--danger); margin-top: 8px; overflow-wrap: anywhere; }
+.hint { color: var(--text-secondary); font-size: 13px; margin-top: 6px; }
+
+.key-list { margin-top: 10px; }
+.key-row {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px;
+  padding: 4px 0; border-bottom: 1px solid var(--border);
+}
+.key-row .kname { flex: 1 1 12em; min-width: 0; overflow-wrap: anywhere; }
+.key-row .kcount { color: var(--text-secondary); white-space: nowrap; }
+.key-status { margin-top: 8px; font-size: 13px; color: var(--text-secondary); }
 </style>
 </head>
 <body>
 <main>
   <header class="app-header">
     <span class="title">DOC-ANON</span>
-    <span class="ver">web edition v0.1</span>
+    <span class="ver">web edition v0.2</span>
     <span class="grow"></span>
     <button type="button" class="btn secondary sm" id="btn-theme">[ DARK ]</button>
   </header>
@@ -236,35 +248,72 @@ label { display: block; margin: 10px 0 4px; color: var(--text-secondary); font-s
         <button type="button" class="btn secondary" id="btn-dl-key" disabled>[ DOWNLOAD KEY .JSON ]</button>
       </div>
       <div class="note hidden" id="results-note"></div>
+      <div id="ai-block" class="hidden">
+        <label for="anon-text">ANONYMIZED TEXT - read it over, then paste it into your AI tool</label>
+        <textarea id="anon-text" class="out-text" rows="10" readonly spellcheck="false"></textarea>
+        <div class="dl-row">
+          <button type="button" class="btn" id="btn-copy-ai" disabled>[ COPY FOR AI ]</button>
+          <button type="button" class="btn secondary" id="btn-copy-text" disabled>[ COPY TEXT ONLY ]</button>
+        </div>
+        <div class="hint">COPY FOR AI adds a short note up top asking the AI to keep every
+          token exactly as written, so its answer can be restored here.</div>
+      </div>
     </section>
   </div>
 
   <!-- ============ DEANONYMIZE ============ -->
   <div id="mode-deanon" class="hidden">
     <section class="panel">
-      <h3>[ 1. ANONYMIZED DOCUMENT ]</h3>
+      <h3>[ 1. KEYS ]</h3>
+      <div class="dropzone" id="drop-dekey" tabindex="0">
+        <div>&gt; DROP ONE OR MORE KEY FILES or [ BROWSE ]</div>
+        <div class="meta">the .key.json or decoder_ring .txt from each anonymize run whose tokens you want back</div>
+      </div>
+      <input type="file" id="file-dekey" class="hidden" accept=".json,.txt" multiple />
+      <div class="key-list" id="key-list"></div>
+      <div class="key-status" id="key-status"></div>
+      <div class="errline hidden" id="key-err"></div>
+      <div class="dl-row hidden" id="key-actions">
+        <button type="button" class="btn danger sm" id="btn-clear-keys">[ CLEAR KEYS ]</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3>[ 2. PASTE THE AI'S RESPONSE ]</h3>
+      <textarea id="ai-in" rows="8" spellcheck="false" placeholder="Paste what the AI sent back. Tokens like [PERSON_3A4F9C2B1D0E] turn back into the real values, even if the AI dropped the brackets, changed the case, or renamed the label."></textarea>
+      <div style="margin-top:12px;">
+        <button type="button" class="btn" id="btn-restore-text" disabled>[ RESTORE TEXT ]</button>
+      </div>
+      <div class="errline hidden" id="text-err"></div>
+      <div id="text-out" class="hidden">
+        <label for="restored-text">RESTORED TEXT</label>
+        <textarea id="restored-text" class="out-text" rows="10" readonly spellcheck="false"></textarea>
+        <div class="dl-row">
+          <button type="button" class="btn" id="btn-copy-restored">[ COPY ALL ]</button>
+          <button type="button" class="btn secondary" id="btn-dl-restored-txt">[ DOWNLOAD .TXT ]</button>
+        </div>
+        <div class="results-table" id="text-report" style="margin-top:12px;"></div>
+        <div class="note hidden" id="text-note"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3>[ 3. OR RESTORE A FILE ]</h3>
       <div class="dropzone" id="drop-dedoc" tabindex="0">
-        <div>&gt; DROP THE FILE WITH [TAG_XXXX] PLACEHOLDERS or [ BROWSE ]</div>
+        <div>&gt; DROP A FILE WITH [TAG_XXXXXXXXXXXX] TOKENS or [ BROWSE ]</div>
         <div class="meta">supported: .txt .md .csv .docx .xlsx</div>
       </div>
       <input type="file" id="file-dedoc" class="hidden" accept=".txt,.md,.csv,.docx,.xlsx" />
-    </section>
-    <section class="panel">
-      <h3>[ 2. DECODER RING ]</h3>
-      <div class="dropzone" id="drop-dekey" tabindex="0">
-        <div>&gt; DROP THE DECODER RING or [ BROWSE ]</div>
-        <div class="meta">accepts the .key.json or the decoder_ring .txt from an anonymize run</div>
+      <div style="margin-top:12px;">
+        <button type="button" class="btn" id="btn-restore-file" disabled>[ RESTORE FILE ]</button>
       </div>
-      <input type="file" id="file-dekey" class="hidden" accept=".json,.txt" />
-    </section>
-    <section class="panel">
-      <h3>[ 3. REMARRY ]</h3>
-      <button type="button" class="btn" id="btn-deanon" disabled>[ RESTORE ORIGINAL TEXT ]</button>
       <div class="steps" id="steps-deanon" style="margin-top:10px;"></div>
+      <div class="errline hidden" id="file-err"></div>
       <div class="dl-row">
         <button type="button" class="btn hidden" id="btn-dl-restored">[ DOWNLOAD RESTORED FILE ]</button>
       </div>
-      <div class="errline hidden" id="deanon-err"></div>
+      <div class="results-table" id="file-report" style="margin-top:12px;"></div>
+      <div class="note hidden" id="file-note"></div>
     </section>
   </div>
 </main>
@@ -281,23 +330,41 @@ const $ = (id) => document.getElementById(id);
 const show = (el) => el.classList.remove("hidden");
 const hide = (el) => el.classList.add("hidden");
 
+// Structured console log. Metadata only (names, sizes, counts) - never
+// document text, PII values, or anything from a replacement map.
+function log(level, mod, msg, err) {
+  const line = `${new Date().toISOString().replace(/\.\d{3}Z$/, "Z")} [${level}] [${mod}] ${msg}`;
+  if (level === "ERROR") console.error(line, err && err.stack ? err.stack : "");
+  else if (level === "WARNING") console.warn(line);
+  else console.info(line);
+}
+
+// localStorage can be missing or throw (private mode, blocked site data).
+// Every access goes through these two helpers.
+function lsGet(k) {
+  try { return window.localStorage.getItem(k); } catch (_) { return null; }
+}
+function lsSet(k, v) {
+  try { window.localStorage.setItem(k, v); return true; } catch (_) { return false; }
+}
+
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme")
+    || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+}
 function initTheme() {
-  const saved = localStorage.getItem("docanon-theme");
+  const saved = lsGet("docanon-theme");
   if (saved === "dark" || saved === "light") document.documentElement.setAttribute("data-theme", saved);
   updateThemeBtn();
   $("btn-theme").addEventListener("click", () => {
-    const cur = document.documentElement.getAttribute("data-theme")
-      || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    const next = cur === "dark" ? "light" : "dark";
+    const next = currentTheme() === "dark" ? "light" : "dark";
     document.documentElement.setAttribute("data-theme", next);
-    localStorage.setItem("docanon-theme", next);
+    lsSet("docanon-theme", next);
     updateThemeBtn();
   });
 }
 function updateThemeBtn() {
-  const cur = document.documentElement.getAttribute("data-theme")
-    || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  $("btn-theme").textContent = cur === "dark" ? "[ DARK ]" : "[ LIGHT ]";
+  $("btn-theme").textContent = currentTheme() === "dark" ? "[ DARK ]" : "[ LIGHT ]";
 }
 
 function renderSteps(hostId, steps) {
@@ -310,6 +377,17 @@ function renderSteps(hostId, steps) {
     const t = document.createElement("span"); t.className = "text"; t.textContent = s.text;
     if (s.blink) { const b = document.createElement("span"); b.className = "blink"; t.append(b); }
     div.append(g, t);
+    host.append(div);
+  }
+}
+
+function renderLines(hostId, lines) {
+  const host = $(hostId);
+  host.innerHTML = "";
+  for (const l of lines) {
+    const div = document.createElement("div");
+    if (l.cls) div.className = l.cls;
+    div.textContent = l.text;
     host.append(div);
   }
 }
@@ -327,6 +405,35 @@ function fmtBytes(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// Clipboard: async API first, execCommand fallback (older Safari, file://,
+// or a browser that denies clipboard-write).
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) { /* fall through */ }
+  const active = document.activeElement;
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed"; ta.style.top = "0"; ta.style.left = "0";
+  ta.style.width = "1px"; ta.style.height = "1px"; ta.style.opacity = "0";
+  document.body.append(ta);
+  let ok = false;
+  try { ta.select(); ok = document.execCommand("copy"); } catch (_) { ok = false; }
+  ta.remove();
+  if (active && active.focus) active.focus();
+  return ok;
+}
+function flashButton(btn, ok) {
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  btn.textContent = ok ? "[ COPIED ]" : "[ COPY FAILED ]";
+  clearTimeout(btn._flashTimer);
+  btn._flashTimer = setTimeout(() => { btn.textContent = btn.dataset.label; }, 1400);
 }
 
 // ------------------------- minimal ZIP (read + write) -------------------------
@@ -447,7 +554,7 @@ function zipStore(entries) {
   return out;
 }
 
-// ------------------------- XML text engine -------------------------
+// ------------------------- XML helpers -------------------------
 function decodeXml(s) {
   return s.replace(/&(amp|lt|gt|quot|apos|#x?[0-9a-fA-F]+);/g, (m, e) => {
     if (e === "amp") return "&"; if (e === "lt") return "<"; if (e === "gt") return ">";
@@ -456,16 +563,427 @@ function decodeXml(s) {
     return Number.isFinite(code) ? String.fromCodePoint(code) : m;
   });
 }
+// Numeric character references for non-ASCII characters become the
+// characters themselves: openpyxl writes "José" as "Jos&#233;". Without this
+// no text pass can match an accented or non-Latin name in formula text,
+// metadata, or any other raw XML - and it would ship. ASCII references
+// (&#10;, &#38;...) are left alone: they can carry meaning. Port of
+// scrubber._decode_char_refs.
+const CHAR_REF_RE = /&#(x[0-9A-Fa-f]+|[0-9]+);/g;
+function decodeCharRefs(xml) {
+  return xml.replace(CHAR_REF_RE, (m, ref) => {
+    const cp = ref[0] === "x" ? parseInt(ref.slice(1), 16) : parseInt(ref, 10);
+    if (!Number.isFinite(cp) || cp < 0x80 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return m;
+    return String.fromCodePoint(cp);
+  });
+}
+// Verifier unescape (port of verifier._xml_unescape): every numeric
+// reference, then the five named entities, &amp; last.
+function xmlUnescapeAll(s) {
+  s = s.replace(CHAR_REF_RE, (m, ref) => {
+    const cp = ref[0] === "x" ? parseInt(ref.slice(1), 16) : parseInt(ref, 10);
+    try { return String.fromCodePoint(cp); } catch (_) { return m; }
+  });
+  return s.split("&lt;").join("<").split("&gt;").join(">").split("&quot;").join('"')
+    .split("&apos;").join("'").split("&amp;").join("&");
+}
 function encodeXml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c]));
 }
 
-// Replace mapped strings inside "text runs" of an XML block, even when a
-// match is split across multiple runs (Word does this constantly).
-// blockRe selects paragraphs (w:p) or shared-string items (si / is).
-// tTag is the text element name ("w:t" or "t"). entries is [[orig, ph], ...]
-// sorted longest-original-first.
-function replaceInBlocks(xml, blockRe, tTag, entries) {
+// ------------------------- identifiers -------------------------
+// Owner rule: every distinct value gets its own 12-char uppercase hex ID
+// ([PERSON_3A4F9C2B1D0E]) and no ID is ever issued twice. A candidate is
+// rejected if it is already in this run, was issued earlier in this page,
+// or sits in this browser's ledger of issued IDs. Each ID has at least one
+// digit and one letter A-F so it can never read as a plain number or word.
+// The ledger holds random IDs only - never PII.
+const HEX_LEN = 12;
+const LEGACY_HEX_LEN = 4;
+const LEDGER_KEY = "docanon-issued-ids";
+const ID_RE = /^[0-9A-F]{12}$/;
+const EXAMPLE_ID = "3A4F9C2B1D0E";   // used in UI copy and the AI note - never issued
+const issuedThisPage = new Set();
+
+function isValidId(s) {
+  return typeof s === "string" && ID_RE.test(s) && /[0-9]/.test(s) && /[A-F]/.test(s)
+    && !/^\d+E\d+$/.test(s);    // Excel reads 123456789E12 as a number
+}
+
+function randomId() {
+  const b = new Uint8Array(HEX_LEN / 2);
+  for (let tries = 0; tries < 10000; tries++) {
+    crypto.getRandomValues(b);
+    let h = "";
+    for (const x of b) h += x.toString(16).padStart(2, "0");
+    h = h.toUpperCase();
+    if (isValidId(h)) return h;
+  }
+  throw new Error("random source is not producing usable ids");
+}
+
+function newId(isTaken) {
+  for (let i = 0; i < 10000; i++) {
+    const c = randomId();
+    if (c === EXAMPLE_ID || issuedThisPage.has(c) || isTaken(c)) continue;
+    issuedThisPage.add(c);
+    return c;
+  }
+  // 48 bits of space - reaching here means the RNG or the reserved set is broken.
+  throw new Error("could not find an unused 12-char id after 10,000 tries");
+}
+
+function loadLedger() {
+  const out = new Set();
+  const raw = lsGet(LEDGER_KEY);
+  if (raw) {
+    for (const tok of String(raw).toUpperCase().split(/[^0-9A-F]+/)) {
+      if (ID_RE.test(tok)) out.add(tok);
+    }
+  }
+  return out;
+}
+
+function recordIssued(ids) {
+  const fresh = [...new Set(ids)].filter(i => ID_RE.test(i));
+  const all = loadLedger();
+  let added = 0;
+  for (const i of fresh) if (!all.has(i)) { all.add(i); added++; }
+  if (!added) return { ok: true, added: 0, total: all.size };
+  const ok = lsSet(LEDGER_KEY, [...all].join("\n"));
+  if (ok) log("INFO", "ids", `ledger updated: ${added} ids recorded, ${all.size} total`);
+  else log("WARNING", "ids", `ledger not writable (browser storage unavailable): ${added} ids kept in page memory only`);
+  return { ok, added, total: all.size };
+}
+
+// ------------------------- replacement engine -------------------------
+// Port of app/replacer.py. Applying a map one entry at a time lets a later
+// short original match INSIDE a placeholder just written ("2B1D" inside
+// [PERSON_7C2B1D90AE44]) and costs values x text. Here every match is found
+// against the text as it stands, in one pass.
+//
+// Two stages. (1) Originals with a letter (and long numbers) match
+// leftmost-longest - a phone is still caught inside +15125550101. (2) SHORT
+// NUMBERS (no letters, fewer than 7 digits - a score, room, ZIP) then fill
+// the gaps, each only where it stands as a whole value: "94" never hits
+// 1945, 94.5, 1,945, A94, $B$94 or 94th, but does hit each item of a comma
+// list like 94,87,100.
+//
+// Protection covers only this map's own placeholders (bracketed and bare),
+// never "anything token-shaped": PII like MRN_000123456789 is still replaced.
+
+// Generic token shape. Used only to strip tokens before the regex-residue
+// warning scan - never for protection.
+const PLACEHOLDER_SRC = String.raw`\[[A-Z]+_(?:[0-9A-F]{12}|[0-9A-F]{4})\]` +
+  String.raw`|(?<![A-Za-z0-9_])[A-Z]+_[0-9A-F]{12}(?![A-Za-z0-9_])`;
+const PLACEHOLDER_RE_G = new RegExp(PLACEHOLDER_SRC, "g");
+const BRACKETED_PH_RE = /^\[([A-Z]+_(?:[0-9A-F]{12}|[0-9A-F]{4}))\]$/;
+
+const SHORT_NUMBER_DIGITS = 7;
+const isDigit = (c) => c !== undefined && c >= "0" && c <= "9";
+const isNumChar = (c) => c !== undefined && ((c >= "0" && c <= "9") || c === "." || c === ",");
+const ONE_NUMBER_RE = /^(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)$/;
+
+// No letters, fewer than 7 digits, starts or ends with a digit.
+function isShortNumber(s) {
+  if (!s || /\p{L}/u.test(s)) return false;
+  const cps = [...s];
+  let digits = 0;
+  for (const c of cps) if (/\p{Nd}/u.test(c)) digits++;
+  return digits < SHORT_NUMBER_DIGITS && (/\p{Nd}/u.test(cps[0]) || /\p{Nd}/u.test(cps[cps.length - 1]));
+}
+
+// Whole code point just before / at an offset (surrogate-pair safe).
+function cpBefore(text, i) {
+  const c = text.charCodeAt(i - 1);
+  if (c >= 0xDC00 && c <= 0xDFFF && i >= 2) {
+    const h = text.charCodeAt(i - 2);
+    if (h >= 0xD800 && h <= 0xDBFF) return text.slice(i - 2, i);
+  }
+  return text[i - 1];
+}
+const cpAt = (text, i) => String.fromCodePoint(text.codePointAt(i));
+const glued = (ch) => /[\p{L}\p{N}_$]/u.test(ch);
+const stripChars = (s, chars) => {
+  let a = 0, b = s.length;
+  while (a < b && chars.includes(s[a])) a++;
+  while (b > a && chars.includes(s[b - 1])) b--;
+  return s.slice(a, b);
+};
+
+// True when text[s:e] (a short number) stands on its own as a whole value.
+// Not whole: glued to letters/digits/$/_ (1945, A94, $B$94, 94th), or part of
+// one formatted number (1,945 / 94.5 / 10.0.94.1). Whole: surrounded by
+// spaces or punctuation, or one item of a comma list (204518,78704 and
+// 94,87,100 are lists - their groups are not all 3 digits).
+function numberBoundaryOk(text, s, e) {
+  if ((s > 0 && glued(cpBefore(text, s))) || (e < text.length && glued(cpAt(text, e)))) return false;
+  let a = s;
+  while (a > 0 && isNumChar(text[a - 1])) a--;
+  let b = e;
+  while (b < text.length && isNumChar(text[b])) b++;
+  const left = text.slice(a, s), right = text.slice(e, b);
+  if ((left && isDigit(left[left.length - 1])) || (right && isDigit(right[0]))) return false;
+  const core = text.slice(s, e);
+  if (![...core].every(isNumChar)) {
+    // e.g. "12/05", "-94": only a direct decimal continuation matters
+    if (left.length > 1 && left[left.length - 1] === "." && isDigit(left[left.length - 2])) return false;
+    if (right.length > 1 && right[0] === "." && isDigit(right[1])) return false;
+    return true;
+  }
+  const run = stripChars(text.slice(a, b), ".,");
+  if (run === stripChars(core, ".,")) return true;
+  if (ONE_NUMBER_RE.test(run)) return false;            // core is only part of one number
+  let i0 = -1;
+  for (let k = s - 1; k >= a; k--) if (text[k] === ",") { i0 = k; break; }
+  i0 = i0 === -1 ? a : i0 + 1;
+  let i1 = -1;
+  for (let k = e; k < b; k++) if (text[k] === ",") { i1 = k; break; }
+  i1 = i1 === -1 ? b : i1;
+  return stripChars(text.slice(i0, i1), ".") === core;
+}
+
+function reEscape(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+const TRIE_END = "";     // key marking "a word ends here" (never a real char)
+function buildTrie(words) {
+  const root = new Map();
+  for (const w of words) {
+    let node = root;
+    for (let i = 0; i < w.length; i++) {
+      const ch = w[i];
+      let nxt = node.get(ch);
+      if (!nxt) { nxt = new Map(); node.set(ch, nxt); }
+      node = nxt;
+    }
+    node.set(TRIE_END, true);
+  }
+  return root;
+}
+
+// Regex matching any of `words`, preferring the longest at a position. A
+// greedy optional group tries the longer continuation first and only
+// backtracks to the shorter word when the longer one fails.
+function triePattern(words) {
+  const kidsOf = (node) => [...node.keys()].filter(k => k !== TRIE_END);
+  function emit(node) {
+    const parts = [];
+    // Walk straight chains iteratively (keeps recursion to branch points).
+    while (true) {
+      const kids = kidsOf(node);
+      if (kids.length === 1 && !node.has(TRIE_END)) {
+        parts.push(reEscape(kids[0]));
+        node = node.get(kids[0]);
+        continue;
+      }
+      break;
+    }
+    const kids = kidsOf(node).sort();
+    if (!kids.length) return parts.join("");
+    const alts = kids.map(k => reEscape(k) + emit(node.get(k)));
+    let body = alts.length === 1 ? alts[0] : "(?:" + alts.join("|") + ")";
+    if (node.has(TRIE_END)) body = alts.length === 1 ? "(?:" + body + ")?" : body + "?";
+    return parts.join("") + body;
+  }
+  return emit(buildTrie(words));
+}
+
+// End offsets of every trie word starting at text[p], longest first.
+function wordsAt(trie, text, p) {
+  const ends = [];
+  let node = trie;
+  for (let i = p; i < text.length; i++) {
+    node = node.get(text[i]);
+    if (node === undefined) break;
+    if (node.has(TRIE_END)) ends.push(i + 1);
+  }
+  return ends.reverse();
+}
+
+function findAll(text, w) {
+  const out = [];
+  let i = text.indexOf(w);
+  while (i !== -1) { out.push(i); i = text.indexOf(w, i + 1); }
+  return out;
+}
+
+// Stretches of `text` where detected values overlap without nesting. Port of
+// replacer.overlap_unions. "Patient Jane" and "Jane Smith" both found in
+// "Patient Jane Smith": whichever wins, part of the other ("Smith") would
+// survive, and the verifier cannot see a fragment. Returns
+// [unionText, memberOriginals] for each stretch so the caller registers the
+// union as one value (its own ID - fully reversible). Stretches spanning a
+// tab or newline cross cells or lines and are skipped.
+function overlapUnions(text, originals) {
+  const words = [...new Set(originals.filter(w => w && !isShortNumber(w)))].sort((a, b) => b.length - a.length);
+  if (words.length < 2) return [];
+  const wordSet = new Set(words);
+  const out = [];
+  let cs = -1, ce = -1, members = [];
+  const flush = () => {
+    if (members.length > 1) {
+      const u = text.slice(cs, ce);
+      if (!wordSet.has(u) && !u.includes("\t") && !u.includes("\n")) out.push([u, members.slice()]);
+    }
+  };
+  try {
+    const re = new RegExp(`(?=(${triePattern(words)}))`, "g");
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      re.lastIndex = m.index + 1;
+      const s0 = m.index, w = m[1];
+      if (s0 < ce) { ce = Math.max(ce, s0 + w.length); members.push(w); }
+      else { flush(); cs = s0; ce = s0 + w.length; members = [w]; }
+    }
+  } catch (exc) {
+    log("WARNING", "replacer", `overlap scan unavailable (${exc.name})`);
+    return [];
+  }
+  flush();
+  const seen = new Set();
+  return out.filter(([u]) => !seen.has(u) && seen.add(u));
+}
+
+class LiteralReplacer {
+  // pairs: [[original, replacement], ...]. Spans are [start, end, replacement].
+  constructor(pairs, protect = true) {
+    this.map = new Map();
+    for (const [k, v] of pairs) if (typeof k === "string" && k) this.map.set(k, v);
+    this.protect = protect;
+    const words = [...this.map.keys()].sort((a, b) => b.length - a.length);
+    this.texty = words.filter(w => !isShortNumber(w));
+    this.numbers = words.filter(w => isShortNumber(w));
+    this.protectedWords = [];
+    if (protect) {
+      const ph = new Set();
+      for (const v of this.map.values()) {
+        const m = typeof v === "string" ? BRACKETED_PH_RE.exec(v) : null;
+        if (m) { ph.add(v); ph.add(m[1]); }
+      }
+      // A placeholder that is itself an original must stay matchable.
+      this.protectedWords = [...ph].filter(p => !this.map.has(p)).sort((a, b) => b.length - a.length);
+    }
+    this.re = null;
+    this.numRe = null;
+    this.numTrie = this.numbers.length ? buildTrie(this.numbers) : null;
+    this.fallback = false;
+    try {
+      const alts = [];
+      if (this.protectedWords.length) alts.push(`(?<ph>${triePattern(this.protectedWords)})`);
+      if (this.texty.length) alts.push(`(?<o>${triePattern(this.texty)})`);
+      if (alts.length) this.re = new RegExp(alts.join("|"), "g");
+      if (this.numbers.length) this.numRe = new RegExp(`(?=(?:${triePattern(this.numbers)}))`, "g");
+    } catch (exc) {
+      // Pathological originals (stack depth / regex size). Correct but slower scan.
+      log("WARNING", "replacer", `trie regex unavailable (${exc.name}) - using fallback scan`);
+      this.fallback = true;
+    }
+  }
+
+  find(text) {
+    if (!text || !this.map.size) return [];
+    if (!this.fallback) {
+      try { return this._find(text, false); }
+      catch (exc) {
+        log("WARNING", "replacer", `trie regex failed (${exc.name}) - using fallback scan`);
+        this.fallback = true;
+      }
+    }
+    return this._find(text, true);
+  }
+
+  _find(text, fb) {
+    const occ = new Uint8Array(text.length);
+    const spans = [];
+    if (fb) this._textyFallback(text, occ, spans);
+    else if (this.re) {
+      const re = this.re;
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        if (m[0] === "") { re.lastIndex++; continue; }
+        const end = m.index + m[0].length;
+        occ.fill(1, m.index, end);
+        if (m.groups.o !== undefined) spans.push([m.index, end, this.map.get(m.groups.o)]);
+      }
+    }
+    if (this.numbers.length) {
+      let starts;
+      if (fb || !this.numRe) {
+        const set = new Set();
+        for (const w of this.numbers) for (const i of findAll(text, w)) set.add(i);
+        starts = [...set].sort((x, y) => x - y);
+      } else {
+        starts = [];
+        const nr = this.numRe;
+        nr.lastIndex = 0;
+        let m;
+        while ((m = nr.exec(text)) !== null) { starts.push(m.index); nr.lastIndex = m.index + 1; }
+      }
+      for (const p of starts) {
+        if (occ[p]) continue;
+        for (const e of wordsAt(this.numTrie, text, p)) {
+          let clash = false;
+          for (let k = p; k < e; k++) if (occ[k]) { clash = true; break; }
+          if (clash || !numberBoundaryOk(text, p, e)) continue;
+          occ.fill(1, p, e);
+          spans.push([p, e, this.map.get(text.slice(p, e))]);
+          break;
+        }
+      }
+    }
+    spans.sort((x, y) => x[0] - y[0]);
+    return spans;
+  }
+
+  // Leftmost-longest over protected + texty words without a regex. Every
+  // accepted span is taken in start order, so "overlaps an accepted span"
+  // is just start < end of the last one: linear in candidate occurrences.
+  _textyFallback(text, occ, spans) {
+    const n = text.length;
+    const best = new Int32Array(n);
+    const isPh = new Uint8Array(n);
+    const note = (w, ph) => {
+      for (const i of findAll(text, w)) if (w.length > best[i]) { best[i] = w.length; isPh[i] = ph ? 1 : 0; }
+    };
+    for (const w of this.protectedWords) note(w, true);
+    for (const w of this.texty) note(w, false);
+    for (let i = 0; i < n;) {
+      if (!best[i]) { i++; continue; }
+      const e = i + best[i];
+      occ.fill(1, i, e);
+      if (!isPh[i]) spans.push([i, e, this.map.get(text.slice(i, e))]);
+      i = e;
+    }
+  }
+
+  // Variant for raw XML parts: also match XML-escaped originals.
+  forRawXml() {
+    const out = [];
+    for (const [o, r] of this.map) {
+      out.push([o, r]);
+      const esc = encodeXml(o);
+      if (esc !== o) out.push([esc, encodeXml(r)]);
+    }
+    return new LiteralReplacer(out, this.protect);
+  }
+}
+
+// Write each [start, end, replacement] span into `text` in one pass.
+function splice(text, spans) {
+  if (!spans.length) return text;
+  const out = [];
+  let cur = 0;
+  for (const [s, e, r] of spans) { out.push(text.slice(cur, s), r); cur = e; }
+  out.push(text.slice(cur));
+  return out.join("");
+}
+function applyReplacer(text, replacer) { return splice(text, replacer.find(text)); }
+
+// Apply a replacer inside "text runs" of an XML block, even when a match is
+// split across runs (Word does this constantly). blockRe selects paragraphs
+// (w:p) or shared-string items (si / is); tTag is "w:t" or "t".
+function replaceInBlocks(xml, blockRe, tTag, replacer, addSpace = true) {
   const tRe = new RegExp(`<${tTag}((?:\\s[^>]*)?)/>|<${tTag}((?:\\s[^>]*)?)>([\\s\\S]*?)</${tTag}>`, "g");
   let replacedCount = 0;
   const out = xml.replace(blockRe, (block) => {
@@ -483,22 +1001,8 @@ function replaceInBlocks(xml, blockRe, tTag, entries) {
     const joined = nodes.map(n => n.text).join("");
     if (!joined) return block;
 
-    // Claim non-overlapping match ranges, longest originals first.
-    const ranges = [];
-    for (const [orig, ph] of entries) {
-      let idx = 0;
-      while (true) {
-        const f = joined.indexOf(orig, idx);
-        if (f === -1) break;
-        const end = f + orig.length;
-        if (!ranges.some(r => f < r.end && end > r.start)) {
-          ranges.push({ start: f, end, ph });
-          idx = end;
-        } else idx = f + 1;
-      }
-    }
+    const ranges = replacer.find(joined);
     if (!ranges.length) return block;
-    ranges.sort((a, b) => a.start - b.start);
     replacedCount += ranges.length;
 
     // Map each character of the joined text back to its owning node.
@@ -509,9 +1013,9 @@ function replaceInBlocks(xml, blockRe, tTag, entries) {
     const newTexts = nodes.map(() => "");
     let i = 0, r = 0;
     while (i < joined.length) {
-      if (r < ranges.length && ranges[r].start === i) {
-        newTexts[owner[i]] += ranges[r].ph;
-        i = ranges[r].end;
+      if (r < ranges.length && ranges[r][0] === i) {
+        newTexts[owner[i]] += ranges[r][2];
+        i = ranges[r][1];
         r++;
       } else {
         newTexts[owner[i]] += joined[i];
@@ -524,7 +1028,7 @@ function replaceInBlocks(xml, blockRe, tTag, entries) {
     for (let k = nodes.length - 1; k >= 0; k--) {
       const n = nodes[k];
       let attrs = n.attrs;
-      if (!/xml:space/.test(attrs)) attrs += ' xml:space="preserve"';
+      if (addSpace && !/xml:space/.test(attrs)) attrs += ' xml:space="preserve"';
       const xmlNode = `<${tTag}${attrs}>${encodeXml(newTexts[k])}</${tTag}>`;
       rebuilt = rebuilt.slice(0, n.start) + xmlNode + rebuilt.slice(n.end);
     }
@@ -533,16 +1037,160 @@ function replaceInBlocks(xml, blockRe, tTag, entries) {
   return { xml: out, count: replacedCount };
 }
 
-// Plain substitution for any XML part (covers metadata, alt text, etc.).
-function replacePlainXml(xml, entries) {
-  let out = xml;
-  for (const [orig, ph] of entries) {
-    const encO = encodeXml(orig);
-    const encP = encodeXml(ph);
-    out = out.split(encO).join(encP);
-    if (encO !== orig) out = out.split(orig).join(encP);
+// Raw-XML substitution that never damages markup. Port of scrubber._apply_raw.
+// By the time this runs, document text has been handled by the run-aware
+// pass. What is left is hidden layers (metadata, formula literals, alt text)
+// and markup. Rules:
+//   - inside a tag: only non-structural attribute values (markupSpanOk)
+//   - xlsx <v> cell values: never (numbers and shared-string indexes)
+//   - formulas (<f>, <definedName>): anonymizing only inside "string
+//     literals" - never a reference (B7, A94) or operand; restoring anywhere,
+//     with apostrophes doubled outside literals ('O''Brien'!B1)
+//   - number-only nodes (word counts, offsets): never a short number
+const NUMERIC_NODE_RE = /^[\s\d.,:+\-]*$/;
+const ATTR_RE = /([\p{L}\p{N}_:.-]+)\s*=\s*("[^"]*"|'[^']*')/gu;
+const ELEMENT_AT_RE = /<\/?\s*([\p{L}\p{N}_:.-]+)/uy;
+// Attribute values that are coordinates, indexes, or identifiers. PII never
+// legitimately lives there, and rewriting them breaks the file.
+const STRUCTURAL_ATTRS = new Set(["r", "ref", "sqref", "spans", "s", "t", "type", "count", "uniquecount"]);
+const localName = (n) => { const p = n.split(":"); return p[p.length - 1].toLowerCase(); };
+function elementAt(text, i) {
+  ELEMENT_AT_RE.lastIndex = i;
+  const m = ELEMENT_AT_RE.exec(text);
+  return m ? m[1] : null;
+}
+
+// May the raw pass rewrite text[s0:e0], which sits inside the tag at lt?
+// Only inside a non-structural attribute value (author, title, Target,
+// name...), and only for values of 4+ characters that are not short numbers.
+// Never element/attribute names, coordinates (r="B7"), ids, or rsids.
+function markupSpanOk(text, lt, s0, e0) {
+  const matched = text.slice(s0, e0);
+  if ([...matched].length < 4 || isShortNumber(matched)) return false;
+  const gt = text.indexOf(">", e0);
+  const tag = text.slice(lt, gt !== -1 ? gt + 1 : text.length);
+  const el = elementAt(tag, 0);
+  if (el !== null && localName(el).startsWith("rsid")) return false;
+  const rs = s0 - lt, re0 = e0 - lt;
+  for (const m of tag.matchAll(ATTR_RE)) {
+    const vEnd = m.index + m[0].length, vStart = vEnd - m[2].length;
+    if (vStart + 1 <= rs && re0 <= vEnd - 1) {
+      const attr = localName(m[1]);
+      return !(STRUCTURAL_ATTRS.has(attr) || attr.startsWith("rsid") || attr.endsWith("id"));
+    }
+  }
+  return false;
+}
+
+function applyRaw(text, replacer, protectV) {
+  const spans = replacer.find(text);
+  if (!spans.length) return text;
+  const keep = [];
+  for (const [s0, e0, r0] of spans) {
+    let r = r0;
+    const lt = s0 > 0 ? text.lastIndexOf("<", s0 - 1) : -1;
+    const gt = s0 > 0 ? text.lastIndexOf(">", s0 - 1) : -1;
+    if (lt > gt) {                                  // inside a tag
+      if (!markupSpanOk(text, lt, s0, e0)) continue;
+    } else {
+      const a = gt + 1;
+      const openLt = a > 0 ? text.lastIndexOf("<", a - 1) : -1;
+      const el = openLt !== -1 ? elementAt(text, openLt) : null;
+      const element = el !== null ? localName(el) : "";
+      if (protectV && element === "v") continue;
+      if (element === "f" || element === "definedname") {
+        // Formula syntax (cells, defined names, chart refs). PII can only
+        // live in a "string literal"; outside quotes it is a reference.
+        const before = text.slice(a, s0).split("&quot;").join('"');
+        const inString = ((before.match(/"/g) || []).length % 2) === 1;
+        if (!inString) {
+          if (!replacer.restoring) continue;
+          // Restoring a token that named a sheet: inside 'quoted'!
+          // references an apostrophe must be doubled (O''Brien).
+          r = r.split("&apos;").join("&apos;&apos;").split("'").join("''");
+        }
+      }
+      if (isShortNumber(text.slice(s0, e0))) {
+        const b = text.indexOf("<", e0);
+        const node = text.slice(a, b !== -1 ? b : text.length);
+        if (element === "v" || NUMERIC_NODE_RE.test(node)) continue;
+      }
+    }
+    keep.push([s0, e0, r]);
+  }
+  return splice(text, keep);
+}
+
+// ------------------------- xlsx sheet titles -------------------------
+// Sheet titles can carry PII ("Smith Family") but cannot hold [ ] : * ? / \
+// and max out at 31 characters. Port of scrubber._anonymized_sheet_titles:
+// PII becomes the bracket-free token; if the result is empty, too long, or
+// already taken, the sheet gets a unique SHEET_<id> instead (never a
+// truncated token). The key file records every rename, so restore is exact.
+const BAD_SHEET_CHARS = /[\[\]:*?\/\\']/g;
+const BRACKETED_ID_G = /\[([A-Z]+_[0-9A-F]{12})\]/g;
+const SHEET_EL_RE = /<sheet\b[^>]*>/g;
+
+// Excel treats sheet names case-insensitively, so "taken" does too
+// (upper-then-lower approximates Python's str.casefold: ß -> ss).
+const casefold = (s) => s.toUpperCase().toLowerCase();
+function anonymizedSheetTitles(titles, replacer, newSheetId) {
+  const renames = new Map();                     // old -> new
+  const taken = new Set(titles.map(casefold));
+  for (const old of titles) {
+    let neu = applyReplacer(old, replacer);
+    if (neu === old) continue;
+    neu = neu.replace(BRACKETED_ID_G, "$1").replace(BAD_SHEET_CHARS, "_").trim();
+    if (!neu || [...neu].length > 31 || taken.has(casefold(neu))) neu = `SHEET_${newSheetId()}`;
+    taken.delete(casefold(old));
+    taken.add(casefold(neu));
+    renames.set(old, neu);
+  }
+  return renames;
+}
+
+function sheetNameAttr(tag) {
+  const m = /\sname\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(tag);
+  return m ? { raw: m[0], value: decodeXml(m[1] !== undefined ? m[1] : m[2]) } : null;
+}
+function workbookSheetTitles(workbookXml) {
+  const out = [];
+  for (const m of workbookXml.matchAll(SHEET_EL_RE)) {
+    const a = sheetNameAttr(m[0]);
+    if (a) out.push(a.value);
   }
   return out;
+}
+function renameSheetsInWorkbook(workbookXml, renames) {
+  return workbookXml.replace(SHEET_EL_RE, (tag) => {
+    const a = sheetNameAttr(tag);
+    if (!a || !renames.has(a.value)) return tag;
+    return tag.replace(a.raw, () => ` name="${encodeXml(renames.get(a.value))}"`);
+  });
+}
+
+// Point formula / defined-name / chart / pivot references at the renamed
+// sheets. Port of scrubber._rewrite_sheet_refs.
+const BARE_SHEET_RE = /^[\p{L}\p{Nl}\p{No}_][\p{L}\p{N}_.]*$/u;     // valid unquoted sheet name
+function rewriteSheetRefs(xml, renames) {
+  const textSafe = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  for (const [old, neu] of renames) {
+    // Inside a formula reference an apostrophe is written twice: 'O''Brien'!A1
+    const quotedNew = textSafe("'" + neu.replace(/'/g, "''") + "'!");
+    const oq = old.replace(/'/g, "''");
+    for (const o of new Set([oq, textSafe(oq), encodeXml(oq)])) {
+      xml = xml.split(`'${o}'!`).join(quotedNew);
+      xml = xml.split(`&apos;${o}&apos;!`).join(quotedNew);
+    }
+    if (BARE_SHEET_RE.test(old)) {      // unquoted refs: Smith!A1, José!A1
+      // Keep the reference's own style: unquoted stays unquoted when the new
+      // name allows it (tokens do), so a restore is text-exact.
+      const bareNew = BARE_SHEET_RE.test(neu) ? textSafe(neu + "!") : quotedNew;
+      xml = xml.replace(new RegExp(`(?<![\\p{L}\\p{N}_.'])${reEscape(old)}!`, "gu"), () => bareNew);
+    }
+    xml = xml.split(`sheet="${encodeXml(old)}"`).join(`sheet="${encodeXml(neu)}"`);
+  }
+  return xml;
 }
 
 function zeroCoreAuthors(xml) {
@@ -553,9 +1201,13 @@ function zeroCoreAuthors(xml) {
 
 // ------------------------- format handlers -------------------------
 const DOCX_TEXT_PARTS = /^word\/(document|header\d*|footer\d*|footnotes|endnotes|comments)\.xml$/;
+const XLSX_SHEET_PART = /^xl\/worksheets\/sheet\d*\.xml$/;
 const W_P_RE = /<w:p[ >][\s\S]*?<\/w:p>/g;
 const SI_RE = /<si>[\s\S]*?<\/si>/g;
 const IS_RE = /<is>[\s\S]*?<\/is>/g;
+// Formula cells with a cached string result keep that text in <v>. The raw
+// pass never touches <v>, so these go through the run-aware pass instead.
+const STR_CELL_RE = /<c\b[^>]*\bt="str"[^>/]*>[\s\S]*?<\/c>/g;
 
 function extractDocxText(xml) {
   const parts = [];
@@ -567,15 +1219,95 @@ function extractDocxText(xml) {
   });
   return parts.join("");
 }
-function extractXlsxTexts(xml, blockRe) {
+function extractXlsxTexts(xml, blockRe, tag = "t") {
   const items = [];
   const blocks = xml.match(blockRe) || [];
+  const tRe = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, "g");
   for (const b of blocks) {
     const texts = [];
-    b.replace(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/g, (m, t) => { texts.push(decodeXml(t)); return m; });
+    b.replace(tRe, (m, t) => { texts.push(decodeXml(t)); return m; });
     if (texts.length) items.push(texts.join(""));
   }
   return items;
+}
+// Plain numeric cells (no formula): <c r="B2" s="1"><v>94</v></c>.
+const NUM_CELL_RE = /<c\b([^>]*)>\s*<v>([^<]*)<\/v>\s*<\/c>/g;
+const cellType = (attrs) => { const m = /\bt="([^"]*)"/.exec(attrs); return m ? m[1] : "n"; };
+// The str() form Python/openpyxl gives a cell value: int stays int, a
+// float keeps a trailing ".0" ("94.0"). Same string the desktop app matches.
+function pyNumStr(v) {
+  const s = v.trim();
+  if (/^[+-]?\d+$/.test(s)) { try { return BigInt(s).toString(); } catch (_) { return null; } }
+  const n = Number(s);
+  if (!s || !Number.isFinite(n)) return null;
+  if (Math.abs(n) >= 1e16) return n.toExponential();
+  return Number.isInteger(n) ? n.toFixed(1) : String(n);
+}
+function numericCellTexts(xml) {
+  const out = [];
+  for (const m of xml.matchAll(NUM_CELL_RE)) {
+    if (cellType(m[1]) !== "n") continue;
+    const s = pyNumStr(decodeXml(m[2]));
+    if (s !== null) out.push(s);
+  }
+  return out;
+}
+function extractSheetTexts(xml) {
+  return [...extractXlsxTexts(xml, IS_RE), ...extractXlsxTexts(xml, STR_CELL_RE, "v"), ...numericCellTexts(xml)];
+}
+
+// A phone typed without dashes, a ZIP, or a student ID is stored as a number.
+// The raw pass never touches <v>, so a numeric cell whose value matches is
+// rewritten here as an inline-string cell holding the replacement (port of
+// the openpyxl numeric-cell rule in scrubber.scrub_xlsx).
+function replaceNumericCells(xml, replacer) {
+  return xml.replace(NUM_CELL_RE, (cell, attrs, v) => {
+    if (cellType(attrs) !== "n") return cell;
+    const s = pyNumStr(decodeXml(v));
+    if (s === null) return cell;
+    const next = applyReplacer(s, replacer);
+    if (next === s) return cell;
+    const a = attrs.replace(/\s+t="[^"]*"/, "");
+    return `<c${a} t="inlineStr"><is><t xml:space="preserve">${encodeXml(next)}</t></is></c>`;
+  });
+}
+
+// Tag-stripped text of every XML part (port of verifier._deep_zip_text), for
+// the verifier: catches PII the text extraction cannot see (metadata, alt
+// text, formula literals). Worksheet <v> values and number-only nodes with
+// fewer than 7 digits are XML bookkeeping and are left out, matching what
+// the raw pass is allowed to touch.
+function blankShortNumbers(xml) {
+  return xml.replace(/>([\s\d.,:+\-]+)</g, (m, node) =>
+    ">" + ((node.match(/[0-9]/g) || []).length >= SHORT_NUMBER_DIGITS ? node : "") + "<");
+}
+// Formulas (<f>, <definedName>, any prefix): PII can live in "string
+// literals" and in the sheet names a formula references ('Smith Family'!A1).
+// Cell references and operators are not scanned - "B7" in "Jane Smith"&B7 is
+// a cell, not the locker ID B7 (port of verifier._formula_literals_only).
+const FORMULA_EL_RE = /(<(?:[\p{L}\p{N}_]+:)?(f|definedName)(?:\s[^>]*)?(?<!\/)>)([\s\S]*?)(<\/(?:[\p{L}\p{N}_]+:)?\2>)/gu;
+const STRING_LIT_RE = /"(?:[^"]|"")*"/g;
+const SHEET_REF_RE = /'((?:[^']|'')+)'!|([\p{L}\p{Nl}\p{No}_][\p{L}\p{N}_.]*)!/gu;
+function formulaLiteralsOnly(xml) {
+  return xml.replace(FORMULA_EL_RE, (m, open, name, inner, close) => {
+    const f = inner.split("&quot;").join('"').split("&apos;").join("'");
+    const lits = (f.match(STRING_LIT_RE) || []).map(x => x.slice(1, -1).split('""').join('"'));
+    const rest = f.replace(STRING_LIT_RE, " ");
+    const refs = [...rest.matchAll(SHEET_REF_RE)].map(r => (r[1] !== undefined ? r[1].split("''").join("'") : r[2]));
+    return open + lits.concat(refs).join("\n") + close;
+  });
+}
+function deepZipText(entries) {
+  const chunks = [];
+  for (const e of entries) {
+    if (!isTextPart(e.name)) continue;
+    let raw = td8.decode(e.bytes);
+    if (XLSX_SHEET_PART.test(e.name)) raw = raw.replace(/<v>[^<]*<\/v>/g, "");
+    raw = formulaLiteralsOnly(raw);
+    raw = blankShortNumbers(raw);
+    chunks.push(xmlUnescapeAll(raw.replace(/<[^>]+>/g, "\n")));
+  }
+  return chunks.join("\n");
 }
 
 const td8 = new TextDecoder();
@@ -599,52 +1331,119 @@ async function loadDocument(file) {
       }
       text = chunks.join("\n");
     } else {
-      const chunks = [];
-      for (const e of entries) {
-        const x = td8.decode(e.bytes);
-        if (e.name === "xl/sharedStrings.xml") chunks.push(...extractXlsxTexts(x, SI_RE));
-        else if (/^xl\/worksheets\/sheet\d*\.xml$/.test(e.name)) chunks.push(...extractXlsxTexts(x, IS_RE));
-      }
-      text = chunks.join("\n");
+      text = xlsxText(entries);
     }
     return { kind: "zip", ext, name, text, entries };
   }
   throw new Error(`unsupported file type: .${ext}`);
 }
 
-// Apply a replacement map to a loaded document; returns {bytes, mime, text}.
-function applyToDocument(doc, entries) {
-  if (doc.kind === "text") {
-    let out = doc.text;
-    for (const [orig, ph] of entries) out = out.split(orig).join(ph);
-    return { bytes: te8.encode(out), mime: "text/plain;charset=utf-8", text: out };
+// Sheets in workbook order, each with its worksheet part name.
+function resolvePart(base, target) {
+  if (target.startsWith("/")) return target.slice(1);
+  const out = [];
+  for (const p of (base + target).split("/")) {
+    if (p === "..") out.pop(); else if (p !== "." && p !== "") out.push(p);
   }
-  // zip formats
+  return out.join("/");
+}
+function workbookSheets(entries) {
+  const byName = new Map(entries.map(e => [e.name, e]));
+  const wb = byName.get("xl/workbook.xml");
+  if (!wb) return [];
+  const targets = new Map();
+  const rels = byName.get("xl/_rels/workbook.xml.rels");
+  if (rels) {
+    for (const m of td8.decode(rels.bytes).matchAll(/<Relationship\b[^>]*>/g)) {
+      const id = /\sId\s*=\s*"([^"]*)"/.exec(m[0]), tg = /\sTarget\s*=\s*"([^"]*)"/.exec(m[0]);
+      if (id && tg) targets.set(id[1], resolvePart("xl/", decodeXml(tg[1])));
+    }
+  }
+  const out = [];
+  for (const m of td8.decode(wb.bytes).matchAll(SHEET_EL_RE)) {
+    const a = sheetNameAttr(m[0]);
+    if (!a) continue;
+    const rid = /\s[A-Za-z0-9_]+:id\s*=\s*"([^"]*)"/.exec(m[0]);
+    out.push({ title: a.value, part: rid ? (targets.get(rid[1]) || null) : null });
+  }
+  return out;
+}
+
+// XLSX text for detection, preview and verification: shared strings, then per
+// sheet its inline strings, cached formula strings and numbers. Sheet titles
+// can carry PII ("Smith Family"), so a "Sheet: <title>" line precedes each
+// sheet - except a lone default-named sheet (port of extractors._extract_xlsx).
+function xlsxText(entries) {
+  const byName = new Map(entries.map(e => [e.name, e]));
+  const chunks = [];
+  const ss = byName.get("xl/sharedStrings.xml");
+  if (ss) chunks.push(...extractXlsxTexts(td8.decode(ss.bytes), SI_RE));
+  const sheets = workbookSheets(entries);
+  const showTitles = sheets.length > 1 || (sheets.length === 1 && !/^Sheet\d*$/.test(sheets[0].title));
+  const done = new Set();
+  for (const sh of sheets) {
+    if (showTitles) chunks.push(`Sheet: ${sh.title}`);
+    const e = sh.part ? byName.get(sh.part) : null;
+    if (e && !done.has(e.name)) { done.add(e.name); chunks.push(...extractSheetTexts(td8.decode(e.bytes))); }
+  }
+  for (const e of entries) {
+    if (XLSX_SHEET_PART.test(e.name) && !done.has(e.name)) chunks.push(...extractSheetTexts(td8.decode(e.bytes)));
+  }
+  return chunks.join("\n");
+}
+
+// Apply a replacer (LiteralReplacer to anonymize, TokenRestorer to restore)
+// to a loaded document. Returns {bytes, mime, text, deepText}. The output is
+// always a freshly built file - never a patched copy of the original bytes.
+function applyToDocument(doc, replacer, opts = {}) {
+  if (doc.kind === "text") {
+    const out = applyReplacer(doc.text, replacer);
+    return { bytes: te8.encode(out), mime: "text/plain;charset=utf-8", text: out, deepText: "", renames: new Map() };
+  }
+  // zip formats: sheet renames + reference rewrite, run-aware pass on text
+  // runs, then a raw pass over every XML part (metadata, alt text, formula
+  // literals) that also matches XML-escaped values.
+  const raw = replacer.forRawXml();
+  let renames = new Map();                       // current title -> new title
+  if (doc.ext === "xlsx") {
+    const wbE = doc.entries.find(e => e.name === "xl/workbook.xml");
+    const titles = wbE ? workbookSheetTitles(td8.decode(wbE.bytes)) : [];
+    if (opts.sheetRestore && opts.sheetRestore.size) {
+      for (const [cur, orig] of opts.sheetRestore) if (titles.includes(cur)) renames.set(cur, orig);
+    } else if (opts.anonymizeSheets) {
+      renames = anonymizedSheetTitles(titles, replacer, opts.newSheetId);
+    }
+  }
   const newEntries = [];
-  const extractedChunks = [];
+  const docxChunks = [];
   for (const e of doc.entries) {
     if (!isTextPart(e.name)) { newEntries.push(e); continue; }
-    let xml = td8.decode(e.bytes);
+    let xml = decodeCharRefs(td8.decode(e.bytes));
+    if (renames.size) {
+      if (e.name === "xl/workbook.xml") xml = renameSheetsInWorkbook(xml, renames);
+      xml = rewriteSheetRefs(xml, renames);
+    }
+    const isSheet = doc.ext === "xlsx" && XLSX_SHEET_PART.test(e.name);
     if (doc.ext === "docx" && DOCX_TEXT_PARTS.test(e.name)) {
-      xml = replaceInBlocks(xml, W_P_RE, "w:t", entries).xml;
+      xml = replaceInBlocks(xml, W_P_RE, "w:t", replacer).xml;
     } else if (doc.ext === "xlsx" && e.name === "xl/sharedStrings.xml") {
-      xml = replaceInBlocks(xml, SI_RE, "t", entries).xml;
-    } else if (doc.ext === "xlsx" && /^xl\/worksheets\/sheet\d*\.xml$/.test(e.name)) {
-      xml = replaceInBlocks(xml, IS_RE, "t", entries).xml;
+      xml = replaceInBlocks(xml, SI_RE, "t", replacer).xml;
+    } else if (isSheet) {
+      xml = replaceInBlocks(xml, IS_RE, "t", replacer).xml;
+      xml = replaceInBlocks(xml, STR_CELL_RE, "v", replacer, false).xml;
+      if (opts.numericCells) xml = replaceNumericCells(xml, replacer);
     }
-    xml = replacePlainXml(xml, entries);
-    if (e.name === "docProps/core.xml") xml = zeroCoreAuthors(xml);
-    if (doc.ext === "docx" && DOCX_TEXT_PARTS.test(e.name)) extractedChunks.push(extractDocxText(xml));
-    if (doc.ext === "xlsx" && (e.name === "xl/sharedStrings.xml" || /^xl\/worksheets\//.test(e.name))) {
-      extractedChunks.push(...extractXlsxTexts(xml, e.name === "xl/sharedStrings.xml" ? SI_RE : IS_RE));
-    }
+    xml = applyRaw(xml, raw, isSheet);
+    if (opts.zeroAuthors && e.name === "docProps/core.xml") xml = zeroCoreAuthors(xml);
+    if (doc.ext === "docx" && DOCX_TEXT_PARTS.test(e.name)) docxChunks.push(extractDocxText(xml));
     newEntries.push({ name: e.name, bytes: te8.encode(xml) });
   }
   const bytes = zipStore(newEntries);
   const mime = doc.ext === "docx"
     ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-  return { bytes, mime, text: extractedChunks.join("\n") };
+  const text = doc.ext === "xlsx" ? xlsxText(newEntries) : docxChunks.join("\n");
+  return { bytes, mime, text, deepText: opts.deep ? deepZipText(newEntries) : "", renames };
 }
 
 // ------------------------- detectors -------------------------
@@ -721,6 +1520,7 @@ const DETECTORS = [
 ];
 const CUSTOM_TAGS = ["PERSON", "EMAIL", "PHONE", "ADDRESS", "ID", "ORG", "FINANCIAL",
   "DOB", "SID", "IP", "USERNAME", "GRADE", "MEDICAL", "IMMIGRATION", "DEMO", "RELIGION", "GENDER"];
+const VALID_TAGS = new Set(CUSTOM_TAGS);
 
 function parseCustomTerms(raw) {
   const out = [];
@@ -735,22 +1535,16 @@ function parseCustomTerms(raw) {
 }
 
 // ------------------------- registry -------------------------
-function newHex(used) {
-  const buf = new Uint16Array(1);
-  while (true) {
-    crypto.getRandomValues(buf);
-    const h = buf[0].toString(16).toUpperCase().padStart(4, "0");
-    if (!used.has(h)) { used.add(h); return h; }
-  }
-}
-
-function buildRegistry(findings) {
-  // findings: Map(text -> tag). Returns {entries, entities, byText}
+function buildRegistry(findings, reserved) {
+  // findings: Map(text -> tag); reserved: Set of IDs already issued.
+  // One fresh ID per distinct value. Returns {entries, entities, byText, ids}.
   const used = new Set();
+  const isTaken = (id) => used.has(id) || reserved.has(id);
   const byText = new Map();      // text -> {tag, hex, ph}
   const entities = {};           // hex -> {types:[], values:{tag:text}}
   for (const [text, tag] of findings) {
-    const hex = newHex(used);
+    const hex = newId(isTaken);
+    used.add(hex);
     const ph = `[${tag}_${hex}]`;
     byText.set(text, { tag, hex, ph });
     entities[hex] = { types: [tag], values: { [tag]: text } };
@@ -758,7 +1552,7 @@ function buildRegistry(findings) {
   const entries = [...byText.entries()]
     .map(([text, v]) => [text, v.ph])
     .sort((a, b) => b[0].length - a[0].length);
-  return { entries, entities, byText };
+  return { entries, entities, byText, ids: [...used] };
 }
 
 // ------------------------- verification -------------------------
@@ -768,19 +1562,25 @@ const RESIDUE_PATTERNS = {
   PHONE: /(?:\+?1[-. ])?\(?\d{3}\)?[-. ]\d{3}[-. ]\d{4}\b/,
 };
 
-function verifyOutput(text, entries) {
-  // Hard gate: no applied original may survive. Regex residue is warning-only
+function verifyOutput(texts, entries) {
+  // Hard gate: no applied original may survive outside a placeholder. An
+  // original that only occurs inside a token ("SON" in [PERSON_...]) is not
+  // a leak. `texts` is the extracted output text plus, for DOCX/XLSX, the
+  // tag-stripped text of every XML part. Regex residue is warning-only
   // (generic patterns produce false positives on clean documents).
-  const residuals = [];
-  for (const [orig] of entries) {
-    if (orig && text.includes(orig)) residuals.push(orig);
+  // Same engine the writer used; only this map's own placeholders are
+  // protected, so PII shaped like a token (MRN_000123456789) still counts.
+  const finder = new LiteralReplacer(entries);
+  const distinct = new Set();
+  for (const text of texts) {
+    for (const [s, e] of finder.find(text)) distinct.add(text.slice(s, e));
   }
-  const scrubbed = text.replace(/\[[A-Z]+_[0-9A-F]{4}\]/g, "\n");
+  const scrubbed = texts.join("\n").replace(PLACEHOLDER_RE_G, "\n");
   const warnings = [];
   for (const [label, re] of Object.entries(RESIDUE_PATTERNS)) {
     if (re.test(scrubbed)) warnings.push(label);
   }
-  return { passed: residuals.length === 0, residualCount: residuals.length, warnings };
+  return { passed: distinct.size === 0, residualCount: distinct.size, warnings };
 }
 
 // ------------------------- key file + decoder ring -------------------------
@@ -791,23 +1591,43 @@ function newSessionId() {
   return [...b].map(x => x.toString(16).padStart(2, "0")).join("");
 }
 
-function buildKeyJson(sid, filename, reg, tags) {
+function buildKeyPayload(sid, filename, reg, tags, sheetTitles) {
   const replacement_map = {};
   for (const [text, ph] of reg.entries) replacement_map[text] = ph;
-  return JSON.stringify({
+  const payload = {
     session_id: sid,
     original_filename: filename,
     created_at: nowIso(),
+    id_format: "hex12",
     llm_endpoint: "",
     llm_api_style: "",
     model_used: "web-regex-v1",
     pii_types_scrubbed: [...tags].sort(),
     entity_registry: reg.entities,
     replacement_map,
-  }, null, 2);
+  };
+  // XLSX: anonymized sheet title -> original, so restore puts it back exactly.
+  if (sheetTitles && Object.keys(sheetTitles).length) payload.sheet_titles = sheetTitles;
+  return payload;
 }
 
-function buildDecoderRing(sid, filename, reg) {
+// Every 12-char ID a key payload releases (port of ids.ids_in_key_payload).
+function idsInKeyPayload(payload) {
+  const out = new Set();
+  for (const ph of Object.values(payload.replacement_map || {})) {
+    if (typeof ph === "string") for (const m of ph.matchAll(/_([0-9A-F]{12})\]/g)) out.add(m[1]);
+  }
+  for (const k of Object.keys(payload.entity_registry || {})) if (ID_RE.test(k)) out.add(k);
+  for (const t of Object.keys(payload.sheet_titles || {})) {
+    for (const m of t.matchAll(/(?<=_)([0-9A-F]{12})(?![0-9A-F])/g)) out.add(m[1]);
+  }
+  return out;
+}
+
+const ringEscape = (s) => s.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+const ringUnescape = (s) => s.replace(/\\(\\|n|r|t)/g, (m, c) => (c === "n" ? "\n" : c === "r" ? "\r" : c === "t" ? "\t" : "\\"));
+
+function buildDecoderRing(sid, filename, reg, sheetTitles) {
   const rule = "=".repeat(56);
   const lines = [
     "DOC-ANON DECODER RING",
@@ -815,51 +1635,257 @@ function buildDecoderRing(sid, filename, reg) {
     `session:  ${sid}`,
     `file:     ${filename}`,
     `created:  ${nowIso()}`,
+    `ids:      hex12 (one unique id per value)`,
     `entries:  ${reg.entries.length}`,
     rule,
   ];
   const sorted = [...reg.entries].sort((a, b) => a[1].localeCompare(b[1]));
-  for (const [text, ph] of sorted) {
-    lines.push(`${ph}\t${text.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/\t/g, "\\t")}`);
-  }
+  for (const [text, ph] of sorted) lines.push(`${ph}\t${ringEscape(text)}`);
+  // Renamed sheet titles: #sheet <tab> title in the file <tab> original title
+  for (const [neu, old] of Object.entries(sheetTitles || {})) lines.push(`#sheet\t${ringEscape(neu)}\t${ringEscape(old)}`);
   lines.push(rule);
   lines.push("Keep this file private. Anyone holding it can reverse the");
   lines.push("anonymization. Store it separately from the anonymized file.");
   return lines.join("\n") + "\n";
 }
 
-function parseDecoderInput(name, content) {
-  // Returns entries [[placeholder, original], ...] longest-placeholder-first.
-  let map = {};
-  if (name.toLowerCase().endsWith(".json")) {
-    const data = JSON.parse(content);
-    const rmap = data.replacement_map;
-    if (!rmap || typeof rmap !== "object") throw new Error("key file has no replacement_map");
-    for (const [orig, ph] of Object.entries(rmap)) map[ph] = orig;
-  } else {
-    for (const line of content.split("\n")) {
-      const m = line.match(/^(\[[A-Z]+_[0-9A-F]{4}\])\t(.*)$/);
-      if (m) {
-        map[m[1]] = m[2].replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\\\/g, "\\");
+// A key file (.key.json) or decoder ring (.txt) -> {replacement_map}.
+function parseKeyFile(name, content) {
+  const body = content.replace(/^﻿/, "");
+  if (name.toLowerCase().endsWith(".json") || body.trimStart().startsWith("{")) {
+    let data;
+    try { data = JSON.parse(body); } catch (_) { throw new Error("not valid JSON"); }
+    const rmap = data && data.replacement_map;
+    if (!rmap || typeof rmap !== "object" || Array.isArray(rmap)) throw new Error("no replacement_map in this key");
+    const st = data.sheet_titles;
+    return { replacement_map: rmap, sheet_titles: st && typeof st === "object" && !Array.isArray(st) ? st : {} };
+  }
+  const rmap = {};
+  const sheetTitles = {};
+  let n = 0;
+  for (const line of body.split(/\r?\n/)) {
+    const sm = line.match(/^#sheet\t([^\t]*)\t(.*)$/);
+    if (sm) { sheetTitles[ringUnescape(sm[1])] = ringUnescape(sm[2]); continue; }
+    const m = line.match(/^(\[[A-Z]+_(?:[0-9A-F]{12}|[0-9A-F]{4})\])\t(.*)$/);
+    if (!m) continue;
+    const orig = ringUnescape(m[2]);
+    if (orig) { rmap[orig] = m[1]; n++; }
+  }
+  if (!n) throw new Error("no decoder entries found in that file");
+  return { replacement_map: rmap, sheet_titles: sheetTitles };
+}
+
+// ------------------------- restore (AI output -> real values) -------------------------
+// Port of app/restorer.py. AI tools rarely hand identifiers back
+// byte-for-byte: case changes, markdown escaping, dropped brackets, relabeled
+// tags, bare IDs. Every 12-char ID is unique to one value, so the hex alone
+// is enough to restore safely. Anything identifier-shaped that is not in the
+// loaded keys is left untouched and reported. Nothing is guessed. Legacy
+// 4-char IDs restore only with their tag present.
+class KeyConflictError extends Error {}
+
+const KEY_PLACEHOLDER_RE = /^\[([A-Z]+)_([0-9A-F]+)\]$/;
+
+function buildIndex(keys) {
+  // keys: [{name, payload}] -> {byHex, legacy, keyNames, legacyAmbiguous, size}
+  const idx = { byHex: new Map(), legacy: new Map(), keyNames: [], legacyAmbiguous: 0, size: 0,
+    sheetTitles: new Map() };                    // anonymized sheet title -> original
+  const hexOwner = new Map();
+  const legacyOwner = new Map();
+  for (const { name, payload } of keys) {
+    const rmap = payload.replacement_map || {};
+    if (typeof rmap !== "object" || Array.isArray(rmap)) throw new Error(`key ${name}: replacement_map is not an object`);
+    idx.keyNames.push(name);
+    const titles = payload.sheet_titles || {};
+    if (typeof titles === "object" && !Array.isArray(titles)) {
+      for (const [neu, old] of Object.entries(titles)) {
+        if (typeof neu !== "string" || typeof old !== "string") continue;
+        if (idx.sheetTitles.has(neu) && idx.sheetTitles.get(neu) !== old) {
+          throw new KeyConflictError(
+            `sheet '${neu}' has different original titles in two keys (one is ${name}). ` +
+            "Select only the key(s) this output came from.");
+        }
+        idx.sheetTitles.set(neu, old);
+        const m = /^SHEET_([0-9A-F]{12})$/.exec(neu);
+        if (m && !idx.byHex.has(m[1])) {
+          // "SHEET_<id>" in an AI answer restores to the real title.
+          idx.byHex.set(m[1], { tag: "SHEET", original: old });
+          hexOwner.set(m[1], name);
+        }
       }
     }
-    if (!Object.keys(map).length) throw new Error("no decoder entries found in that file");
+    // Longest original first, so a legacy placeholder shared by
+    // "Jane Smith" and "Jane" resolves to the fuller value.
+    const items = Object.entries(rmap).sort((a, b) => b[0].length - a[0].length);
+    for (const [original, placeholder] of items) {
+      if (typeof original !== "string" || typeof placeholder !== "string" || !original) continue;
+      const m = KEY_PLACEHOLDER_RE.exec(placeholder);
+      if (!m) continue;
+      const tag = m[1], hx = m[2];
+      if (hx.length === HEX_LEN) {
+        const prev = idx.byHex.get(hx);
+        if (prev !== undefined && prev.original !== original) {
+          throw new KeyConflictError(
+            `identifier ${hx} means different values in ${hexOwner.get(hx)} and ${name}. ` +
+            "Select only the key(s) this output came from.");
+        }
+        if (prev === undefined) { idx.byHex.set(hx, { tag, original }); hexOwner.set(hx, name); }
+      } else if (hx.length === LEGACY_HEX_LEN) {
+        const k = `${tag}_${hx}`;
+        const prev = idx.legacy.get(k);
+        if (prev !== undefined && prev !== original) {
+          if (legacyOwner.get(k) !== name) {
+            throw new KeyConflictError(
+              `[${tag}_${hx}] means different values in ${legacyOwner.get(k)} and ${name} ` +
+              "(old 4-character keys reuse IDs). Select only the key this output came from.");
+          }
+          idx.legacyAmbiguous++;
+          continue;
+        }
+        if (prev === undefined) { idx.legacy.set(k, original); legacyOwner.set(k, name); }
+      }
+    }
   }
-  return Object.entries(map).sort((a, b) => b[0].length - a[0].length);
+  idx.size = idx.byHex.size + idx.legacy.size;
+  log("INFO", "restore", `key index built: keys=${idx.keyNames.length} ids=${idx.byHex.size} ` +
+    `legacy_ids=${idx.legacy.size} legacy_ambiguous=${idx.legacyAmbiguous}`);
+  return idx;
+}
+
+// Tolerant token grammar. Alternatives are tried left to right at each
+// position; the regex scans the text once.
+//   br - bracketed:   [TAG_HEX]  \[TAG\_HEX\]  [ tag_hex ]
+//   nb - no brackets:  TAG_HEX   TAG\_HEX   __TAG_HEX__ (markdown)   TAG_HEX_email
+//   xh - bare 12-char hex
+const TAG_SRC = "[A-Za-z][A-Za-z_]{1,30}";
+const TOKEN_SRC =
+  String.raw`(?<br>\\?\[[ \t]*(?<bt>${TAG_SRC})\\?_(?<bh>[0-9A-Fa-f]{4,16})[ \t]*\\?\])` +
+  String.raw`|(?<![0-9A-Za-z])(?<nb>(?<nt>${TAG_SRC})\\?_(?<nh>[0-9A-Fa-f]{4,16}))(?![0-9A-Fa-f])` +
+  String.raw`|(?<![0-9A-Za-z])(?<xh>[0-9A-Fa-f]{${HEX_LEN}})(?![0-9A-Za-z])`;
+const ANY_ID_SRC = `(?=([0-9A-Fa-f]{${HEX_LEN}}))`;
+
+function newReport(index) {
+  return {
+    restored: 0, byTag: {}, relabeled: 0, untagged: 0,
+    unresolved: [], unresolvedCount: 0, residual: 0,
+    legacyAmbiguous: index ? index.legacyAmbiguous : 0,
+    keysUsed: index ? [...index.keyNames] : [],
+  };
+}
+
+class TokenRestorer {
+  constructor(index, escapeXml = false) {
+    this.index = index;
+    this.escapeXml = escapeXml;
+    this.restoring = true;       // raw pass: a token is never a cell reference
+    this.re = new RegExp(TOKEN_SRC, "g");
+  }
+
+  // -> {original | null, tag, flags}
+  resolve(g) {
+    if (g.xh !== undefined) {
+      const hit = this.index.byHex.get(g.xh.toUpperCase());
+      if (hit === undefined) return { original: null, tag: "", flags: { ignore: true } };  // ordinary hex in the text
+      return { original: hit.original, tag: hit.tag, flags: { untagged: true } };
+    }
+    const bracketed = g.br !== undefined;
+    const tag = (bracketed ? g.bt : g.nt).toUpperCase();
+    const hx = (bracketed ? g.bh : g.nh).toUpperCase();
+    const tagKnown = VALID_TAGS.has(tag);
+    if (hx.length === HEX_LEN) {
+      const hit = this.index.byHex.get(hx);
+      if (hit !== undefined) return { original: hit.original, tag: hit.tag, flags: { relabeled: hit.tag !== tag } };
+      return { original: null, tag: "", flags: { report: true } };
+    }
+    if (hx.length === LEGACY_HEX_LEN) {
+      const original = this.index.legacy.get(`${tag}_${hx}`);
+      if (original !== undefined) return { original, tag, flags: {} };
+      return { original: null, tag: "", flags: { report: bracketed && tagKnown } };
+    }
+    // Wrong length: a truncated or padded ID. Report it if it clearly was
+    // meant to be one of ours.
+    return { original: null, tag: "", flags: { report: tagKnown && (bracketed || hx.length >= 8) } };
+  }
+
+  find(text) { return this._scan(text, null); }
+  scan(text, report) { return this._scan(text, report); }
+
+  _scan(text, report) {
+    if (!text || this.index.size === 0) return [];
+    const spans = [];
+    const seen = new Set(report ? report.unresolved : []);
+    const covered = report ? new Uint8Array(text.length) : null;
+    const noteUnresolved = (tok) => {
+      report.unresolvedCount++;
+      if (!seen.has(tok)) { seen.add(tok); report.unresolved.push(tok); }
+    };
+    const re = this.re;
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const { original, tag, flags } = this.resolve(m.groups);
+      if (covered && (original !== null || flags.report)) covered.fill(1, m.index, m.index + m[0].length);
+      if (original === null) {
+        if (report && flags.report) noteUnresolved(m[0]);
+        continue;
+      }
+      spans.push([m.index, m.index + m[0].length, this.escapeXml ? encodeXml(original) : original]);
+      if (report) {
+        report.restored++;
+        report.byTag[tag] = (report.byTag[tag] || 0) + 1;
+        if (flags.relabeled) report.relabeled++;
+        if (flags.untagged) report.untagged++;
+      }
+    }
+    if (report) {
+      // Safety net: a known ID glued inside some other token
+      // ("xPERSON_3A4F9C2B1D0E9") was not restored - say so, never silently.
+      const anyId = new RegExp(ANY_ID_SRC, "g");
+      let a;
+      while ((a = anyId.exec(text)) !== null) {
+        const p0 = a.index;
+        anyId.lastIndex = p0 + 1;
+        if (covered[p0] || !this.index.byHex.has(a[1].toUpperCase())) continue;
+        covered.fill(1, p0, p0 + HEX_LEN);
+        noteUnresolved(a[1]);
+      }
+    }
+    return spans;
+  }
+
+  forRawXml() { return new TokenRestorer(this.index, true); }
+}
+
+function restoreText(text, index) {
+  const report = newReport(index);
+  const out = splice(text, new TokenRestorer(index).scan(text, report));
+  log("INFO", "restore", `text restore: chars_in=${text.length} restored=${report.restored} ` +
+    `relabeled=${report.relabeled} untagged=${report.untagged} unresolved=${report.unresolvedCount}`);
+  return { text: out, report };
 }
 
 // ==========================================================================
 // UI wiring
 // ==========================================================================
+const AI_NOTE = "Note: this data has been anonymized. Tokens like [PERSON_3A4F9C2B1D0E] stand in for real names, emails, phone numbers, addresses, and other personal details. Each token is unique to one real value. When you refer to any of them in your answer, copy the token exactly as written, brackets included. Do not shorten, merge, or invent tokens.";
+
 const state = {
+  file: null,
   doc: null,          // loaded document (anonymize tab)
   findings: null,     // Map(text -> tag)
   excluded: new Set(),
-  outputs: null,      // {docName, docBlob, ringName, ringText, keyName, keyText, verified}
-  de: { doc: null, key: null, out: null },
+  outputs: null,      // {docName, docBlob, ringName, ringText, keyName, keyText, verified, text}
+  keys: [],           // [{name, size, payload, ids, legacy}] (deanonymize tab)
+  index: null,
+  indexError: null,
+  deFile: null,
+  restoredText: null,
+  lastTextReport: null,
+  lastFileReport: null,
+  restoredFile: null,
 };
 
-function bindDropzone(zoneId, inputId, onFile) {
+function bindDropzone(zoneId, inputId, onFiles) {
   const zone = $(zoneId), input = $(inputId);
   zone.addEventListener("click", () => input.click());
   zone.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } });
@@ -867,9 +1893,14 @@ function bindDropzone(zoneId, inputId, onFile) {
   zone.addEventListener("dragleave", () => zone.classList.remove("dragover"));
   zone.addEventListener("drop", (e) => {
     e.preventDefault(); zone.classList.remove("dragover");
-    if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]);
+    const files = [...(e.dataTransfer.files || [])];
+    if (files.length) onFiles(input.multiple ? files : files.slice(0, 1));
   });
-  input.addEventListener("change", (e) => { if (e.target.files[0]) onFile(e.target.files[0]); });
+  input.addEventListener("change", (e) => {
+    const files = [...(e.target.files || [])];
+    e.target.value = "";          // same file can be picked again
+    if (files.length) onFiles(files);
+  });
 }
 
 function markLoaded(zoneId, file) {
@@ -900,6 +1931,7 @@ function renderPiiGrid() {
   }
 }
 
+// ------------------------- anonymize -------------------------
 async function runDetect() {
   const file = state.file;
   if (!file) return;
@@ -910,9 +1942,12 @@ async function runDetect() {
   try {
     state.doc = await loadDocument(file);
   } catch (exc) {
+    log("ERROR", "extractor", `read failed: ${file.name}`, exc);
     renderSteps("steps-detect", [{ glyph: "[!]", text: `read failed: ${exc.message}`, kind: "err" }]);
     return;
   }
+  log("INFO", "extractor", `${state.doc.ext.toUpperCase()} extracted: ${state.doc.text.length} chars` +
+    (state.doc.entries ? ` from ${state.doc.entries.length} zip parts` : ""));
   const steps = [
     { glyph: "[x]", text: `read file (${fmtBytes(file.size)})`, kind: "done" },
     { glyph: "[x]", text: `extracted text: ${state.doc.text.length.toLocaleString()} chars`, kind: "done" },
@@ -935,26 +1970,33 @@ async function runDetect() {
       if (t && !findings.has(t)) findings.set(t, d.tag);
     }
   }
+  // Overlapping detections ("Patient Jane" + "Jane Smith") would leave a
+  // fragment ("Smith") behind whichever wins. Register the overlapping
+  // stretch as one value so it is replaced whole.
+  const unions = overlapUnions(state.doc.text, [...findings.keys()]);
+  for (const [u, members] of unions) {
+    const longest = members.reduce((a, b) => (b.length > a.length ? b : a));
+    if (!findings.has(u)) findings.set(u, findings.get(longest));
+  }
+  if (unions.length) log("INFO", "detector", `overlapping detections merged: ${unions.length}`);
   state.findings = findings;
-  steps[2] = { glyph: "[x]", text: `scan complete: ${findings.size} unique item(s) found`, kind: "done" };
+  log("INFO", "detector", `scan complete: ${findings.size} unique values (${countByTag(findings.values())})`);
+  steps[2] = { glyph: "[x]", text: `scan complete: ${findings.size} unique item(s) found` +
+    (unions.length ? ` (${unions.length} overlapping stretch(es) merged)` : ""), kind: "done" };
   renderSteps("steps-detect", steps);
   renderPreview();
 }
 
+function countByTag(tags) {
+  const counts = {};
+  for (const t of tags) counts[t] = (counts[t] || 0) + 1;
+  return Object.keys(counts).sort().map(k => `${counts[k]} ${k}`).join(", ") || "none";
+}
+
+// Spans exactly as the writer will place them (same single-pass engine).
 function occurrenceSpans(text, entries) {
-  // Non-overlapping spans over `text`, longest originals claiming first.
-  const spans = [];
-  for (const [orig, ph] of entries) {
-    let idx = 0;
-    while (true) {
-      const f = text.indexOf(orig, idx);
-      if (f === -1) break;
-      const end = f + orig.length;
-      if (!spans.some(s => f < s.end && end > s.start)) { spans.push({ start: f, end, orig, ph }); idx = end; }
-      else idx = f + 1;
-    }
-  }
-  return spans.sort((a, b) => a.start - b.start);
+  return new LiteralReplacer(entries).find(text)
+    .map(([start, end, ph]) => ({ start, end, orig: text.slice(start, end), ph }));
 }
 
 function renderPreview() {
@@ -973,8 +2015,8 @@ function renderPreview() {
     ? `showing first ${PREVIEW_CAP.toLocaleString()} of ${full.length.toLocaleString()} characters - everything detected is still replaced, on and off screen.`
     : "";
 
-  const entries = [...findings.keys()].sort((a, b) => b.length - a.length).map(t => [t, `[${findings.get(t)}_····]`]);
-  const spans = occurrenceSpans(head, entries);
+  const entries = [...findings.keys()].map(t => [t, `[${findings.get(t)}]`]);
+  const spans = occurrenceSpans(full, entries).filter(s => s.end <= head.length);
   const body = $("preview-body");
   body.innerHTML = "";
   let cursor = 0;
@@ -1002,12 +2044,22 @@ function renderPreview() {
   if (cursor < head.length) body.append(document.createTextNode(head.slice(cursor)));
 }
 
+function resetAiBlock() {
+  hide($("ai-block"));
+  $("anon-text").value = "";
+  $("anon-text").placeholder = "";
+  $("btn-copy-ai").disabled = true;
+  $("btn-copy-text").disabled = true;
+}
+
 async function runConfirm() {
   const findings = new Map([...state.findings].filter(([text]) => !state.excluded.has(text)));
   show($("panel-results"));
   hide($("results-note"));
+  resetAiBlock();
   $("results-table").innerHTML = "";
   ["btn-dl-doc", "btn-dl-ring", "btn-dl-key"].forEach(id => $(id).disabled = true);
+  state.outputs = null;
   if (findings.size === 0) {
     renderSteps("steps-build", [{ glyph: "[!]", text: "nothing selected to anonymize", kind: "err" }]);
     return;
@@ -1017,25 +2069,47 @@ async function runConfirm() {
 
   try {
     const sid = newSessionId();
-    const reg = buildRegistry(findings);
-    const result = applyToDocument(state.doc, reg.entries);
-    const verify = verifyOutput(result.text, reg.entries);
+    const reserved = loadLedger();
+    const reg = buildRegistry(findings, reserved);
+    log("INFO", "mapper", `replacement map: ${countByTag(findings.values())} | ${reg.entries.length} unique ids, ${reserved.size} reserved`);
+    const replacer = new LiteralReplacer(reg.entries);
+    // A sheet title that cannot hold its token gets SHEET_<id>: a fresh ID
+    // like any other, never reused.
+    const usedIds = new Set(reg.ids);
+    const newSheetId = () => { const id = newId(c => usedIds.has(c) || reserved.has(c)); usedIds.add(id); return id; };
+    const result = applyToDocument(state.doc, replacer,
+      { zeroAuthors: true, deep: true, numericCells: true, anonymizeSheets: true, newSheetId });
+    const sheetTitles = {};
+    for (const [old, neu] of result.renames) sheetTitles[neu] = old;
+    const payload = buildKeyPayload(sid, state.doc.name, reg, new Set(findings.values()), sheetTitles);
+    const ledger = recordIssued(idsInKeyPayload(payload));
+    if (result.renames.size) log("INFO", "writer", `xlsx sheet titles anonymized: ${result.renames.size}`);
+    const verify = verifyOutput([result.text, result.deepText], reg.entries);
+    log(verify.passed ? "INFO" : "WARNING", "verifier",
+      `verification ${verify.passed ? "passed" : "FAILED"}: residual_values=${verify.residualCount}` +
+      (verify.warnings.length ? ` pattern_warnings=${verify.warnings.join(",")}` : ""));
 
     const stem = state.doc.name.replace(/\.[^.]+$/, "");
     const outputs = {
       verified: verify.passed,
+      text: verify.passed ? result.text : "",
       docName: `${stem}_anon_${sid}.${state.doc.ext}`,
       docBlob: new Blob([result.bytes], { type: result.mime }),
       ringName: `${stem}_${sid}_decoder_ring.txt`,
-      ringText: buildDecoderRing(sid, state.doc.name, reg),
+      ringText: buildDecoderRing(sid, state.doc.name, reg, sheetTitles),
       keyName: `${stem}_${sid}.key.json`,
-      keyText: buildKeyJson(sid, state.doc.name, reg, new Set(findings.values())),
+      keyText: JSON.stringify(payload, null, 2),
     };
     state.outputs = outputs;
+    log("INFO", "writer", `output built: ${outputs.docName} format=${state.doc.ext} size=${result.bytes.length}`);
+    log("INFO", "writer", `key built: ${outputs.keyName}`);
 
     const steps = [
-      { glyph: "[x]", text: `replacements applied: ${reg.entries.length} unique value(s)`, kind: "done" },
-      { glyph: "[x]", text: "decoder ring + key built", kind: "done" },
+      { glyph: "[x]", text: `replacements applied: ${reg.entries.length} unique value(s), ${reg.entries.length} unique 12-char id(s)`, kind: "done" },
+      { glyph: "[x]", text: "decoder ring + key built" + (result.renames.size ? ` (${result.renames.size} sheet title(s) renamed)` : ""), kind: "done" },
+      ledger.ok
+        ? { glyph: "[x]", text: `id ledger: ${ledger.added} new id(s) recorded, ${ledger.total} never to be reused`, kind: "done" }
+        : { glyph: "[!]", text: "id ledger unavailable (browser storage blocked) - ids are unique within this tab only", kind: "warn" },
       verify.passed
         ? { glyph: "[x]", text: "verification: 0 residual PII from the map", kind: "done" }
         : { glyph: "[!]", text: `verification FAILED: ${verify.residualCount} original value(s) still present`, kind: "err" },
@@ -1056,13 +2130,7 @@ async function runConfirm() {
       lines.push({ text: k.padEnd(12) + String(counts[k]).padStart(5) + " value(s)" });
     }
     lines.push({ text: rule, cls: "rule" });
-    const tbl = $("results-table");
-    for (const l of lines) {
-      const div = document.createElement("div");
-      if (l.cls) div.className = l.cls;
-      div.textContent = l.text;
-      tbl.append(div);
-    }
+    renderLines("results-table", lines);
     if (verify.warnings.length) {
       const n = $("results-note");
       n.textContent = `[!] heads up: patterns that look like ${verify.warnings.join(", ")} remain in the output. `
@@ -1072,40 +2140,27 @@ async function runConfirm() {
     $("btn-dl-doc").disabled = !verify.passed;
     $("btn-dl-ring").disabled = !verify.passed;
     $("btn-dl-key").disabled = !verify.passed;
+
+    show($("ai-block"));
+    if (verify.passed) {
+      $("anon-text").value = outputs.text;
+      $("btn-copy-ai").disabled = false;
+      $("btn-copy-text").disabled = false;
+    } else {
+      $("anon-text").placeholder = "blocked: original values survived anonymization. Nothing to copy.";
+    }
   } catch (exc) {
+    log("ERROR", "writer", "build failed", exc);
     renderSteps("steps-build", [{ glyph: "[!]", text: `build failed: ${exc.message}`, kind: "err" }]);
   }
 }
 
-function maybeEnableDeanon() {
-  $("btn-deanon").disabled = !(state.de.doc && state.de.key);
-}
-
-async function runDeanon() {
-  hide($("deanon-err")); hide($("btn-dl-restored"));
-  renderSteps("steps-deanon", [{ glyph: "[>]", text: "restoring...", kind: "active", blink: true }]);
-  try {
-    const keyContent = await state.de.key.text();
-    const entries = parseDecoderInput(state.de.key.name, keyContent);
-    const doc = await loadDocument(state.de.doc);
-    const result = applyToDocument(doc, entries);
-    const leftover = (result.text.match(/\[[A-Z]+_[0-9A-F]{4}\]/g) || []).length;
-    const stem = doc.name.replace(/\.[^.]+$/, "").replace(/_anon_[0-9a-f]{8}$/, "");
-    state.de.out = { name: `${stem}_restored.${doc.ext}`, blob: new Blob([result.bytes], { type: result.mime }) };
-    renderSteps("steps-deanon", [
-      { glyph: "[x]", text: `decoder ring loaded: ${entries.length} entries`, kind: "done" },
-      { glyph: "[x]", text: `placeholders restored`, kind: "done" },
-      leftover
-        ? { glyph: "[!]", text: `${leftover} placeholder(s) had no decoder entry and were left in place`, kind: "err" }
-        : { glyph: "[x]", text: "0 unresolved placeholders", kind: "done" },
-    ]);
-    show($("btn-dl-restored"));
-  } catch (exc) {
-    renderSteps("steps-deanon", []);
-    const e = $("deanon-err");
-    e.textContent = `[!] failed: ${exc.message}`;
-    show(e);
-  }
+async function copyAnon(withNote, btn) {
+  const o = state.outputs;
+  if (!o || !o.verified) return;     // copy is gated on verification, same as downloads
+  const ok = await copyText(withNote ? `${AI_NOTE}\n\n${o.text}` : o.text);
+  log(ok ? "INFO" : "WARNING", "clipboard", `anonymized text ${ok ? "copied" : "copy failed"}: ${o.text.length} chars, ai_note=${withNote}`);
+  flashButton(btn, ok);
 }
 
 function resetAnon() {
@@ -1120,16 +2175,258 @@ function resetAnon() {
   l2.textContent = "supported: .txt .md .csv .docx .xlsx (processed locally)";
   zone.append(l1, l2);
   $("btn-detect").disabled = true;
+  resetAiBlock();
   hide($("panel-progress")); hide($("panel-preview")); hide($("panel-results"));
+}
+
+// ------------------------- deanonymize: keys -------------------------
+function keyIdCounts(payload) {
+  const ids = new Set(), legacy = new Set();
+  for (const ph of Object.values(payload.replacement_map || {})) {
+    if (typeof ph !== "string") continue;
+    const m = KEY_PLACEHOLDER_RE.exec(ph);
+    if (!m) continue;
+    if (m[2].length === HEX_LEN) ids.add(m[2]);
+    else if (m[2].length === LEGACY_HEX_LEN) legacy.add(`${m[1]}_${m[2]}`);
+  }
+  for (const t of Object.keys(payload.sheet_titles || {})) {
+    const m = /^SHEET_([0-9A-F]{12})$/.exec(t);
+    if (m) ids.add(m[1]);
+  }
+  return { ids: ids.size, legacy: legacy.size };
+}
+
+async function addKeyFiles(files) {
+  const errors = [];
+  for (const f of files) {
+    let payload;
+    try {
+      payload = parseKeyFile(f.name, await f.text());
+    } catch (exc) {
+      errors.push(`${f.name}: ${exc.message}`);
+      log("WARNING", "unanonymize", `key rejected: ${f.name} (${exc.message})`);
+      continue;
+    }
+    const counts = keyIdCounts(payload);
+    const same = JSON.stringify(payload.replacement_map);
+    // The same file picked twice is a no-op; a different file with the same
+    // name gets a suffix so conflict messages stay unambiguous.
+    if (state.keys.some(k => k.name === f.name && k.fingerprint === same)) continue;
+    let name = f.name, n = 2;
+    while (state.keys.some(k => k.name === name)) name = `${f.name} (${n++})`;
+    state.keys.push({ name, size: f.size, payload, fingerprint: same, ...counts });
+    log("INFO", "unanonymize", `key loaded: ${name} ids=${counts.ids} legacy_ids=${counts.legacy}`);
+  }
+  const err = $("key-err");
+  if (errors.length) { err.textContent = `[!] not loaded - ${errors.join(" | ")}`; show(err); }
+  else hide(err);
+  refreshKeys();
+}
+
+function refreshKeys() {
+  const host = $("key-list");
+  host.innerHTML = "";
+  state.keys.forEach((k, i) => {
+    const row = document.createElement("div"); row.className = "key-row";
+    const nm = document.createElement("span"); nm.className = "kname"; nm.textContent = `[x] ${k.name}`;
+    const ct = document.createElement("span"); ct.className = "kcount";
+    ct.textContent = `${String(k.ids).padStart(5)} id(s)` + (k.legacy ? ` + ${k.legacy} legacy 4-char` : "");
+    const rm = document.createElement("button");
+    rm.type = "button"; rm.className = "btn secondary sm"; rm.textContent = "[ REMOVE ]";
+    rm.setAttribute("aria-label", `remove key ${k.name}`);
+    rm.addEventListener("click", () => {
+      state.keys.splice(i, 1);
+      log("INFO", "unanonymize", `key removed: ${k.name}`);
+      refreshKeys();
+    });
+    row.append(nm, ct, rm);
+    host.append(row);
+  });
+  (state.keys.length ? show : hide)($("key-actions"));
+
+  state.index = null; state.indexError = null;
+  const status = $("key-status");
+  status.className = "key-status";
+  if (!state.keys.length) {
+    status.textContent = "no keys loaded";
+  } else {
+    try {
+      state.index = buildIndex(state.keys);
+      if (state.index.size === 0) {
+        state.indexError = "the loaded key(s) contain no identifiers";
+      } else {
+        status.textContent = `merged: ${state.index.byHex.size} id(s)` +
+          (state.index.legacy.size ? ` + ${state.index.legacy.size} legacy` : "") +
+          ` from ${state.keys.length} key(s). Ready.`;
+      }
+    } catch (exc) {
+      state.index = null;
+      state.indexError = exc.message;
+      log("WARNING", "unanonymize", `key conflict: ${exc.message}`);
+    }
+    if (state.indexError) {
+      status.className = "key-status errline";
+      status.textContent = `[!] ${state.indexError}`;
+    }
+  }
+  updateDeanonButtons();
+}
+
+function updateDeanonButtons() {
+  const haveKeys = state.keys.length > 0;
+  $("btn-restore-text").disabled = !(haveKeys && $("ai-in").value.length > 0);
+  $("btn-restore-file").disabled = !(haveKeys && state.deFile);
+}
+
+// Index for a restore, or null after showing why not. A conflict restores nothing.
+function indexForRestore(errId) {
+  const err = $(errId);
+  if (!state.keys.length) { err.textContent = "[!] load at least one key first"; show(err); return null; }
+  if (state.indexError || !state.index) {
+    err.textContent = `[!] nothing restored: ${state.indexError || "keys could not be read"}`;
+    show(err);
+    return null;
+  }
+  hide(err);
+  return state.index;
+}
+
+// ------------------------- deanonymize: report -------------------------
+function reportLines(report, isFile) {
+  const rule = "─".repeat(44);
+  const row = (label, n, cls) => ({ text: label.padEnd(20) + String(n).padStart(6), cls: cls || "" });
+  const lines = [{ text: rule, cls: "rule" }];
+  lines.push(row("RESTORED", report.restored, report.restored && !report.unresolvedCount ? "verified" : ""));
+  lines.push({ text: rule, cls: "rule" });
+  const tags = Object.keys(report.byTag).sort();
+  for (const t of tags) lines.push(row(`  ${t}`, report.byTag[t]));
+  if (tags.length) lines.push({ text: rule, cls: "rule" });
+  lines.push(row("RELABELED", report.relabeled));
+  lines.push(row("UNTAGGED", report.untagged));
+  lines.push(row("UNRESOLVED", report.unresolvedCount, report.unresolvedCount ? "warn" : ""));
+  const CAP = 50;
+  for (const tok of report.unresolved.slice(0, CAP)) lines.push({ text: `  ${tok}`, cls: "warn" });
+  if (report.unresolved.length > CAP) lines.push({ text: `  ...and ${report.unresolved.length - CAP} more`, cls: "warn" });
+  if (report.legacyAmbiguous) lines.push(row("LEGACY AMBIGUOUS", report.legacyAmbiguous, "warn"));
+  if (isFile) lines.push(row("RESIDUAL", report.residual, report.residual ? "failed" : ""));
+  lines.push({ text: rule, cls: "rule" });
+  lines.push({ text: `KEYS: ${report.keysUsed.join(", ")}`, cls: "" });
+  return lines;
+}
+
+function reportNote(report) {
+  const parts = [];
+  if (report.unresolvedCount) {
+    parts.push(`[!] ${report.unresolvedCount} token(s) look like identifiers but are not in the loaded key(s). `
+      + "They were left exactly as written. Usually a truncated or mistyped ID, or a key that is not loaded.");
+  }
+  if (report.relabeled) parts.push(`${report.relabeled} token(s) had a label the AI changed. They were restored by ID - glance at those spots.`);
+  if (report.legacyAmbiguous) parts.push(`An old 4-character key reused ${report.legacyAmbiguous} ID(s) for different values. The longest value was used.`);
+  return parts.join(" ");
+}
+
+function showNote(id, text) {
+  const n = $(id);
+  if (text) { n.textContent = text; show(n); } else { n.textContent = ""; hide(n); }
+}
+
+// ------------------------- deanonymize: pasted text -------------------------
+function runRestoreText() {
+  state.restoredText = null; state.lastTextReport = null;
+  $("restored-text").value = "";
+  $("text-report").innerHTML = "";
+  showNote("text-note", "");
+  hide($("text-out"));
+  const index = indexForRestore("text-err");
+  if (!index) return;
+  const input = $("ai-in").value;
+  log("INFO", "unanonymize", `unanonymize started: pasted text, ${input.length} chars, keys=${index.keyNames.length} ids=${index.size}`);
+  try {
+    const { text, report } = restoreText(input, index);
+    state.restoredText = text;
+    state.lastTextReport = report;
+    $("restored-text").value = text;
+    renderLines("text-report", reportLines(report, false));
+    showNote("text-note", reportNote(report));
+    show($("text-out"));
+    log("INFO", "unanonymize", `unanonymize complete: pasted text, ${text.length} chars out`);
+  } catch (exc) {
+    log("ERROR", "unanonymize", "text restore failed", exc);
+    const err = $("text-err");
+    err.textContent = `[!] failed: ${exc.message}`;
+    show(err);
+  }
+}
+
+// ------------------------- deanonymize: file -------------------------
+async function runRestoreFile() {
+  hide($("btn-dl-restored"));
+  $("file-report").innerHTML = "";
+  showNote("file-note", "");
+  state.restoredFile = null; state.lastFileReport = null;
+  const index = indexForRestore("file-err");
+  if (!index) { renderSteps("steps-deanon", []); return; }
+  renderSteps("steps-deanon", [{ glyph: "[>]", text: "restoring...", kind: "active", blink: true }]);
+  try {
+    const doc = await loadDocument(state.deFile);
+    log("INFO", "unanonymize", `unanonymize started: ${doc.name} (${doc.ext}), keys=${index.keyNames.length} ids=${index.size}`);
+    const restorer = new TokenRestorer(index);
+    // Tally from the text the operator sees, once - the writer makes several
+    // passes and would double count.
+    const report = newReport(index);
+    restorer.scan(doc.text, report);
+    const result = applyToDocument(doc, restorer, { sheetRestore: index.sheetTitles });
+    if (result.renames.size) log("INFO", "unanonymize", `xlsx sheet titles restored: ${result.renames.size}`);
+    // Post-restore check: nothing the keys can resolve may remain.
+    const residual = newReport(index);
+    restorer.scan(result.text, residual);
+    report.residual = residual.restored;
+
+    const stem = doc.name.replace(/\.[^.]+$/, "").replace(/_anon_[0-9a-f]{8}$/, "");
+    state.restoredFile = { name: `${stem}_restored.${doc.ext}`, blob: new Blob([result.bytes], { type: result.mime }) };
+    state.lastFileReport = report;
+    log("INFO", "unanonymize", `unanonymize complete: out=${state.restoredFile.name} bytes=${result.bytes.length} ` +
+      `restored=${report.restored} relabeled=${report.relabeled} untagged=${report.untagged} ` +
+      `unresolved=${report.unresolvedCount} residual=${report.residual}`);
+    renderSteps("steps-deanon", [
+      { glyph: "[x]", text: `read ${doc.name}: ${doc.text.length.toLocaleString()} chars`, kind: "done" },
+      { glyph: "[x]", text: `${report.restored} token(s) restored`, kind: "done" },
+      report.residual
+        ? { glyph: "[!]", text: `${report.residual} restorable token(s) still present after writing`, kind: "err" }
+        : { glyph: "[x]", text: "post-restore check: 0 restorable tokens left", kind: "done" },
+    ]);
+    renderLines("file-report", reportLines(report, true));
+    showNote("file-note", reportNote(report));
+    show($("btn-dl-restored"));
+  } catch (exc) {
+    log("ERROR", "unanonymize", "file restore failed", exc);
+    renderSteps("steps-deanon", []);
+    const e = $("file-err");
+    e.textContent = `[!] failed: ${exc.message}`;
+    show(e);
+  }
+}
+
+// ------------------------- boot -------------------------
+function storageAvailable() {
+  try {
+    const k = "docanon-probe";
+    window.localStorage.setItem(k, "1");
+    window.localStorage.removeItem(k);
+    return true;
+  } catch (_) { return false; }
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   initTheme();
   renderPiiGrid();
+  log("INFO", "app", `startup: web edition v0.2 | network: none (all local) | id format: hex12 | ` +
+    `browser storage: ${storageAvailable() ? "available" : "unavailable"} | ledger ids: ${loadLedger().size}`);
 
-  bindDropzone("drop-anon", "file-anon", (file) => {
+  bindDropzone("drop-anon", "file-anon", ([file]) => {
     state.file = file;
     markLoaded("drop-anon", file);
+    log("INFO", "app", `file received: ${file.name} size=${file.size} type=${file.type || "unknown"}`);
     $("btn-detect").disabled = false;
   });
   $("btn-detect").addEventListener("click", runDetect);
@@ -1140,14 +2437,34 @@ document.addEventListener("DOMContentLoaded", () => {
     downloadBlob(state.outputs.ringName, new Blob([state.outputs.ringText], { type: "text/plain;charset=utf-8" })));
   $("btn-dl-key").addEventListener("click", () =>
     downloadBlob(state.outputs.keyName, new Blob([state.outputs.keyText], { type: "application/json" })));
+  $("btn-copy-ai").addEventListener("click", (e) => copyAnon(true, e.currentTarget));
+  $("btn-copy-text").addEventListener("click", (e) => copyAnon(false, e.currentTarget));
 
-  bindDropzone("drop-dedoc", "file-dedoc", (file) => { state.de.doc = file; markLoaded("drop-dedoc", file); maybeEnableDeanon(); });
-  bindDropzone("drop-dekey", "file-dekey", (file) => { state.de.key = file; markLoaded("drop-dekey", file); maybeEnableDeanon(); });
-  $("btn-deanon").addEventListener("click", runDeanon);
-  $("btn-dl-restored").addEventListener("click", () => downloadBlob(state.de.out.name, state.de.out.blob));
+  bindDropzone("drop-dekey", "file-dekey", addKeyFiles);
+  $("btn-clear-keys").addEventListener("click", () => { state.keys = []; hide($("key-err")); refreshKeys(); });
+  $("ai-in").addEventListener("input", updateDeanonButtons);
+  $("btn-restore-text").addEventListener("click", runRestoreText);
+  $("btn-copy-restored").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    flashButton(btn, state.restoredText !== null && await copyText(state.restoredText));
+  });
+  $("btn-dl-restored-txt").addEventListener("click", () => {
+    if (state.restoredText === null) return;
+    downloadBlob("ai_response_restored.txt", new Blob([state.restoredText], { type: "text/plain;charset=utf-8" }));
+  });
+
+  bindDropzone("drop-dedoc", "file-dedoc", ([file]) => {
+    state.deFile = file;
+    markLoaded("drop-dedoc", file);
+    log("INFO", "app", `file received: ${file.name} size=${file.size} type=${file.type || "unknown"}`);
+    updateDeanonButtons();
+  });
+  $("btn-restore-file").addEventListener("click", runRestoreFile);
+  $("btn-dl-restored").addEventListener("click", () => downloadBlob(state.restoredFile.name, state.restoredFile.blob));
 
   $("tab-anon").addEventListener("click", () => switchTab("anon"));
   $("tab-deanon").addEventListener("click", () => switchTab("deanon"));
+  refreshKeys();
 });
 
 function switchTab(which) {

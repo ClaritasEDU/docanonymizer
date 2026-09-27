@@ -544,3 +544,255 @@ gate; and the web edition's CSP (`connect-src 'none'`).
 
 1. None for this repo — B50 (in parentpoint) is the pointer if the
    pipeline-integration question ever becomes a build.
+
+---
+
+## Session 007 - 2026-09-27 (Claude Code, branch `claude/great-tesla-hoj1yy`)
+
+**Type:** Feature + hardening - unique 12-character identifiers and the AI round trip
+
+### The request
+
+"Add a spreadsheet -> names, emails, phones, and physical addresses become
+unique 12-character hexadecimal identifiers -> show me the output -> I run
+analyses through AI platforms -> whatever comes back is de-anonymized with no
+mixing up of names, people, addresses, or contact information. Hexadecimals
+assigned must be unique."
+
+### Decisions made
+
+1. **One ID per distinct value, never shared.** The v1.3 rule gave all of an
+   entity's PII one suffix (`[PERSON_3A4F]`, `[EMAIL_3A4F]`). That violates
+   "must be unique" and makes AI output ambiguous: an answer citing only the
+   ID could mean the name or the email. v1.3 could also give two name
+   variants the same placeholder (then restore picked one arbitrarily). Now
+   each distinct value gets its own `[TAG_XXXXXXXXXXXX]`. The model's
+   `linked_to` is kept in the key file as a relationship only.
+2. **Uniqueness is enforced across files, for all time.** New IDs are checked
+   against the session, every key in `/keys`, an append-only
+   `keys/issued_ids.ledger` (random IDs only, no PII), and IDs issued by the
+   running process. Two spreadsheets pasted into one AI chat can never
+   collide. IDs always have a letter and a digit and never look like Excel
+   scientific notation.
+3. **Restore tolerates what AI tools do to tokens** - lowercase, dropped
+   brackets, markdown escaping, relabeled tags, bare hex. The unique hex is
+   what makes that safe. Unresolvable tokens are listed, never guessed.
+4. **All keys selected by default** in the restore picker (safe because IDs
+   never overlap). Legacy 4-char keys are opt-in; conflicting keys refuse.
+5. **[ COPY FOR AI ]** prepends one sentence asking the AI to keep
+   identifiers exactly as written.
+
+### What was built or changed
+
+- `app/ids.py` (new): ID rules, reserved-ID loading, ledger.
+- `app/replacer.py` (new): single-pass, leftmost-longest trie-regex engine.
+  Fixes two bugs in the old per-entry `str.replace` loop: (a) a short value
+  could rewrite INSIDE an earlier placeholder (`2B1D` inside
+  `[PERSON_3A4F9C2B1D0E]`), breaking reversal; (b) quadratic time - 1,000
+  rows took 3.2s, 5,000 rows ~80s. Now 3,000 rows is well under a second of
+  matching. Short numbers (no letters, <7 digits) match whole numbers only.
+- `app/restorer.py` (new): tolerant token grammar, merged multi-key index,
+  conflict detection, legacy 4-char support, restore report.
+- `app/mapper.py`: unique ID per value; `linked_to` recorded, not shared.
+- `app/scrubber.py`: every pass on the shared engine; `deep_clean=False`
+  mode for restores (never strips the AI file's comments/metadata);
+  XLSX numeric/date cells scrubbed; PII sheet names get the bracket-free
+  token and all formula / defined-name / pivot references follow; the raw
+  XML pass never writes a short number into markup or number-only nodes.
+- `app/verifier.py`: same engine; ignores text inside placeholders and XML
+  bookkeeping numbers (a 2-digit grade occurs inside ~4% of random 12-char
+  IDs and would otherwise dead-end clean files).
+- `app/unanonymize.py`: `restore_file()` with post-restore residual check.
+- `app/key_files.py`: `id_format: "hex12"`, ledger write on save, richer
+  listing, import, traversal-safe name resolution.
+- `app/server.py`: `POST /api/unanonymize/text` (nothing written to disk),
+  `POST /api/keys/import`, `/api/unanonymize` accepts a list of saved keys,
+  cached preview (was recomputed every 800ms poll), error paths logged,
+  app no longer built twice at startup (startup was logged twice).
+- `app/pipeline.py`: an exception during verification now ends the run with
+  an error and quarantines the output (before: worker died silently and the
+  UI showed "verification scan running" forever).
+- `app/extractors.py`: `.md` supported (AI tools answer in markdown).
+- Frontend: output opens on screen automatically once verified, spreadsheet
+  output shown one row per line, `[ COPY FOR AI ]` / `[ COPY TEXT ONLY ]`;
+  UNANONYMIZE tab rebuilt - key picker, paste-to-restore, file restore,
+  import key, monospace restore report; narrow-screen layout fixed.
+- Docs: CLAUDE.md business rules 1-4, business_spec.md, PRD 4.5 / 5.1-5.3 /
+  5.5 / 5.7 / 5.8 / 5.10, README round-trip guide.
+
+### Pre-existing bugs found and fixed along the way
+
+- Phones/ZIPs stored as numbers and birthdays stored as dates were skipped
+  by the cell pass, then the raw XML pass wrote a placeholder into a numeric
+  cell - a workbook Excel had to repair.
+- A sheet named after a family ("Smith Family") became `[ORG_...]`; brackets
+  are illegal in sheet names, openpyxl refused the file, and verification
+  crashed the worker (the UI hang above).
+- The raw XML pass rewrote cell coordinates: with a grade "94" in the map,
+  `row r="94"` / `c r="A94"` became `r="A[GRADE_...]"`.
+
+### Tests
+
+- pytest: 76 -> 151 passing, stable across repeated runs. New suites:
+  `test_ids.py`, `test_replacer.py` (fuzzed against a brute-force
+  reference), `test_restorer.py` (every mangled form, 1,000 values x 4,000
+  randomly mangled mentions with zero mix-ups, multi-key, conflicts, legacy,
+  md/csv/xlsx/docx restores incl. split runs and `&`/`<` escaping, numeric
+  cells, sheet-name round trip), `test_restore_api.py` (routes + the full
+  spreadsheet -> AI -> restore flow through the API).
+- Live browser (Playwright + real Flask + mock Ollama): 53/53 checks - the
+  whole flow clicked through as an operator would, clipboard contents,
+  downloads, key import, legacy key, errors, zero requests off localhost,
+  uploads/ empty afterwards, no PII in the log. Owner note: primary use is
+  PC/Mac desktop, not mobile - desktop viewport is the target.
+
+### Independent review round (same session)
+
+An adversarial review agent re-ran everything with its own repro scripts.
+Confirmed and fixed:
+
+1. PII shaped like a token (`MRN_000123456789`, or any 12-digit number) was
+   treated as "ours" by shape and shipped while verification passed.
+   Protection is now by exact placeholder from this run's map.
+2. Comma lists (`204518,78704`) were read as thousands separators and
+   leaked. Whole-number logic now looks at the full numeric run: one
+   formatted number vs. a list.
+3. Sheet titles truncated at 31 chars could cut through a token and never
+   restore; duplicate suffixes broke the token. Key file now records
+   `sheet_titles` (exact originals); overflow/collisions get `SHEET_<id>`.
+4. Restoring an apostrophe sheet name wrote `'O'Brien'!` (invalid). Now
+   doubled in formula context on both restore paths.
+5. `__PERSON_X__`, `PERSON_X_email`, `PERSON_Xs` restored nothing and said
+   nothing. Grammar widened; any known ID left over is now reported.
+6. Short texty values (`B7`, `A1`) were written into cell coordinates and
+   Word rsids. Raw pass now writes only into non-structural attribute
+   values, and formulas only inside string literals (also covers the web
+   agent's finding that a grade 94 rewrote `A94*2`).
+7. Sheet titles were never sent to detection or verification. Extraction
+   now includes a `Sheet: <title>` line.
+Plus: non-object JSON to /api/unanonymize/text returned 500, now 400.
+
+The web-edition agent, porting the same rules, found three more that hit
+both editions:
+
+8. A PII value that is also a cell reference in a formula ("B7" in
+   `"Jane Smith"&B7`) made verification fail forever on a correct file (a
+   dead end). The verifier now reads only formula string literals.
+9. Overlapping detections ("Patient Jane" + "Jane Smith" in "Patient Jane
+   Smith") left "Smith" behind, invisible to verification (pre-existing).
+   The overlapping stretch is now registered as its own value, so it is
+   replaced whole and restores exactly.
+10. Sheet-title uniqueness was case-sensitive; Excel's is not. Fixed.
+
+Accepted as inherent: a numeric cell that is itself detected PII (a grade
+of 94) becomes a text token, so a formula computing on it shows #VALUE in
+the anonymized copy. The original and the restored file are unaffected.
+
+Performance after all fixes: 5,000 rows / 20,000 values scrubs in 3.7s and
+verifies in 1.3s. pytest: 167 passing. Browser: 53/53.
+
+### Open issues / known limits
+
+- A comma list whose items are all exactly 3 digits (`101,102`) reads as a
+  formatted number, so a 3-digit value in such a list is not matched.
+- Restoring by token (a key without `sheet_titles`, e.g. hand-made) cannot
+  shorten a restored title that exceeds 31 chars; keys this app writes
+  always carry `sheet_titles`, so this only affects imported keys.
+- XLSX charts and images are dropped by the openpyxl round trip (pre-existing).
+- Sessions still live in server memory until restart (pre-existing).
+
+### Next steps
+
+1. Operator run on a real spreadsheet with the local LLM, then paste the
+   output into an AI tool and restore the answer.
+2. Web edition (`web/index.html`) is being brought to the same rules; see
+   the follow-up entry.
+
+### Follow-up - web edition brought to the same rules (same session)
+
+`web/index.html` (v0.2) now matches the local app: 12-character unique IDs
+(ledger in browser storage, every access guarded), the single-pass engine
+with exact placeholder protection and the whole-number rule, raw-XML markup
+rules, formula-literal verification, overlap unions, reversible sheet
+titles (`sheet_titles` in key.json and `#sheet` lines in the decoder ring),
+and the tolerant restorer with multi-key merge and conflict refusal. New:
+on-screen output with `[ COPY FOR AI ]`, and a paste box that restores the
+AI's answer. Still zero network calls (CSP `connect-src 'none'` verified).
+Logs go to the browser console only - counts and file names, never values.
+
+Tests: 181/181 Playwright checks at desktop 1280x900, including JS-vs-Python
+parity on thousands of randomized cases (replacer, number boundaries, raw
+XML, reference rewrites, sheet titles, overlap unions, formula literals,
+restore) with zero mismatches, and docx/xlsx round trips validated by
+python-docx and openpyxl.
+
+---
+
+## Session 007 (continued) - 2026-09-27 - "Have you tested comprehensively?"
+
+Owner asked. Honest answer at that point: extensively, but every run had
+used a mocked LLM, no output had been opened in a real office suite, and
+LibreOffice formats, PDF/PPTX, non-English names, cross-edition keys, and
+concurrent runs were untested. This round closed those gaps. The gaps found
+real problems.
+
+### What real-world testing found (all fixed, all with regression tests)
+
+1. **Accented / non-Latin names leaked from spreadsheets** (pre-existing).
+   openpyxl writes "José" as `Jos&#233;`. No raw-XML pass could match it, so
+   a name in formula text or document properties shipped, and the verifier
+   was blind to it. Found by opening outputs in LibreOffice (#NAME? errors).
+   Scrubber now decodes non-ASCII character references first; verifier
+   decodes all of them and also scans sheet names referenced in formulas.
+2. **Detection timed out on a 25-row sheet with a real model.** The app
+   waited for llama3.2's whole answer with a 120s cap. Calls now stream and
+   fail only on a stall (LLM_STALL_TIMEOUT_S, default 180).
+3. **Silent-truncation risks.** Ollama's default context could drop the
+   start of a prompt; an answer cut off for length, or unreadable, was
+   treated as "no PII". Now: explicit num_ctx (OLLAMA_NUM_CTX 8192), JSON
+   schema output, split-and-rescan on truncation, unreadable = failed scan.
+4. **Real llama3.2 recall was 81% on dense data** and it tagged pledge
+   amounts as PII (FINANCIAL, ID, even PERSON). Added: amount filter (every
+   type except SID/GRADE), pattern backstop (email, phone, SSN, card, IP,
+   street address), spreadsheet column consensus, preview type toggles.
+   Same sheet, same model: 111/112 caught, pledge column intact.
+5. **Uploads could linger** (pre-existing): starting a second file or
+   closing the tab at the preview left the original on disk indefinitely.
+   Now cancelled by the page, expired server-side after 2h at preview, and
+   purged at startup.
+6. **Race in the upload route** (pre-existing): a corrupt file's worker
+   could delete the upload before the route read its size - 500 instead of
+   the real error. Found as a 1-in-5 flake under CPU load.
+7. Unquoted sheet references (`=José!A1`) came back quoted - equivalent but
+   not text-exact. Now keep their style.
+8. Prompt asks for each distinct value once (repeats were most of the
+   runtime and are replaced automatically anyway).
+
+### Test inventory at end of round
+
+- pytest: 193, stable over 10 consecutive full runs under heavy CPU load.
+- Local app browser (Playwright, desktop): 60/60, incl. type toggles and
+  upload hygiene (second file mid-preview, tab closed at preview).
+- Gap suite (real pipeline, stubbed LLM): 39/39 - Unicode in txt/csv/docx/
+  xlsx byte- or value-exact; LibreOffice opens and recalculates anonymized
+  and restored xlsx/docx; .xls/.ods/.odt/.doc via LibreOffice; PDF; PPTX
+  incl. speaker notes; two concurrent sessions share zero IDs.
+- Real LLM (Ollama 0.34.4, llama3.2 on a 4-core CPU): donor sheet 16/16
+  caught, amounts intact, exact restore; pledge sheet 111/112.
+- Web edition: 203 checks incl. JS-vs-Python parity and cross-edition keys
+  (web key restores in the local app and vice versa, exact).
+- Model comparison, same 25-row pledge sheet, with all safety layers:
+  llama3.2 111/112 in 306s, llama3.1:8b 112/112 in 895s (4-core CPU; a Mac
+  with Apple Silicon runs both several times faster). Recommendation added
+  to README: llama3.1:8b for sensitive data; llama3.2 for simple lists with
+  a careful read of the preview.
+- Web edition brought to the same rules again (character references,
+  formula sheet-reference scan, unquoted-reference style): 203/203.
+
+### Next steps
+
+1. Owner: pull `llama3.1:8b` and switch the endpoint model (README).
+2. Owner: run a real parish spreadsheet end to end; read the preview for
+   names inside notes columns before confirming.
+3. Consider a second detection pass on free-text columns only (the one
+   residual miss class for small models).
