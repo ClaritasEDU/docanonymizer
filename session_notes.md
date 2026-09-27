@@ -672,8 +672,24 @@ Confirmed and fixed:
    now includes a `Sheet: <title>` line.
 Plus: non-object JSON to /api/unanonymize/text returned 500, now 400.
 
+The web-edition agent, porting the same rules, found three more that hit
+both editions:
+
+8. A PII value that is also a cell reference in a formula ("B7" in
+   `"Jane Smith"&B7`) made verification fail forever on a correct file (a
+   dead end). The verifier now reads only formula string literals.
+9. Overlapping detections ("Patient Jane" + "Jane Smith" in "Patient Jane
+   Smith") left "Smith" behind, invisible to verification (pre-existing).
+   The overlapping stretch is now registered as its own value, so it is
+   replaced whole and restores exactly.
+10. Sheet-title uniqueness was case-sensitive; Excel's is not. Fixed.
+
+Accepted as inherent: a numeric cell that is itself detected PII (a grade
+of 94) becomes a text token, so a formula computing on it shows #VALUE in
+the anonymized copy. The original and the restored file are unaffected.
+
 Performance after all fixes: 5,000 rows / 20,000 values scrubs in 3.7s and
-verifies in 1.3s. pytest: 163 passing. Browser: 53/53.
+verifies in 1.3s. pytest: 167 passing. Browser: 53/53.
 
 ### Open issues / known limits
 

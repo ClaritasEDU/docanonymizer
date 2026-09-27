@@ -381,7 +381,7 @@ _BRACKETED_ID = re.compile(r"\[([A-Z]+_[0-9A-F]{12})\]")
 def _anonymized_sheet_titles(wb, replacer: Replacer) -> dict[str, str]:
     """old title -> new title for every sheet whose title contains PII."""
     renames: dict[str, str] = {}
-    taken = {ws.title for ws in wb.worksheets}
+    taken = {ws.title.casefold() for ws in wb.worksheets}   # Excel: case-insensitive
     reserved: Optional[set[str]] = None
     for ws in wb.worksheets:
         old = ws.title
@@ -389,13 +389,13 @@ def _anonymized_sheet_titles(wb, replacer: Replacer) -> dict[str, str]:
         if new == old:
             continue
         new = _BAD_SHEET_CHARS.sub("_", _BRACKETED_ID.sub(r"\1", new)).strip()
-        if not new or len(new) > 31 or new in taken:
+        if not new or len(new) > 31 or new.casefold() in taken:
             # Never truncate through a token. A unique, restorable name instead.
             if reserved is None:
                 reserved = ids.load_reserved()
             new = f"SHEET_{ids.new_id(lambda c: c in reserved)}"
-        taken.discard(old)
-        taken.add(new)
+        taken.discard(old.casefold())
+        taken.add(new.casefold())
         renames[old] = new
     if renames:
         log.info("xlsx sheet titles anonymized: %d", len(renames))

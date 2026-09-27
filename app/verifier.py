@@ -75,6 +75,22 @@ _V_RE = re.compile(r"<v>[^<]*</v>")
 _SHORT_NUMERIC_NODE_RE = re.compile(r">([\s\d.,:+\-]+)<")
 
 
+# Formula text (cells, defined names, chart refs): only "string literals" can
+# hold PII. The rest is references and operators - a PII value like "B7"
+# legitimately remains there as a cell reference and must not fail the scan.
+_FORMULA_EL_RE = re.compile(
+    r"(<(?:\w+:)?(f|definedName)(?:\s[^>]*)?(?<!/)>)(.*?)(</(?:\w+:)?\2>)", re.DOTALL)
+_STRING_LIT_RE = re.compile(r'"(?:[^"]|"")*"')
+
+
+def _formula_literals_only(xml: str) -> str:
+    def repl(m: re.Match) -> str:
+        inner = m.group(3).replace("&quot;", '"')
+        lits = [x[1:-1].replace('""', '"') for x in _STRING_LIT_RE.findall(inner)]
+        return m.group(1) + "\n".join(lits) + m.group(4)
+    return _FORMULA_EL_RE.sub(repl, xml)
+
+
 def _blank_short_numbers(xml: str) -> str:
     def repl(m: re.Match) -> str:
         node = m.group(1)
@@ -121,6 +137,7 @@ def _deep_zip_text(path: Path) -> str:
                     continue
                 if _SHEET_PART_RE.fullmatch(name):
                     raw = _V_RE.sub("", raw)     # numbers + shared-string indexes
+                raw = _formula_literals_only(raw)
                 raw = _blank_short_numbers(raw)
                 chunks.append(_xml_unescape(_TAG_RE.sub("\n", raw)))
     except (zipfile.BadZipFile, OSError) as exc:

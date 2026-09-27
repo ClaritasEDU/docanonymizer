@@ -284,6 +284,47 @@ class LiteralReplacer:
         return LiteralReplacer(out, protect_placeholders=self.protect)
 
 
+def overlap_unions(text: str, originals) -> list[tuple[str, list[str]]]:
+    """Stretches of `text` where detected values overlap without nesting.
+
+    "Patient Jane" and "Jane Smith" both found in "Patient Jane Smith":
+    whichever wins, part of the other ("Smith") would survive, and the
+    verifier can't see a fragment. Returns (union_text, member_originals)
+    for each such stretch so the caller can register the union as one value
+    (its own ID - fully reversible). Unions spanning a tab or newline are
+    skipped: they cross spreadsheet cells or lines and can't be one value.
+    """
+    words = sorted({w for w in originals if w and not is_short_number(w)}, key=len, reverse=True)
+    if len(words) < 2:
+        return []
+    try:
+        pat = re.compile(f"(?=({_trie_pattern(words)}))")
+    except (RecursionError, re.error, OverflowError, MemoryError):
+        return []
+    word_set = set(words)
+    out: list[tuple[str, list[str]]] = []
+    cs = ce = -1
+    members: list[str] = []
+
+    def flush() -> None:
+        if len(members) > 1:
+            union = text[cs:ce]
+            if union not in word_set and "\t" not in union and "\n" not in union:
+                out.append((union, list(members)))
+
+    for m in pat.finditer(text):
+        s0, w = m.start(), m.group(1)
+        if s0 < ce:
+            ce = max(ce, s0 + len(w))
+            members.append(w)
+        else:
+            flush()
+            cs, ce, members = s0, s0 + len(w), [w]
+    flush()
+    seen: set[str] = set()
+    return [(u, ms) for u, ms in out if not (u in seen or seen.add(u))]
+
+
 def _find_all(text: str, w: str):
     i = text.find(w)
     while i != -1:

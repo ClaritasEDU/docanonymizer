@@ -22,6 +22,7 @@ from .extractors import ExtractResult, extract
 from .key_files import new_session_id, save_key_file
 from .logging_setup import get_logger
 from .mapper import EntityRegistry
+from .replacer import overlap_unions
 from .scrubber import scrub_csv, scrub_docx, scrub_text, scrub_xlsx
 from .verifier import verify_output
 
@@ -170,6 +171,20 @@ def run_extract_and_detect(sess: Session) -> Session:
                 sess.registry.add(term, tag)
             except (ValueError, RuntimeError) as exc:
                 log.warning("custom term skipped: tag=%s reason=%s", tag, exc)
+
+    # Overlapping detections ("Patient Jane" + "Jane Smith") would leave a
+    # fragment ("Smith") behind whichever wins. Register the overlapping
+    # stretch as one value so it is replaced whole.
+    unions = overlap_unions(sess.extract.text, list(sess.registry.replacements))
+    for union, members in unions:
+        longest = max(members, key=len)
+        tag = sess.registry.replacements[longest].strip("[]").split("_", 1)[0]
+        try:
+            sess.registry.add(union, tag)
+        except (ValueError, RuntimeError) as exc:
+            log.warning("overlap union skipped: tag=%s reason=%s", tag, exc)
+    if unions:
+        log.info("session %s overlapping detections merged: %d", sess.id, len(unions))
 
     sess.detection_complete = True
     counts = sess.registry.counts_per_type()

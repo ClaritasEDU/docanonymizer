@@ -601,3 +601,72 @@ def test_known_id_that_cannot_be_restored_is_reported_not_silent():
     assert out == f"ref x{JANE}9 and Bob Torres"
     assert rep.restored == 1
     assert rep.unresolved == [JANE]
+
+
+def test_formula_reference_equal_to_a_pii_value_does_not_block_release(tmp_path):
+    """Web-agent finding: a PII value "B7" also used as a cell reference in
+    "Jane Smith"&B7 made verification fail forever on a correct file."""
+    from openpyxl import Workbook, load_workbook
+    from app.scrubber import scrub_xlsx
+    from app.verifier import verify_output
+    wb = Workbook()
+    ws = wb.active
+    ws["B7"] = "B7"
+    ws["A1"] = '="Jane Smith"&B7'
+    src = tmp_path / "f.xlsx"
+    wb.save(src)
+    rmap = {"Jane Smith": "[PERSON_3A4F9C2B1D0E]", "B7": "[ID_B7B7B7B7B7B7]"}
+    out = tmp_path / "o.xlsx"
+    scrub_xlsx(src, rmap, out)
+    ws2 = load_workbook(out).active
+    assert ws2["A1"].value == '="[PERSON_3A4F9C2B1D0E]"&B7'
+    assert verify_output(out, rmap).passed
+    # A literal left in a formula is still caught.
+    leaky = tmp_path / "leak.xlsx"
+    wb2 = Workbook()
+    wb2.active["A1"] = '="Jane Smith"&B7'
+    wb2.save(leaky)
+    assert not verify_output(leaky, rmap).passed
+
+
+def test_overlapping_detections_leave_no_fragment(tmp_path):
+    """Web-agent finding: "Patient Jane" + "Jane Smith" in "Patient Jane
+    Smith" left "Smith" behind whichever won. The union becomes one value."""
+    import json as _json
+    from unittest.mock import patch as _patch
+    from app import detector, pipeline
+    from app.config import UPLOADS_DIR
+    from app.restorer import build_index, restore_text
+
+    up = UPLOADS_DIR / "note.txt"
+    up.write_text("Patient Jane Smith visited. Jane Smith called. Patient Jane waited.")
+    sess = pipeline.new_session(up, "note.txt", ["PERSON"],
+                                endpoint={"base_url": "http://localhost:1", "model": "m",
+                                          "api_style": "ollama", "nickname": "t"},
+                                custom_terms=[("PERSON", "Jane Smith")])
+    fake = _json.dumps([{"text": "Patient Jane", "type": "PERSON"}])
+    with _patch.object(detector.llm, "llm_call", return_value=fake):
+        pipeline.run_extract_and_detect(sess)
+    assert "Patient Jane Smith" in sess.registry.replacements
+    pipeline.confirm_and_scrub(sess)
+    assert sess.verify_result["passed"]
+    out = sess.output_path.read_text()
+    assert "Smith" not in out and "Jane" not in out
+    idx = build_index([("k", {"replacement_map": sess.registry.as_replacement_map()})])
+    assert restore_text(out, idx)[0] == "Patient Jane Smith visited. Jane Smith called. Patient Jane waited."
+
+
+def test_overlap_unions_ignores_nesting_and_cross_cell_stretches():
+    from app.replacer import overlap_unions
+    assert overlap_unions("Jane Smith", ["Jane", "Jane Smith", "Smith"]) == []
+    assert overlap_unions("Ann Lee\tLee Park", ["Ann Lee", "Lee\tLee Park"]) == []
+    assert overlap_unions("Mary Ann Lee", ["Mary Ann", "Ann Lee"]) == [("Mary Ann Lee", ["Mary Ann", "Ann Lee"])]
+
+
+def test_sheet_titles_that_differ_only_by_case_stay_distinct(tmp_path):
+    """Excel sheet names are unique ignoring case: PERSON_X_s vs PERSON_X_S."""
+    titles = ["Smith's", "Smith_S"]
+    anon, restored, _, res = _anon_and_restore_titles(tmp_path, titles, [("Smith", "PERSON")])
+    assert len({t.casefold() for t in anon.sheetnames}) == len(anon.sheetnames)
+    assert restored.sheetnames == titles + ["Summary"]
+    assert res.report.residual == 0
