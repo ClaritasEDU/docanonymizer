@@ -45,6 +45,22 @@ Primary user: a single operator (initially the product owner) who needs to prepa
 
 Secondary use: small teams where documents pass through a compliance review step before going to analysts who use AI tools.
 
+**Role in the ClaritasEDU school suite (owner ruling 2026-08-06):** this
+tool is the designated deep-scrub for school newsletters headed to any
+frontier model outside ParentPoint's own guarded extraction pipeline —
+e.g. an operator pasting a newsletter into a hosted AI chat for ad-hoc
+analysis. ParentPoint's automated pipeline keeps its own roster-driven
+name tokenizer; this tool covers what a roster structurally can't know
+(non-roster names, addresses, phones — the full 17-category sweep). The
+ruling, its Beacon counterpart (already-family-distributed newsletters may
+reach Beacon PII-intact — that content is school-published), and the open
+integration-shape decision (manual pre-step today; possibly a service on
+the school's on-prem box later, using its local LLM — tracked as
+parentpoint tracker B50) live in `parentpoint/PROTECTED_DATA_CLASSES.md`
+Part 1 ("Newsletters — owner rulings 2026-08-06"). Nothing about this
+tool's local-only privacy contract changes: the scrub still never runs in
+the cloud, by construction.
+
 ---
 
 ## Why Local

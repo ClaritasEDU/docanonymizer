@@ -494,3 +494,53 @@ Fixed two UI bugs reported from live use:
 ### Next Steps
 
 1. Operator re-test of the attach and PII selection flow on the Mac.
+
+---
+
+## Session 006 - 2026-08-06 (Claude Code, branch `claude/school-config-files-wvn98e`)
+
+**Type:** Suite-integration review + role assignment (docs only, no code)
+
+### What Was Done
+
+This repo was pulled into the ClaritasEDU cross-suite session (parentpoint /
+teacherAIde / chamberlain / beacon) for a final "everything working together"
+review, and came out of it with an assigned role: the owner designated Doc
+Anonymizer as the deep-scrub applied to school newsletters before they go
+into any frontier model outside ParentPoint's own guarded extraction
+pipeline.
+
+The review that preceded the ruling was code-level, not doc-level. Verified
+directly: the local-only endpoint guard (`app/endpoints.py is_local_url` —
+loopback/RFC1918/link-local only, non-local rejected), which is the
+make-or-break property for this role (the document must never touch a
+hosted model DURING anonymization); the 17-category detection set, which
+covers the strict-exclusion classes in parentpoint's
+`PROTECTED_DATA_CLASSES.md` boundary map (MEDICAL, GRADE, DOB, SID,
+IMMIGRATION, DEMO, RELIGION); the reversible entity-linked key.json
+(`unanonymize.py`), which makes a future scrub -> frontier-extract ->
+un-scrub pipeline architecturally possible; the post-scrub verification
+gate; and the web edition's CSP (`connect-src 'none'`).
+
+### Decisions Recorded (owner)
+
+1. Newsletters -> any frontier model (outside ParentPoint's pipeline): run
+   through this tool first.
+2. Newsletters -> Beacon: PII may stay intact — newsletters already go out
+   to every family, so their content is school-published information. (The
+   canonical write-up of both rulings lives in
+   `parentpoint/PROTECTED_DATA_CLASSES.md` Part 1.)
+3. Whether this tool ever wires INTO ParentPoint's automated pipeline is
+   deliberately undecided — parentpoint tracker B50. Its privacy contract
+   (local LLM only) means the realistic future host is a school's on-prem
+   box, not ParentPoint's cloud functions. Nothing here changes today: the
+   tool stays exactly what it is, used manually.
+
+### Changes In This Repo
+
+`business_spec.md` "Who Uses This" gained the suite-role paragraph. No code.
+
+### Next Steps
+
+1. None for this repo — B50 (in parentpoint) is the pointer if the
+   pipeline-integration question ever becomes a build.
