@@ -25,9 +25,24 @@ A local LLM is required. Easiest setup:
 
 ```bash
 brew install ollama
-ollama pull llama3.2
+ollama pull llama3.1:8b
 ollama serve
 ```
+
+**Which model.** Measured on a messy 25-row pledge sheet (names, emails,
+phones, addresses, plus spouses and phone numbers inside free-text notes):
+
+| Model | PII caught | Notes |
+|---|---|---|
+| llama3.2 (3B) alone | 91 of 112 | before the app's safety layers |
+| llama3.2 + app safety layers | 111 of 112 | missed one spouse name in a note |
+| llama3.1:8b + app safety layers | 112 of 112 | about 3x slower than llama3.2 |
+
+Use `llama3.1:8b` for anything sensitive (needs about 5 GB of free memory).
+`llama3.2` is faster and fine for simple lists, but always read the preview
+for names inside free-text notes. To switch models: `[ MANAGE ENDPOINTS ]` >
+`[ EDIT ]` > MODEL `llama3.1:8b` > `[ SAVE ]`. A brand-new install picks it up
+from `.env` instead: `DEFAULT_MODEL=llama3.1:8b`.
 
 ---
 

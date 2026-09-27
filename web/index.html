@@ -563,6 +563,30 @@ function decodeXml(s) {
     return Number.isFinite(code) ? String.fromCodePoint(code) : m;
   });
 }
+// Numeric character references for non-ASCII characters become the
+// characters themselves: openpyxl writes "José" as "Jos&#233;". Without this
+// no text pass can match an accented or non-Latin name in formula text,
+// metadata, or any other raw XML - and it would ship. ASCII references
+// (&#10;, &#38;...) are left alone: they can carry meaning. Port of
+// scrubber._decode_char_refs.
+const CHAR_REF_RE = /&#(x[0-9A-Fa-f]+|[0-9]+);/g;
+function decodeCharRefs(xml) {
+  return xml.replace(CHAR_REF_RE, (m, ref) => {
+    const cp = ref[0] === "x" ? parseInt(ref.slice(1), 16) : parseInt(ref, 10);
+    if (!Number.isFinite(cp) || cp < 0x80 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return m;
+    return String.fromCodePoint(cp);
+  });
+}
+// Verifier unescape (port of verifier._xml_unescape): every numeric
+// reference, then the five named entities, &amp; last.
+function xmlUnescapeAll(s) {
+  s = s.replace(CHAR_REF_RE, (m, ref) => {
+    const cp = ref[0] === "x" ? parseInt(ref.slice(1), 16) : parseInt(ref, 10);
+    try { return String.fromCodePoint(cp); } catch (_) { return m; }
+  });
+  return s.split("&lt;").join("<").split("&gt;").join(">").split("&quot;").join('"')
+    .split("&apos;").join("'").split("&amp;").join("&");
+}
 function encodeXml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c]));
 }
@@ -1147,6 +1171,7 @@ function renameSheetsInWorkbook(workbookXml, renames) {
 
 // Point formula / defined-name / chart / pivot references at the renamed
 // sheets. Port of scrubber._rewrite_sheet_refs.
+const BARE_SHEET_RE = /^[\p{L}\p{Nl}\p{No}_][\p{L}\p{N}_.]*$/u;     // valid unquoted sheet name
 function rewriteSheetRefs(xml, renames) {
   const textSafe = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   for (const [old, neu] of renames) {
@@ -1157,8 +1182,11 @@ function rewriteSheetRefs(xml, renames) {
       xml = xml.split(`'${o}'!`).join(quotedNew);
       xml = xml.split(`&apos;${o}&apos;!`).join(quotedNew);
     }
-    if (/^[A-Za-z_][A-Za-z0-9_.]*$/.test(old)) {
-      xml = xml.replace(new RegExp(`(?<![A-Za-z0-9_.'])${reEscape(old)}!`, "g"), () => quotedNew);
+    if (BARE_SHEET_RE.test(old)) {      // unquoted refs: Smith!A1, José!A1
+      // Keep the reference's own style: unquoted stays unquoted when the new
+      // name allows it (tokens do), so a restore is text-exact.
+      const bareNew = BARE_SHEET_RE.test(neu) ? textSafe(neu + "!") : quotedNew;
+      xml = xml.replace(new RegExp(`(?<![\\p{L}\\p{N}_.'])${reEscape(old)}!`, "gu"), () => bareNew);
     }
     xml = xml.split(`sheet="${encodeXml(old)}"`).join(`sheet="${encodeXml(neu)}"`);
   }
@@ -1253,16 +1281,20 @@ function blankShortNumbers(xml) {
   return xml.replace(/>([\s\d.,:+\-]+)</g, (m, node) =>
     ">" + ((node.match(/[0-9]/g) || []).length >= SHORT_NUMBER_DIGITS ? node : "") + "<");
 }
-// Formulas (<f>, <definedName>, any prefix): only their "string literals"
-// can hold PII. Everything else is references and operators - "B7" in
-// "Jane Smith"&B7 is a cell, not the locker ID B7 (port of
-// verifier._formula_literals_only).
+// Formulas (<f>, <definedName>, any prefix): PII can live in "string
+// literals" and in the sheet names a formula references ('Smith Family'!A1).
+// Cell references and operators are not scanned - "B7" in "Jane Smith"&B7 is
+// a cell, not the locker ID B7 (port of verifier._formula_literals_only).
 const FORMULA_EL_RE = /(<(?:[\p{L}\p{N}_]+:)?(f|definedName)(?:\s[^>]*)?(?<!\/)>)([\s\S]*?)(<\/(?:[\p{L}\p{N}_]+:)?\2>)/gu;
 const STRING_LIT_RE = /"(?:[^"]|"")*"/g;
+const SHEET_REF_RE = /'((?:[^']|'')+)'!|([\p{L}\p{Nl}\p{No}_][\p{L}\p{N}_.]*)!/gu;
 function formulaLiteralsOnly(xml) {
   return xml.replace(FORMULA_EL_RE, (m, open, name, inner, close) => {
-    const lits = (inner.split("&quot;").join('"').match(STRING_LIT_RE) || []).map(x => x.slice(1, -1).split('""').join('"'));
-    return open + lits.join("\n") + close;
+    const f = inner.split("&quot;").join('"').split("&apos;").join("'");
+    const lits = (f.match(STRING_LIT_RE) || []).map(x => x.slice(1, -1).split('""').join('"'));
+    const rest = f.replace(STRING_LIT_RE, " ");
+    const refs = [...rest.matchAll(SHEET_REF_RE)].map(r => (r[1] !== undefined ? r[1].split("''").join("'") : r[2]));
+    return open + lits.concat(refs).join("\n") + close;
   });
 }
 function deepZipText(entries) {
@@ -1273,7 +1305,7 @@ function deepZipText(entries) {
     if (XLSX_SHEET_PART.test(e.name)) raw = raw.replace(/<v>[^<]*<\/v>/g, "");
     raw = formulaLiteralsOnly(raw);
     raw = blankShortNumbers(raw);
-    chunks.push(decodeXml(raw.replace(/<[^>]+>/g, "\n")));
+    chunks.push(xmlUnescapeAll(raw.replace(/<[^>]+>/g, "\n")));
   }
   return chunks.join("\n");
 }
@@ -1386,7 +1418,7 @@ function applyToDocument(doc, replacer, opts = {}) {
   const docxChunks = [];
   for (const e of doc.entries) {
     if (!isTextPart(e.name)) { newEntries.push(e); continue; }
-    let xml = td8.decode(e.bytes);
+    let xml = decodeCharRefs(td8.decode(e.bytes));
     if (renames.size) {
       if (e.name === "xl/workbook.xml") xml = renameSheetsInWorkbook(xml, renames);
       xml = rewriteSheetRefs(xml, renames);

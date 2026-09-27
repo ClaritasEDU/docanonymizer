@@ -781,3 +781,18 @@ real problems.
   caught, amounts intact, exact restore; pledge sheet 111/112.
 - Web edition: 203 checks incl. JS-vs-Python parity and cross-edition keys
   (web key restores in the local app and vice versa, exact).
+- Model comparison, same 25-row pledge sheet, with all safety layers:
+  llama3.2 111/112 in 306s, llama3.1:8b 112/112 in 895s (4-core CPU; a Mac
+  with Apple Silicon runs both several times faster). Recommendation added
+  to README: llama3.1:8b for sensitive data; llama3.2 for simple lists with
+  a careful read of the preview.
+- Web edition brought to the same rules again (character references,
+  formula sheet-reference scan, unquoted-reference style): 203/203.
+
+### Next steps
+
+1. Owner: pull `llama3.1:8b` and switch the endpoint model (README).
+2. Owner: run a real parish spreadsheet end to end; read the preview for
+   names inside notes columns before confirming.
+3. Consider a second detection pass on free-text columns only (the one
+   residual miss class for small models).
