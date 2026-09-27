@@ -47,6 +47,7 @@ _ID_RE = re.compile(r"[0-9A-F]{12}")
 _SCI_RE = re.compile(r"\d+E\d+")
 # Pulls the hex out of a placeholder like "[PERSON_3A4F9C2B1D0E]".
 _PLACEHOLDER_HEX_RE = re.compile(r"_([0-9A-F]{12})\]")
+_BARE_HEX_RE = re.compile(r"(?<=_)([0-9A-F]{12})(?![0-9A-F])")
 
 _lock = threading.Lock()
 _issued_this_process: set[str] = set()
@@ -99,6 +100,9 @@ def ids_in_key_payload(payload: dict) -> set[str]:
     for hex_id in (payload.get("entity_registry") or {}):
         if isinstance(hex_id, str) and _ID_RE.fullmatch(hex_id):
             out.add(hex_id)
+    for title in (payload.get("sheet_titles") or {}):
+        if isinstance(title, str):
+            out.update(_BARE_HEX_RE.findall(title))
     return out
 
 

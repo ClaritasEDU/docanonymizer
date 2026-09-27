@@ -402,7 +402,7 @@ def test_sheet_named_after_a_family_round_trips(tmp_path):
     reg.add("Smith Family", "ORG")
     reg.add("Jane Smith", "PERSON")
     out = tmp_path / "families_anon_ab12cd34.xlsx"
-    scrub_xlsx(src, reg.as_replacement_map(), out)
+    result = scrub_xlsx(src, reg.as_replacement_map(), out)
 
     token = reg.replacements["Smith Family"].strip("[]")
     wb2 = load_workbook(out)                      # used to raise ValueError
@@ -411,14 +411,19 @@ def test_sheet_named_after_a_family_round_trips(tmp_path):
     assert wb2.defined_names["smith_total"].attr_text == f"'{token}'!$B$1"
     assert verify_output(out, reg.as_replacement_map()).passed
 
+    assert result.sheet_titles == {token: "Smith Family"}
+
     from app.restorer import build_index
-    res = restore_file(out, build_index([("k", {"replacement_map": reg.as_replacement_map()})]),
-                       display_name=out.name)
-    wb3 = load_workbook(res.output_path)
-    assert wb3.sheetnames == ["Smith Family", "Summary"]
-    assert wb3["Smith Family"]["A1"].value == "Jane Smith"
-    assert wb3["Summary"]["A1"].value == "='Smith Family'!B1*2"
-    assert wb3.defined_names["smith_total"].attr_text == "'Smith Family'!$B$1"
+    rmap = reg.as_replacement_map()
+    for key in ({"replacement_map": rmap, "sheet_titles": result.sheet_titles},  # normal
+                {"replacement_map": rmap}):                                    # token fallback
+        res = restore_file(out, build_index([("k", key)]), display_name=out.name)
+        wb3 = load_workbook(res.output_path)
+        assert wb3.sheetnames == ["Smith Family", "Summary"]
+        assert wb3["Smith Family"]["A1"].value == "Jane Smith"
+        assert wb3["Summary"]["A1"].value == "='Smith Family'!B1*2"
+        assert wb3.defined_names["smith_total"].attr_text == "'Smith Family'!$B$1"
+        assert res.report.residual == 0
 
 
 def test_ids_never_look_like_scientific_notation():
@@ -426,3 +431,173 @@ def test_ids_never_look_like_scientific_notation():
     assert not is_valid_id("123456789E12")
     assert not is_valid_id("1E2345678901")
     assert is_valid_id("12345678E12A")
+
+
+
+def _formula_parses(formula: str) -> bool:
+    from openpyxl.formula import Tokenizer
+    try:
+        Tokenizer(formula)
+        return True
+    except Exception:
+        return False
+
+
+def _anon_and_restore_titles(tmp_path, titles, rmap_values):
+    """Build a workbook with `titles`, a Summary sheet referencing each, run
+    anonymize -> restore through the real key file. Returns both workbooks."""
+    import json as _json
+    from openpyxl import Workbook, load_workbook
+    from app.key_files import save_key_file
+    from app.mapper import EntityRegistry
+    from app.restorer import build_index
+    from app.scrubber import scrub_xlsx
+    from app.unanonymize import restore_file
+    wb = Workbook()
+    wb.remove(wb.active)
+    for t in titles:
+        wb.create_sheet(t)["B1"] = 7
+    summ = wb.create_sheet("Summary")
+    for i, t in enumerate(titles, start=1):
+        summ.cell(row=i, column=1, value="='" + t.replace("'", "''") + "'!B1*2")
+    src = tmp_path / "t.xlsx"
+    wb.save(src)
+    reg = EntityRegistry()
+    for v, tag in rmap_values:
+        reg.add(v, tag)
+    out = tmp_path / "t_anon_ab12cd34.xlsx"
+    result = scrub_xlsx(src, reg.as_replacement_map(), out)
+    key_path = save_key_file("ab12cd34", "t.xlsx", {}, ["PERSON"], reg,
+                             sheet_titles=result.sheet_titles)
+    key = _json.loads(key_path.read_text())
+    res = restore_file(out, build_index([(key_path.name, key)]), display_name=out.name)
+    return load_workbook(out), load_workbook(res.output_path), key, res
+
+
+def test_long_and_duplicate_sheet_titles_restore_exactly(tmp_path):
+    """Review finding 3: a title that won't fit after substitution, and two
+    titles that collide, must both come back exactly."""
+    from app import ids
+    # "2024 Pledges - PERSON_<id>" is 34 chars (won't fit); "Smith's" and
+    # "Smith_s" both sanitize to "PERSON_<id>_s" (collide).
+    titles = ["2024 Pledges - Smith", "Smith's", "Smith_s", "Smith Family"]
+    anon, restored, key, res = _anon_and_restore_titles(
+        tmp_path, titles, [("Smith", "PERSON"), ("Smith Family", "ORG")])
+    for t in anon.sheetnames:
+        assert "Smith" not in t and len(t) <= 31
+    assert sum(t.startswith("SHEET_") for t in anon.sheetnames) == 2   # too long + collision
+    assert restored.sheetnames == titles + ["Summary"]
+    for i, t in enumerate(titles, start=1):
+        f = restored["Summary"].cell(row=i, column=1).value
+        assert f == "='" + t.replace("'", "''") + "'!B1*2" and _formula_parses(f)
+    assert set(key["sheet_titles"].values()) == set(titles)
+    # SHEET ids are released IDs too - never reissued.
+    sheet_ids = {t[6:] for t in key["sheet_titles"] if t.startswith("SHEET_")}
+    assert sheet_ids and sheet_ids <= ids.load_reserved()
+    assert res.report.residual == 0
+
+
+def test_apostrophe_sheet_title_restores_to_valid_formulas(tmp_path):
+    """Review finding 4: 'O''Brien'!B1 must come back with the doubled quote."""
+    anon, restored, _, _ = _anon_and_restore_titles(
+        tmp_path, ["O'Brien"], [("O'Brien", "PERSON")])
+    assert "O'Brien" not in anon.sheetnames
+    assert restored.sheetnames == ["O'Brien", "Summary"]
+    f = restored["Summary"]["A1"].value
+    assert f == "='O''Brien'!B1*2" and _formula_parses(f)
+
+
+def test_apostrophe_sheet_title_token_fallback_also_valid(tmp_path):
+    """Same, when the key has no sheet_titles record (restore via the token)."""
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.workbook.defined_name import DefinedName
+    from app.mapper import EntityRegistry
+    from app.restorer import build_index
+    from app.scrubber import scrub_xlsx
+    from app.unanonymize import restore_file
+    wb = Workbook()
+    wb.active.title = "O'Brien"
+    wb.active["B1"] = 7
+    wb.create_sheet("Summary")["A1"] = "='O''Brien'!B1*2"
+    wb.defined_names["ob"] = DefinedName("ob", attr_text="'O''Brien'!$B$1")
+    src = tmp_path / "s.xlsx"
+    wb.save(src)
+    reg = EntityRegistry()
+    reg.add("O'Brien", "PERSON")
+    out = tmp_path / "o.xlsx"
+    scrub_xlsx(src, reg.as_replacement_map(), out)
+    res = restore_file(out, build_index([("k", {"replacement_map": reg.as_replacement_map()})]))
+    wb2 = load_workbook(res.output_path)
+    assert wb2.sheetnames == ["O'Brien", "Summary"]
+    assert wb2["Summary"]["A1"].value == "='O''Brien'!B1*2"
+    assert wb2.defined_names["ob"].attr_text == "'O''Brien'!$B$1"
+
+
+def test_defined_names_keep_their_references(tmp_path):
+    """A short texty value (B7) must not rewrite a defined name's reference."""
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.workbook.defined_name import DefinedName
+    from app.scrubber import scrub_xlsx
+    wb = Workbook()
+    wb.active["B7"] = "B7"
+    wb.defined_names["locker"] = DefinedName("locker", attr_text="Sheet!$B$7")
+    src = tmp_path / "d.xlsx"
+    wb.save(src)
+    scrub_xlsx(src, {"B7": "[ID_B7B7B7B7B7B7]"}, tmp_path / "o.xlsx")
+    wb2 = load_workbook(tmp_path / "o.xlsx")
+    assert wb2.active["B7"].value == "[ID_B7B7B7B7B7B7]"
+    assert wb2.defined_names["locker"].attr_text == "Sheet!$B$7"
+
+
+def test_sheet_title_only_pii_is_detected_and_verified(tmp_path):
+    """Review finding 7: a name that lives only in the sheet title reaches the
+    model (extracted text) and the verifier."""
+    from openpyxl import Workbook
+    from app.extractors import extract
+    from app.mapper import EntityRegistry
+    from app.scrubber import scrub_xlsx
+    from app.verifier import verify_output
+    wb = Workbook()
+    wb.active.title = "Maria Gonzalez IEP"
+    wb.active.append(["goal", "status"])
+    src = tmp_path / "iep.xlsx"
+    wb.save(src)
+    assert "Sheet: Maria Gonzalez IEP" in extract(src).text
+    reg = EntityRegistry()
+    reg.add("Maria Gonzalez", "PERSON")
+    out = tmp_path / "o.xlsx"
+    scrub_xlsx(src, reg.as_replacement_map(), out)
+    assert "Maria" not in extract(out).text
+    assert verify_output(out, reg.as_replacement_map()).passed
+    # And a title that was NOT scrubbed fails verification.
+    assert not verify_output(src, reg.as_replacement_map()).passed
+
+
+def test_default_single_sheet_adds_no_header_line(tmp_path):
+    from openpyxl import Workbook
+    from app.extractors import extract
+    wb = Workbook()
+    wb.active.append(["a", "b"])
+    wb.save(tmp_path / "d.xlsx")
+    assert extract(tmp_path / "d.xlsx").text.startswith("a\tb")
+
+
+def test_markdown_and_snake_case_forms_restore():
+    """Review finding 5."""
+    for token, expected in [
+        (f"_PERSON_{JANE}_", "_Jane Smith_"),
+        (f"__PERSON_{JANE}__", "__Jane Smith__"),
+        (f"PERSON_{JANE}_email", "Jane Smith_email"),
+        (f"PERSON_{JANE}s", "Jane Smiths"),
+        (f"*[PERSON_{JANE}]*", "*Jane Smith*"),
+    ]:
+        out, rep = _restore(token)
+        assert out == expected, token
+        assert rep.restored == 1 and rep.unresolved_count == 0
+
+
+def test_known_id_that_cannot_be_restored_is_reported_not_silent():
+    out, rep = _restore(f"ref x{JANE}9 and [PERSON_{BOB}]")
+    assert out == f"ref x{JANE}9 and Bob Torres"
+    assert rep.restored == 1
+    assert rep.unresolved == [JANE]

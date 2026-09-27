@@ -138,10 +138,11 @@ The PRD listed six open questions. Three are resolved as built; three are deferr
 
 7. **Identifier uniqueness (2026-09-27).** Enforced, not probabilistic: new IDs are checked against the session, every key in `/keys`, `keys/issued_ids.ledger` (append-only, random IDs only, no PII), and IDs issued by the running process.
 8. **Legacy 4-character keys (2026-09-27).** Still restore, but only with their tag present (`[PERSON_3A4F]`), since a bare 4-character hex is too common in ordinary text. Old keys that gave two values the same placeholder restore to the longer value and say so. They are opt-in in the key picker; if two selected keys disagree about an identifier, restore refuses and names both keys.
-9. **Short numbers (2026-09-27).** A value with no letters and fewer than 7 digits (a grade, room number, ZIP, 5-digit student ID) is replaced only where it stands as a whole number - a grade of 94 does not touch 1945, 94.5, or row 94 of a spreadsheet. Phones, SSNs, and account numbers keep plain substring matching.
-10. **Spreadsheet realities (2026-09-27).** Phones, ZIPs, and birthdays stored as numbers or dates are scrubbed (the cell becomes text). Sheet names that contain PII get the bracket-free form (`ORG_B9442179E0EE`, since Excel forbids brackets in sheet names) and every formula, defined name, and pivot reference follows the rename.
+9. **Short numbers (2026-09-27).** A value with no letters and fewer than 7 digits (a grade, room number, ZIP, 5-digit student ID) is replaced only where it stands as a whole number - a grade of 94 does not touch 1945, 94.5, 1,945, cell A94, or row 94 of a spreadsheet, but every item of a comma list like `204518,78704` is caught. Phones, SSNs, and account numbers keep plain substring matching.
+10. **Spreadsheet realities (2026-09-27).** Phones, ZIPs, and birthdays stored as numbers or dates are scrubbed (the cell becomes text). Sheet titles are sent to detection and verification. A title containing PII gets the bracket-free form (`ORG_B9442179E0EE`, since Excel forbids brackets in sheet names), or a unique `SHEET_<id>` when that won't fit in 31 characters; every formula, defined name, and pivot reference follows the rename, and the key file records the exact original title so restore is exact. Formulas are only ever changed inside their "string literals" - references like `B7` or `A94` are never touched.
+11. **Placeholder protection is exact (2026-09-27).** Only the run's own placeholders are protected from re-replacement. A record number that happens to look like a token (`MRN_000123456789`) is still replaced and still verified.
 
 **Deferred to v2:**
 
-11. Optional AES-encrypted key files at rest.
-12. In-place highlight-and-tag in the preview panel (custom terms cover the need for now).
+12. Optional AES-encrypted key files at rest.
+13. In-place highlight-and-tag in the preview panel (custom terms cover the need for now).

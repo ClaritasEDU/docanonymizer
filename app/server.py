@@ -465,7 +465,9 @@ def create_app() -> Flask:
     @app.post("/api/unanonymize/text")
     def unanon_text():
         """Restore pasted text (an AI tool's answer). Nothing is written to disk."""
-        payload = request.get_json(force=True, silent=True) or {}
+        payload = request.get_json(force=True, silent=True)
+        if not isinstance(payload, dict):
+            payload = {}
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip():
             log.warning("text restore refused: empty input")

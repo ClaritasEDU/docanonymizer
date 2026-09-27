@@ -45,8 +45,9 @@ import shutil
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
+from . import ids
 from .extractors import ExtractResult
 from .logging_setup import get_logger
 from .replacer import Replacer, apply, as_replacer, is_short_number, splice, xml_escape
@@ -62,6 +63,9 @@ class ScrubResult:
     layers_cleaned: list[str] = field(default_factory=list)
     formula_warnings: list[str] = field(default_factory=list)
     bytes_written: int = 0
+    # XLSX: anonymized sheet title -> original title, stored in the key file
+    # so restore puts the exact title back (titles are length-limited).
+    sheet_titles: dict[str, str] = field(default_factory=dict)
 
 
 def apply_replacements_text(text: str, replacement_map: MapOrReplacer) -> str:
@@ -271,10 +275,13 @@ def scrub_docx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
 
 
 def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Path,
-               deep_clean: bool = True) -> ScrubResult:
+               deep_clean: bool = True,
+               sheet_restore: Optional[dict[str, str]] = None) -> ScrubResult:
     """XLSX scrub: surface replace via openpyxl, ZIP-level deep scrub, formula warnings.
 
     `deep_clean=False` (unanonymize) skips the comment/metadata handlers.
+    `sheet_restore` (unanonymize) maps anonymized sheet titles back to the
+    originals recorded in the key file.
     """
     from openpyxl import load_workbook
 
@@ -314,10 +321,18 @@ def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
                     if new != sv:
                         cell.value = new
 
-    # Sheet names can carry PII ("Smith Family") but can't contain [ or ], so
-    # they get the bracket-free token form. References to the old name in
-    # formulas, defined names, and pivot sources are rewritten to match.
-    renames = _rename_sheets(wb, replacer) if deep_clean else {}
+    # Sheet names can carry PII ("Smith Family") but can't contain [ or ] and
+    # max out at 31 characters, so they get the bracket-free token form (or a
+    # unique SHEET_<id> if that won't fit). The key file records every rename,
+    # so restore is exact. References to the old name in formulas, defined
+    # names, and pivot sources are rewritten to match.
+    if sheet_restore:
+        renames = {cur: orig for cur, orig in sheet_restore.items() if cur in wb.sheetnames}
+    elif deep_clean:
+        renames = _anonymized_sheet_titles(wb, replacer)
+    else:
+        renames = {}
+    _apply_sheet_renames(wb, renames)
     wb.save(str(staged))
 
     def structured(name: str, xml: str, r: Replacer) -> str:
@@ -349,6 +364,7 @@ def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
         layers_cleaned=["xlsx_cells"] + layers,
         formula_warnings=formula_warnings,
         bytes_written=out_path.stat().st_size,
+        sheet_titles={new: old for old, new in renames.items()} if deep_clean else {},
     )
 
 
@@ -362,29 +378,38 @@ _BAD_SHEET_CHARS = re.compile(r"[\[\]:*?/\\']")
 _BRACKETED_ID = re.compile(r"\[([A-Z]+_[0-9A-F]{12})\]")
 
 
-def _rename_sheets(wb, replacer: Replacer) -> dict[str, str]:
-    """Replace PII in sheet titles with bracket-free tokens. Returns old -> new."""
+def _anonymized_sheet_titles(wb, replacer: Replacer) -> dict[str, str]:
+    """old title -> new title for every sheet whose title contains PII."""
     renames: dict[str, str] = {}
     taken = {ws.title for ws in wb.worksheets}
+    reserved: Optional[set[str]] = None
     for ws in wb.worksheets:
         old = ws.title
         new = apply(old, replacer)
         if new == old:
             continue
-        new = _BAD_SHEET_CHARS.sub("_", _BRACKETED_ID.sub(r"\1", new))[:31] or "Sheet"
-        base, i = new, 1
-        while new in taken:
-            suffix = f"_{i}"
-            new = base[: 31 - len(suffix)] + suffix
-            i += 1
+        new = _BAD_SHEET_CHARS.sub("_", _BRACKETED_ID.sub(r"\1", new)).strip()
+        if not new or len(new) > 31 or new in taken:
+            # Never truncate through a token. A unique, restorable name instead.
+            if reserved is None:
+                reserved = ids.load_reserved()
+            new = f"SHEET_{ids.new_id(lambda c: c in reserved)}"
         taken.discard(old)
         taken.add(new)
         renames[old] = new
-    for old, new in renames.items():
-        wb[old].title = new
     if renames:
         log.info("xlsx sheet titles anonymized: %d", len(renames))
     return renames
+
+
+def _apply_sheet_renames(wb, renames: dict[str, str]) -> None:
+    # Two phases so A->B, B->A style swaps can't collide mid-way.
+    temp = {}
+    for i, old in enumerate(renames):
+        wb[old].title = f"__docanon_tmp_{i}"
+        temp[f"__docanon_tmp_{i}"] = renames[old]
+    for t, final in temp.items():
+        wb[t].title = final
 
 
 def _rewrite_sheet_refs(xml: str, renames: dict[str, str]) -> str:
@@ -393,7 +418,8 @@ def _rewrite_sheet_refs(xml: str, renames: dict[str, str]) -> str:
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     for old, new in renames.items():
-        quoted_new = text_safe(f"'{new}'!")
+        # Inside a formula reference an apostrophe is written twice: 'O''Brien'!A1
+        quoted_new = text_safe("'" + new.replace("'", "''") + "'!")
         oq = old.replace("'", "''")
         for o in {oq, text_safe(oq), xml_escape(oq)}:
             xml = xml.replace(f"'{o}'!", quoted_new)
@@ -412,6 +438,39 @@ def _protect_cell_values(name: str) -> bool:
 
 
 _NUMERIC_NODE_RE = re.compile(r"[\s\d.,:+\-]*")
+_ATTR_RE = re.compile(r"""([\w:.-]+)\s*=\s*("[^"]*"|'[^']*')""")
+_ELEMENT_RE = re.compile(r"</?\s*([\w:.-]+)")
+# Attribute values that are coordinates, indexes, or identifiers. PII never
+# legitimately lives there, and rewriting them breaks the file.
+_STRUCTURAL_ATTRS = {"r", "ref", "sqref", "spans", "s", "t", "type", "count", "uniquecount"}
+
+
+def _local(name: str) -> str:
+    return name.split(":")[-1].lower()
+
+
+def _markup_span_ok(text: str, lt: int, s0: int, e0: int) -> bool:
+    """May the raw pass rewrite text[s0:e0], which sits inside the tag at lt?
+
+    Only inside a non-structural attribute value (author, title, Target,
+    name...), and only for values of 4+ characters that are not short
+    numbers. Never element/attribute names, coordinates (r="B7"), ids, or
+    Word revision ids (rsid).
+    """
+    matched = text[s0:e0]
+    if len(matched) < 4 or is_short_number(matched):
+        return False
+    gt = text.find(">", e0)
+    tag = text[lt:(gt + 1 if gt != -1 else len(text))]
+    el = _ELEMENT_RE.match(tag)
+    if el and _local(el.group(1)).startswith("rsid"):
+        return False
+    rs, re0 = s0 - lt, e0 - lt
+    for m in _ATTR_RE.finditer(tag):
+        if m.start(2) + 1 <= rs and re0 <= m.end(2) - 1:
+            attr = _local(m.group(1))
+            return not (attr in _STRUCTURAL_ATTRS or attr.startswith("rsid") or attr.endswith("id"))
+    return False
 
 
 def _apply_raw(text: str, replacer: Replacer, protect_v: bool = False) -> str:
@@ -419,10 +478,13 @@ def _apply_raw(text: str, replacer: Replacer, protect_v: bool = False) -> str:
 
     By the time this runs, real document text has been handled by the
     format-aware passes. What is left is hidden layers (metadata, formula
-    literals, alt text) - and markup. A short number such as a grade "94"
-    must never be written into markup (row r="94", cell r="A94", style ids)
-    or into a number-only data node (word counts, drawing offsets). Letters
-    and long numbers (phones, SSNs) are still replaced everywhere.
+    literals, alt text) - and markup. Rules:
+      - inside a tag: only non-structural attribute values (_markup_span_ok)
+      - xlsx <v> cell values: never (numbers and shared-string indexes)
+      - formulas (<f>, <definedName>): only inside "string literals" - never
+        a reference (B7, A94) or operand
+      - number-only nodes (word counts, offsets): never a short number
+    Letters and long numbers (phones, SSNs) are replaced everywhere else.
     """
     spans = replacer.find(text)
     if not spans:
@@ -431,16 +493,32 @@ def _apply_raw(text: str, replacer: Replacer, protect_v: bool = False) -> str:
     for s0, e0, r in spans:
         lt, gt = text.rfind("<", 0, s0), text.rfind(">", 0, s0)
         if lt > gt:                                   # inside a tag
-            if is_short_number(text[s0:e0]):
+            if not _markup_span_ok(text, lt, s0, e0):
                 continue
         else:
             a = gt + 1
-            if protect_v and text[max(0, a - 3):a] == "<v>":
+            open_lt = text.rfind("<", 0, a)
+            el = _ELEMENT_RE.match(text, open_lt) if open_lt != -1 else None
+            element = _local(el.group(1)) if el else ""
+            if protect_v and element == "v":
                 continue
-            b = text.find("<", e0)
-            node = text[a:(b if b != -1 else len(text))]
-            if is_short_number(text[s0:e0]) and _NUMERIC_NODE_RE.fullmatch(node):
-                continue
+            if element in ("f", "definedname"):
+                # Formula syntax (cells and defined names). PII can only live
+                # in a "string literal"; outside quotes everything is a
+                # reference or operator (B7, A94, 2).
+                before = text[a:s0].replace("&quot;", '"')
+                in_string = before.count('"') % 2 == 1
+                if not in_string:
+                    if not getattr(replacer, "restoring", False):
+                        continue
+                    # Restoring a token that named a sheet: inside 'quoted'!
+                    # references an apostrophe must be doubled (O''Brien).
+                    r = r.replace("&apos;", "&apos;&apos;").replace("'", "''")
+            if is_short_number(text[s0:e0]):
+                b = text.find("<", e0)
+                node = text[a:(b if b != -1 else len(text))]
+                if element == "v" or _NUMERIC_NODE_RE.fullmatch(node):
+                    continue
         keep.append((s0, e0, r))
     return splice(text, keep)
 

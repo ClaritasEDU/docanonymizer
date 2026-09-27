@@ -18,7 +18,9 @@ the report counts it as "relabeled" so the operator can glance at it.
 
 Anything that looks like one of our identifiers but is NOT in the selected
 keys (a typo, a truncated ID, a key that wasn't selected) is left untouched
-and listed as unresolved. Nothing is guessed.
+and listed as unresolved. Nothing is guessed. As a final safety net, any
+known ID still present after the scan (glued inside some other token) is
+also listed, so a miss is never silent.
 
 Legacy (v1.3) keys used 4-char IDs shared across an entity's tags. Those are
 matched only with their tag present ([PERSON_3A4F] / PERSON_3A4F) - a bare
@@ -50,14 +52,16 @@ _KEY_PLACEHOLDER_RE = re.compile(r"\[([A-Z]+)_([0-9A-F]+)\]")
 # Tolerant token grammar. Alternatives are tried left to right at each
 # position; the regex scans the text once.
 #   br - bracketed:  [TAG_HEX]  \[TAG\_HEX\]  [ tag_hex ]
-#   nb - no brackets: TAG_HEX   TAG\_HEX
+#   nb - no brackets: TAG_HEX   TAG\_HEX   __TAG_HEX__ (markdown)   TAG_HEX_email
 #   xh - bare 12-char hex
 _TAG = r"[A-Za-z][A-Za-z_]{1,30}"
 _TOKEN_RE = re.compile(
     rf"(?P<br>\\?\[[ \t]*(?P<bt>{_TAG})\\?_(?P<bh>[0-9A-Fa-f]{{4,16}})[ \t]*\\?\])"
-    rf"|(?<![0-9A-Za-z_])(?P<nb>(?P<nt>{_TAG})\\?_(?P<nh>[0-9A-Fa-f]{{4,16}}))(?![0-9A-Za-z_])"
-    rf"|(?<![0-9A-Za-z])(?P<xh>[0-9A-Fa-f]{{{HEX_LEN}}})(?![0-9A-Za-z_])"
+    rf"|(?<![0-9A-Za-z])(?P<nb>(?P<nt>{_TAG})\\?_(?P<nh>[0-9A-Fa-f]{{4,16}}))(?![0-9A-Fa-f])"
+    rf"|(?<![0-9A-Za-z])(?P<xh>[0-9A-Fa-f]{{{HEX_LEN}}})(?![0-9A-Za-z])"
 )
+_ANY_ID_RE = re.compile(rf"(?=([0-9A-Fa-f]{{{HEX_LEN}}}))")
+_SHEET_ID_RE = re.compile(r"SHEET_([0-9A-F]{12})")
 
 
 @dataclass
@@ -66,6 +70,7 @@ class KeyIndex:
     legacy: dict[tuple[str, str], str] = field(default_factory=dict)          # (TAG, HEX4) -> original
     key_names: list[str] = field(default_factory=list)
     legacy_ambiguous: int = 0      # v1.3 placeholders that pointed at 2+ values
+    sheet_titles: dict[str, str] = field(default_factory=dict)   # anonymized -> original
 
     @property
     def size(self) -> int:
@@ -87,6 +92,22 @@ def build_index(keys: Iterable[tuple[str, dict]]) -> KeyIndex:
         if not isinstance(rmap, dict):
             raise ValueError(f"key {name}: replacement_map is not an object")
         idx.key_names.append(name)
+        titles = payload.get("sheet_titles") or {}
+        if isinstance(titles, dict):
+            for new, old in titles.items():
+                if not isinstance(new, str) or not isinstance(old, str):
+                    continue
+                if idx.sheet_titles.get(new, old) != old:
+                    raise KeyConflictError(
+                        f"sheet '{new}' has different original titles in two keys "
+                        f"(one is {name}). Select only the key(s) this output came from."
+                    )
+                idx.sheet_titles[new] = old
+                m = _SHEET_ID_RE.fullmatch(new)
+                if m and m.group(1) not in idx.by_hex:
+                    # "SHEET_<id>" in an AI answer restores to the real title.
+                    idx.by_hex[m.group(1)] = ("SHEET", old)
+                    hex_owner[m.group(1)] = name
         # Longest original first, so a legacy placeholder shared by
         # "Jane Smith" and "Jane" resolves to the fuller value.
         for original, placeholder in sorted(rmap.items(), key=lambda kv: -len(kv[0])):
@@ -158,6 +179,8 @@ class RestoreReport:
 class TokenRestorer:
     """Replacer (see replacer.py) that maps identifiers back to originals."""
 
+    restoring = True   # scrubber: a token is never a cell reference
+
     def __init__(self, index: KeyIndex, escape_xml: bool = False):
         self.index = index
         self.escape_xml = escape_xml
@@ -203,15 +226,21 @@ class TokenRestorer:
             return []
         spans: list[Span] = []
         seen_unresolved = set(report.unresolved) if report else set()
+        covered = bytearray(len(text)) if report is not None else None
+
+        def note_unresolved(tok: str) -> None:
+            report.unresolved_count += 1
+            if tok not in seen_unresolved:
+                seen_unresolved.add(tok)
+                report.unresolved.append(tok)
+
         for m in _TOKEN_RE.finditer(text):
             original, key_tag, flags = self._resolve(m)
+            if covered is not None and (original is not None or flags.get("report")):
+                covered[m.start():m.end()] = b"\x01" * (m.end() - m.start())
             if original is None:
                 if report is not None and flags.get("report"):
-                    report.unresolved_count += 1
-                    tok = m.group(0)
-                    if tok not in seen_unresolved:
-                        seen_unresolved.add(tok)
-                        report.unresolved.append(tok)
+                    note_unresolved(m.group(0))
                 continue
             spans.append((m.start(), m.end(),
                           xml_escape(original) if self.escape_xml else original))
@@ -222,6 +251,15 @@ class TokenRestorer:
                     report.relabeled += 1
                 if flags.get("untagged"):
                     report.untagged += 1
+        if report is not None:
+            # Safety net: a known ID glued inside some other token
+            # ("xPERSON_3A4F9C2B1D0E9") was not restored - say so.
+            for m in _ANY_ID_RE.finditer(text):
+                p0 = m.start()
+                if covered[p0] or self.index.by_hex.get(m.group(1).upper()) is None:
+                    continue
+                covered[p0:p0 + HEX_LEN] = b"\x01" * HEX_LEN
+                note_unresolved(m.group(1))
         return spans
 
     def for_raw_xml(self) -> "TokenRestorer":

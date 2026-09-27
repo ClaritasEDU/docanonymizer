@@ -78,7 +78,8 @@ def restore_file(input_path: Path, index: KeyIndex, display_name: str = "") -> R
 
     try:
         if suffix in ("xlsx", "xls", "ods"):
-            result = scrub_xlsx(extracted.working_path, restorer, out_path, deep_clean=False)
+            result = scrub_xlsx(extracted.working_path, restorer, out_path, deep_clean=False,
+                                sheet_restore=index.sheet_titles)
         elif suffix in ("docx", "doc", "odt"):
             result = scrub_docx(extracted.working_path, restorer, out_path, deep_clean=False)
         elif suffix == "csv":

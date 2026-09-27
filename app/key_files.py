@@ -12,7 +12,8 @@ Schema:
   "pii_types_scrubbed": [...],
   "entity_registry":  {"3A4F9C2B1D0E": {"types": ["PERSON"], "values": {...},
                                         "linked_to": "<id>" (optional)}},
-  "replacement_map":  {"Jane Smith": "[PERSON_3A4F9C2B1D0E]", ...}
+  "replacement_map":  {"Jane Smith": "[PERSON_3A4F9C2B1D0E]", ...},
+  "sheet_titles":     {"ORG_B9442179E0EE": "Smith Family"}   (XLSX only, optional)
 }
 
 `id_format` is "hex12" for current keys (one unique 12-char ID per value).
@@ -53,6 +54,7 @@ def save_key_file(
     endpoint: dict,
     pii_types_scrubbed: list[str],
     registry: EntityRegistry,
+    sheet_titles: Optional[dict[str, str]] = None,
 ) -> Path:
     payload = {
         "session_id": session_id,
@@ -66,6 +68,9 @@ def save_key_file(
         "entity_registry": registry.as_serializable(),
         "replacement_map": registry.as_replacement_map(),
     }
+    if sheet_titles:
+        # anonymized sheet title -> original (restore puts the exact title back)
+        payload["sheet_titles"] = dict(sheet_titles)
     stem = Path(original_filename).stem or "document"
     name = f"{stem}_{session_id}.key.json"
     path = KEYS_DIR / name
@@ -74,7 +79,7 @@ def save_key_file(
     log.info("key file saved: %s ids=%d", path.name, len(registry.entities))
     # The IDs are now released - make sure they are never issued again, even
     # if this key file is later moved out of /keys.
-    ids.record_issued(registry.entities.keys())
+    ids.record_issued(ids.ids_in_key_payload(payload))
     return path
 
 

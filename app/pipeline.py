@@ -247,6 +247,7 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None) -> 
                 endpoint=sess.endpoint,
                 pii_types_scrubbed=sorted(sess.registry.counts_per_type().keys()),
                 registry=sess.registry,
+                sheet_titles=result.sheet_titles,
             )
     except Exception as exc:
         # An output that can't be verified is never released. Without this,

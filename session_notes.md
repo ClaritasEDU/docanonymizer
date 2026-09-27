@@ -640,7 +640,54 @@ assigned must be unique."
   md/csv/xlsx/docx restores incl. split runs and `&`/`<` escaping, numeric
   cells, sheet-name round trip), `test_restore_api.py` (routes + the full
   spreadsheet -> AI -> restore flow through the API).
-- Live browser (Playwright + real Flask + mock Ollama): 52/52 checks - the
+- Live browser (Playwright + real Flask + mock Ollama): 53/53 checks - the
   whole flow clicked through as an operator would, clipboard contents,
-  downloads, key import, legacy key, errors, 375px layout, zero requests
-  off localhost, uploads/ empty afterwards, no PII in the log.
+  downloads, key import, legacy key, errors, zero requests off localhost,
+  uploads/ empty afterwards, no PII in the log. Owner note: primary use is
+  PC/Mac desktop, not mobile - desktop viewport is the target.
+
+### Independent review round (same session)
+
+An adversarial review agent re-ran everything with its own repro scripts.
+Confirmed and fixed:
+
+1. PII shaped like a token (`MRN_000123456789`, or any 12-digit number) was
+   treated as "ours" by shape and shipped while verification passed.
+   Protection is now by exact placeholder from this run's map.
+2. Comma lists (`204518,78704`) were read as thousands separators and
+   leaked. Whole-number logic now looks at the full numeric run: one
+   formatted number vs. a list.
+3. Sheet titles truncated at 31 chars could cut through a token and never
+   restore; duplicate suffixes broke the token. Key file now records
+   `sheet_titles` (exact originals); overflow/collisions get `SHEET_<id>`.
+4. Restoring an apostrophe sheet name wrote `'O'Brien'!` (invalid). Now
+   doubled in formula context on both restore paths.
+5. `__PERSON_X__`, `PERSON_X_email`, `PERSON_Xs` restored nothing and said
+   nothing. Grammar widened; any known ID left over is now reported.
+6. Short texty values (`B7`, `A1`) were written into cell coordinates and
+   Word rsids. Raw pass now writes only into non-structural attribute
+   values, and formulas only inside string literals (also covers the web
+   agent's finding that a grade 94 rewrote `A94*2`).
+7. Sheet titles were never sent to detection or verification. Extraction
+   now includes a `Sheet: <title>` line.
+Plus: non-object JSON to /api/unanonymize/text returned 500, now 400.
+
+Performance after all fixes: 5,000 rows / 20,000 values scrubs in 3.7s and
+verifies in 1.3s. pytest: 163 passing. Browser: 53/53.
+
+### Open issues / known limits
+
+- A comma list whose items are all exactly 3 digits (`101,102`) reads as a
+  formatted number, so a 3-digit value in such a list is not matched.
+- Restoring by token (a key without `sheet_titles`, e.g. hand-made) cannot
+  shorten a restored title that exceeds 31 chars; keys this app writes
+  always carry `sheet_titles`, so this only affects imported keys.
+- XLSX charts and images are dropped by the openpyxl round trip (pre-existing).
+- Sessions still live in server memory until restart (pre-existing).
+
+### Next steps
+
+1. Operator run on a real spreadsheet with the local LLM, then paste the
+   output into an AI tool and restore the answer.
+2. Web edition (`web/index.html`) is being brought to the same rules; see
+   the follow-up entry.

@@ -250,3 +250,10 @@ def test_two_spreadsheets_never_share_an_id():
     assert ka["id_format"] == kb["id_format"] == "hex12"
     assert not set(ka["entity_registry"]) & set(kb["entity_registry"])
     assert len(ka["entity_registry"]) == len(kb["entity_registry"]) == 40
+
+
+
+def test_restore_text_rejects_non_object_json():
+    c = _client()
+    for body in ([1], "text", 5):
+        assert c.post("/api/unanonymize/text", json=body).status_code == 400

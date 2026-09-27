@@ -191,9 +191,11 @@ Each connection stores:
 
 ### 5.3 Replacement Application
 - Single pass, leftmost-longest: scanning left to right, the longest original starting at a position wins (prevents "Jane" replacing before "Jane Smith"). All originals are compiled into one trie-shaped pattern, so a text is scanned once (linear, not values x cells)
-- Existing placeholders are never rewritten - a short value like "2B1D" can't match inside `[PERSON_3A4F9C2B1D0E]`
-- Short numbers (no letters, under 7 digits: grades, room numbers, ZIPs) match only as whole numbers - "94" does not match in 1945, 94.5, 1,945, or a spreadsheet row index. Longer numbers keep substring matching
+- The run's own placeholders are never rewritten - a short value like "2B1D" can't match inside `[PERSON_3A4F9C2B1D0E]`. Protection is by exact placeholder, not by shape, so PII shaped like a token (`MRN_000123456789`) is still replaced
+- Two stages: letter-bearing originals (and long numbers) first, leftmost-longest; then short numbers (no letters, under 7 digits: grades, room numbers, ZIPs) in the gaps, each only as a whole number - not glued to letters/digits (1945, A94, 94th), not part of one formatted number (1,945 / 94.5 / 10.0.94.1), but each item of a comma list (204518,78704) counts. Longer numbers keep substring matching
 - XLSX cells stored as numbers or dates are matched on the same text the model saw and become text cells when replaced
+- XLSX sheet titles are part of the extracted text (`Sheet: <title>` line when the workbook has several sheets or a non-default title). A title with PII becomes the bracket-free token form, or `SHEET_<unique id>` when it won't fit 31 characters; references follow; the key records `sheet_titles` so restore is exact
+- The raw XML pass writes only into text and non-structural attribute values: never coordinates (`r="B7"`), ids, rsids, cell values, or formula references - formulas change only inside "string literals"
 - Replace ALL occurrences of each PII string, including in headers, footers, tables, metadata
 - Case-sensitive matching (LLM is instructed to return text exactly as it appears)
 - If the same string appears in multiple PII categories (edge case), the first-matched category wins

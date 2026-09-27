@@ -7,20 +7,34 @@ import time
 
 
 def _brute(text, mapping):
-    """Reference leftmost-longest scanner (short numbers: whole numbers only)."""
+    """Reference scanner: letter-bearing originals leftmost-longest, then
+    short numbers in the remaining gaps, whole numbers only."""
     from app.replacer import _number_boundary_ok, is_short_number
-    words = sorted(mapping, key=len, reverse=True)
-    out, i = [], 0
+    texty = sorted((w for w in mapping if not is_short_number(w)), key=len, reverse=True)
+    numbers = sorted((w for w in mapping if is_short_number(w)), key=len, reverse=True)
+    out, used, i = [], [False] * len(text), 0
     while i < len(text):
-        for w in words:
-            if text.startswith(w, i) and (
-                    not is_short_number(w) or _number_boundary_ok(text, i, i + len(w))):
+        for w in texty:
+            if text.startswith(w, i):
                 out.append((i, i + len(w), mapping[w]))
+                for k in range(i, i + len(w)):
+                    used[k] = True
                 i += len(w)
                 break
         else:
             i += 1
-    return out
+    for i in range(len(text)):
+        if used[i]:
+            continue
+        for w in numbers:
+            e = i + len(w)
+            if (text.startswith(w, i) and not any(used[i:e])
+                    and _number_boundary_ok(text, i, e)):
+                out.append((i, e, mapping[w]))
+                for k in range(i, e):
+                    used[k] = True
+                break
+    return sorted(out)
 
 
 def test_matches_reference_on_random_inputs():
@@ -130,7 +144,31 @@ def test_short_numbers_match_whole_numbers_only():
     assert apply("scored 94; gave 1945; 94.5 avg; 1,945 total; 194; 94", r) == \
         "scored [G]; gave 1945; 94.5 avg; 1,945 total; 194; [G]"
     assert apply("GPA 3.87 vs 13.87 vs 3.875", r) == "GPA [P] vs 13.87 vs 3.875"
-    assert apply("Grade94 (94)", r) == "Grade[G] ([G])"
+    assert apply("Grade94 (94) 94th A94 $B$94 94%", r) == "Grade94 ([G]) 94th A94 $B$94 [G]%"
+
+
+def test_comma_lists_are_lists_not_thousands():
+    """204518,78704 is two values; 1,945 is one number (review finding 2)."""
+    from app.replacer import LiteralReplacer, apply
+    r = LiteralReplacer({"204518": "[S1]", "204519": "[S2]", "78704": "[Z]", "94": "[G]",
+                         "87": "[H]", "945": "[X]"})
+    assert apply("Jane,204518,78704\nSibling IDs: 204518,204519", r) == \
+        "Jane,[S1],[Z]\nSibling IDs: [S1],[S2]"
+    assert apply("scores 94,87,100.", r) == "scores [G],[H],100."
+    assert apply("gift $1,945 and 1,945.50 and ip 10.0.94.1", r) == \
+        "gift $1,945 and 1,945.50 and ip 10.0.94.1"
+
+
+def test_pii_shaped_like_a_token_is_still_replaced_and_verified(tmp_path):
+    """Protection covers only this map's own placeholders (review finding 1)."""
+    from app.replacer import LiteralReplacer, apply
+    from app.verifier import verify_output
+    rmap = {"MRN_000123456789": "[ID_A1B2C3D4E5F6]", "Jane Smith": "[PERSON_3A4F9C2B1D0E]"}
+    assert apply("Patient Jane Smith, MRN_000123456789", LiteralReplacer(rmap)) == \
+        "Patient [PERSON_3A4F9C2B1D0E], [ID_A1B2C3D4E5F6]"
+    leaky = tmp_path / "o.txt"
+    leaky.write_text("Patient [PERSON_3A4F9C2B1D0E], MRN_000123456789")
+    assert not verify_output(leaky, rmap).passed
 
 
 def test_long_numbers_still_match_inside_longer_forms():
@@ -147,6 +185,22 @@ def test_is_short_number():
     assert not is_short_number("5125550101")       # 10 digits
     assert not is_short_number("A+") and not is_short_number("Apt 4")
     assert not is_short_number("")
+
+
+def test_raw_xml_pass_leaves_coordinates_ids_and_formulas_alone():
+    """Review finding 6 + web agent finding: B7 must not hit <c r="B7">, A1 must
+    not hit an rsid, and a grade 94 must not rewrite the formula A94*2."""
+    from app.replacer import LiteralReplacer
+    from app.scrubber import _apply_raw
+    r = LiteralReplacer({"B7": "[ID_B7B7B7B7B7B7]", "A1D8": "[ID_A1D8A1D8A1D8]",
+                         "94": "[GRADE_5C94AB01DE2F]", "Jane Smith": "[PERSON_3A4F9C2B1D0E]"})
+    xml = ('<c r="B7" s="3"><f>A94*2</f></c><w:rsid w:val="00A1D8D"/>'
+           '<w:p w:rsidR="00A1D8D2"/><Relationship Id="A1D8" Target="x"/>'
+           '<w:comment w:author="Jane Smith"/><f>"Jane Smith"&amp;B7</f>')
+    assert _apply_raw(xml, r) == (
+        '<c r="B7" s="3"><f>A94*2</f></c><w:rsid w:val="00A1D8D"/>'
+        '<w:p w:rsidR="00A1D8D2"/><Relationship Id="A1D8" Target="x"/>'
+        '<w:comment w:author="[PERSON_3A4F9C2B1D0E]"/><f>"[PERSON_3A4F9C2B1D0E]"&amp;B7</f>')
 
 
 def test_raw_xml_pass_never_writes_short_numbers_into_markup():

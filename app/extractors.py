@@ -194,12 +194,20 @@ def _extract_csv(path: Path) -> ExtractResult:
     )
 
 
+_DEFAULT_SHEET_RE = re.compile(r"Sheet\d*")
+
+
 def _extract_xlsx(path: Path) -> ExtractResult:
     from openpyxl import load_workbook  # local import keeps cold-start fast
 
     wb = load_workbook(filename=str(path), data_only=True)
     text_parts: list[str] = []
+    # Sheet titles can carry PII ("Smith Family"), so they go to detection
+    # and verification. A lone default-named sheet adds no header line.
+    show_titles = len(wb.worksheets) > 1 or not _DEFAULT_SHEET_RE.fullmatch(wb.worksheets[0].title)
     for ws in wb.worksheets:
+        if show_titles:
+            text_parts.append(f"Sheet: {ws.title}")
         for row in ws.iter_rows(values_only=True):
             cells = [str(c) if c is not None else "" for c in row]
             text_parts.append("\t".join(cells))
