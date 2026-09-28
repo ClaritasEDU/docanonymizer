@@ -1,7 +1,7 @@
 # Business Spec: Doc Anonymizer
 
-**Last updated:** 2026-09-27  
-**Status:** v1.4 - unique 12-character identifiers and the AI round trip (anonymize -> analyze in any AI tool -> restore the answer) are built and tested
+**Last updated:** 2026-09-28  
+**Status:** v1.4 - unique 12-character identifiers and the AI round trip (anonymize -> analyze in any AI tool -> restore the answer) are built and tested. v1.5 adds lifelong community identifiers for spreadsheets, issued by Family Graph (built and tested on branch claude/gracious-archimedes-8xhkgx, 284 tests passing)
 
 ---
 
@@ -20,7 +20,7 @@ A locally-hosted web app that runs entirely on the user's machine. It accepts an
 The core flow the owner uses it for:
 
 1. Add a spreadsheet (or any document).
-2. Names, emails, phone numbers, addresses (and the other PII categories) become unique 12-character hex identifiers like `[PERSON_3A4F9C2B1D0E]`.
+2. Names, emails, phone numbers, addresses (and the other PII categories) become unique 12-character hex identifiers like `[PERSON_3A4F9C2B1D0E]`. With Family Graph connected, the people and households on a spreadsheet get their lifelong community ids instead (`[I…]`, `[F…]`) - see Community Identifiers below.
 3. See the anonymized output on screen, verified clean.
 4. Paste it into any AI tool for analysis.
 5. Bring the AI's answer back. Every identifier becomes the real value again - with no chance of mixing up two people, two addresses, or two phone numbers.
@@ -83,7 +83,7 @@ the cloud, by construction.
 - Legal contracts under NDA cannot be sent externally
 - Student records (grades, IEP status, medical accommodations) carry strict handling requirements under FERPA and IDEA
 
-A local tool with no external dependencies satisfies all of these constraints by construction, not by policy. The only permitted external network call is the GitHub push, and only when the operator explicitly initiates it with a verified-clean file.
+A local tool with no external dependencies satisfies all of these constraints by construction, not by policy. The only permitted external network call is the GitHub push, and only when the operator explicitly initiates it with a verified-clean file. Family Graph, when connected, is not an external call: its URL must be localhost or a private LAN address, with no override.
 
 ---
 
@@ -128,9 +128,29 @@ Differences from the local app, accepted as scope:
 
 ---
 
+## Community Identifiers (added 2026-09-28)
+
+The owner's goal: every community member a spreadsheet surfaces (school rosters, parishioner lists) gets one lifelong identifier - `I` + 16 hex for the person, `F` + 16 hex for the household - and the same human is never issued a second one in any product (Family Graph, Doc Anonymizer, MissionIQ, later ParentPoint and TeacherAIde). Two humans never share one.
+
+The product contract:
+
+- **Family Graph is the only minter.** Doc Anonymizer never mints identity. For a tabular file (xlsx, xls, ods, csv) it asks Family Graph whether each person and household already exists. Every other format makes zero Family Graph calls.
+- **Obvious cases are automatic, anything uncertain goes to a person.** Family Graph's strict matching decides the clear matches and clear non-matches. Everything else shows up in the preview as a card with [ SAME PERSON ] / [ NEW PERSON ] / [ NOT A PERSON ] (households: SAME / NEW HOUSEHOLD). [ CONFIRM AND SCRUB ] stays disabled until every card is answered. A one-column sheet is only sent when its header is a person-name header, and every name on it is a review item, never automatic.
+- **Nothing is minted until the operator confirms.** The preview runs a dry-run plan that writes nothing. On confirm, the commit goes to Family Graph first, then the scrub runs.
+- **No silent fallback.** If Family Graph is unreachable or too slow, the app says so. Going ahead without community ids is an explicit [ CONTINUE WITHOUT COMMUNITY IDS ] choice.
+- **Retry safe.** Every commit carries an idempotency key, so a resend never writes twice. If the outcome is unknown (timeout, dropped connection, 5xx) the file is frozen: decisions cannot change, and the only ways on are resending the identical request or cancelling the file. Decisions Family Graph reports as stale are dropped and the operator is told why.
+- **What gets which id.** Name cells become `[I…]`. Surname cells, free-text mentions, emails, phones, and addresses keep their per-value tokens. A household column becomes `[F…]`, or a FAMILY_ID column is appended and removed again on restore. Formula cells are reported, not rewritten.
+- **Restore.** The key file adds the identity registry, the identity cells, and the community source (Family Graph host name, import run ids, category, commit time). The anonymized file restores cell by cell, exactly. AI text restores community ids even when lowercased, un-bracketed, escaped, or reduced to bare hex, but only when a selected key actually holds community ids. If Family Graph later merges two records, the losing id becomes a permanent alias of the winner, so older files still restore and still look up.
+- **Connection and secrets.** The [ FAMILY GRAPH - COMMUNITY IDS ] panel takes a URL and an API key, stored in `familygraph.json` (0600, gitignored). The key is never shown again or logged, and it carries only Family Graph's `roster` scope (issued with `family-graph issue-key docanonymizer roster`). Changing the URL requires re-entering the key. Proxy settings are ignored for these calls.
+- **Web safety.** The app listens on 127.0.0.1 only, answers only to a localhost Host header (DNS rebinding), and refuses any state-changing request that is not same-origin.
+- **Deployment.** Family Graph and Doc Anonymizer run together on one local Spark server inside the firewall. Doc Anonymizer stays on 127.0.0.1, so the operator reaches it through an SSH tunnel. Logs hold counts, HTTP status, and timings only - never names, ids, candidate data, or document text.
+- **Timeouts.** `FAMILYGRAPH_TIMEOUT_S` for quick calls (default 10 s) and `FAMILYGRAPH_ROSTER_TIMEOUT_S` for plan and commit (default 600 s). A 2,000-row roster took Family Graph about 9 seconds to plan in testing (longer on a small machine), and it holds its other requests until it finishes.
+
+---
+
 ## Operational Decisions (resolved during implementation)
 
-The PRD listed six open questions. Three are resolved as built; three are deferred to v2.
+The PRD listed six open questions. All six are resolved as built (items 1-6), followed by later decisions; two items are deferred to v2.
 
 **Resolved:**
 

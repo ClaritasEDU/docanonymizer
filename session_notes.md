@@ -821,3 +821,39 @@ real problems.
 ### Next steps
 
 1. Family Graph side: make roster commit idempotent per `source_ref` so a retried commit after a client timeout is a no-op.
+
+## Session 008 (continued) - 2026-09-28 - Retry-safe commits, same-origin guard, bug hunt and fix pass
+
+The earlier entry's next step is done, and the answer changed its "press confirm again" advice. Then a full bug hunt across Family Graph and this app, with every finding checked by independent skeptics, and a fix pass.
+
+### What was built or changed
+
+- **Retry-safe commit.** Every commit to Family Graph carries `idempotency_key = docanon:<session>:<first 32 hex of the sha256 of the commit body>`. Family Graph stores the result for 7 days per caller. Same key and same request replays the stored result and writes nothing; same key with a different request is a 409 `idempotency_conflict`.
+- **Frozen file.** When the outcome is unknown (read timeout, dropped connection, 5xx) the file goes to `commit_unknown`. Decisions can't change. The only ways on are resending the identical request byte for byte (Family Graph replays) or cancelling the file. A request that was never sent (connection refused, not configured) does not freeze. If the Family Graph URL or key changed since the first send, the resend is refused and the file stays frozen, because Family Graph replays only for the same caller.
+- **Stale decisions.** A decision Family Graph says no longer answers the current question (a `create` where the plan now finds a definitive match, or a repeat of an earlier commit) is dropped, the item asks again, and the operator is told why. On a frozen resend, stale decisions keep the file frozen since they can mean the first send was written.
+- **Same-origin guard.** The Host header must be 127.0.0.1, localhost or ::1 (DNS rebinding). Every state-changing request must be same-origin by Origin or Referer and Sec-Fetch-Site. `POST /api/familygraph` requires JSON. Changing the Family Graph scheme, host or port requires re-entering the key, so the stored key never follows a new URL.
+- **Roster-only key.** Doc Anonymizer's key now needs only the `roster` scope (`family-graph issue-key docanonymizer roster`). The old "needs pii.read and import" messages are gone; a 403 names the command to fix it.
+- **Tabular-only guarantee, in tests.** PDF, DOCX, PPTX, scans/OCR and text make zero Family Graph calls and produce the same output and key shape connected or not.
+- **Spreadsheet edge cases.** Merged cells, formula cells (reported, not rewritten), blank households (labelled from their members), kept names in a shared couple or list cell (that cell falls back to per-value tokens), CSV row padding, and surnames inside full-name and list cells are caught.
+- **One-column lists are review only.** A one-column sheet is sent only under a person-name header (Name, Student Name, Full Name). "Ministry Name" or "Room Name" does not count. Every person on it becomes a one-click review item, never automatic.
+- **Exact restore by content.** The roster layout is picked from the uploaded file's own cells, not its filename, so a renamed file still restores exactly. Relabeled community ids restore too.
+- Session idle time counts from the last decision; results count decided people correctly; `*.tmp` is gitignored.
+- Test fixtures are regenerated from the current Family Graph by `tests/fixtures/capture_fg_fixtures.js`, and `test_fg_fixture_contract.py` fails if the two drift.
+
+### Bug hunt
+
+Eight finders (identity, rules, security, robustness, Doc Anonymizer core, privacy and flow, cross-system contract), each finding checked by independent skeptics. 40 confirmed across both repos (11 critical, 5 high, 10 medium, 14 low), 0 refuted, all fixed except the large-roster speed target on the Family Graph side. An independent review of the fix diff found 10 more (3 high), all fixed with regression tests.
+
+### Decisions / assumptions
+
+- A frozen file never unfreezes on its own. Resend or cancel is the whole menu, because anything else risks a second id for the same person.
+- The Host allow-list has no override. On the Spark server, reach Doc Anonymizer through an SSH tunnel to 127.0.0.1:5000; a LAN name or IP in the browser is refused with 403.
+
+### Tests
+
+227 -> 284 passed (193 at the start of the day). New suites `test_community_core_fixes.py`, `test_community_flow_fixes.py`, `test_community_review_fixes.py`, `test_community_stale_decisions.py`, `test_fg_fixture_contract.py`.
+
+### Next steps
+
+1. Deploy on the Spark server next to Family Graph, issue the roster key, paste it into the [ FAMILY GRAPH ] panel, and run one real roster end to end.
+2. Family Graph side: roster plan and commit still run on its request thread, so a 2,000-row roster holds other requests for about 10 s. Moving large jobs to a worker is future work.

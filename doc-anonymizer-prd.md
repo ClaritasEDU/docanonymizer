@@ -1,5 +1,5 @@
 # PRD: Local Document Anonymizer
-**Version:** 1.4 (2026-09-27: unique 12-char identifiers, AI round trip - sections 4.5, 5.1-5.3, 5.5, 5.7, 5.8)  
+**Version:** 1.4 (2026-09-27: unique 12-char identifiers, AI round trip - sections 4.5, 5.1-5.3, 5.5, 5.7, 5.8). As-built additions of 2026-09-28 (community identifiers from Family Graph) are in Appendix A  
 **Status:** Ready for Build  
 **Target:** Claude Code
 
@@ -85,7 +85,7 @@ Processing pipeline in order:
 
 1. **Extract** - pull all text and structure from the source file
 2. **Detect** - send chunks to local LLM; build the replacement map
-3. **Preview** - show the user what will be replaced before any file is written (see 4.11)
+3. **Preview** - show the user what will be replaced before any file is written (see 4.9)
 4. **Confirm** - user reviews preview and clicks `[ CONFIRM AND SCRUB ]` to proceed, or `[ CANCEL ]`
 5. **Scrub** - apply replacements and deep-clean the output file (see 5.9)
 6. **Verify** - run a post-scrub scan to confirm zero residual PII before offering download (see 5.10)
@@ -128,7 +128,7 @@ Before any file is written, the app presents a preview panel showing exactly wha
 
 **Preview panel contents:**
 - The full extracted text of the document rendered in the monospace log panel style
-- Every detected PII span highlighted inline with its proposed placeholder. Example: `Jane Smith` renders as `[PERSON_3A4F]` in `--warning` color with the original text shown in a tooltip on hover
+- Every detected PII span highlighted inline with its proposed placeholder. Example: `Jane Smith` renders as `[PERSON_3A4F9C2B1D0E]` in `--warning` color with the original text shown in a tooltip on hover
 - A summary table above the preview: count of each PII type found, total entities, total replacement instances
 - Any PII the user wants to un-mark (false positives) can be deselected via checkbox next to each highlighted span. Deselected spans are excluded from the replacement map before scrubbing proceeds.
 - `[ CONFIRM AND SCRUB ]` primary button and `[ CANCEL ]` secondary button
@@ -510,7 +510,7 @@ The app communicates with local LLM servers via a thin adapter layer. Two API st
 ## 10. Success Criteria
 
 - A user can drag in a donor list XLSX, anonymize it, share the anonymized version with an external analyst, and then fully restore the original data using only the local key file.
-- The same person's name, email, and phone all share the same hex suffix in the output.
+- Every distinct name, email, and phone gets its own identifier, never shared and never reissued across files; the key file records which ones belong together as `linked_to` (5.2 - the v1.3 shared-suffix criterion was retired 2026-09-27).
 - No bytes of the original document are transmitted outside localhost at any point. Only the anonymized output file may leave the machine, and only when the user explicitly initiates a GitHub push.
 - Post-scrub verification passes on every successful anonymize run (zero residual PII detected by both map-based and regex-based scans).
 - A DOCX file with tracked changes, comments, and revision history produces an output file with all three stripped and zero author metadata.
@@ -716,6 +716,51 @@ Max content width: 760px, centered. Page padding: 24px. Section spacing: 32px ve
 - Focus states: `outline: 2px solid --border-focus` on all interactive elements, no `outline: none`
 - All form inputs must have visible labels (not placeholder-only)
 - Light/dark toggle must work via keyboard
+
+---
+
+## Appendix A. As-Built Deviations (2026-09-28): Community Identifiers from Family Graph
+
+The PRD above predates this work. This appendix records what shipped; the original sections stay as written.
+
+**What changed and why.** A roster should give the same human the same lifelong identifier in every file, every year, and every product. Doc Anonymizer does not mint those. Family Graph (the parish and school identity registry, a separate local service, default `http://127.0.0.1:3500`) is the only minter. Doc Anonymizer asks it who is who and writes the answer into the file.
+
+**Identifier format (adds to 5.1).** `I` + 16 uppercase hex for a person, `F` + 16 uppercase hex for a household (legacy 8-hex codes still restore). They are the Family Graph code re-spelled (`p_<hex>` / `f_<hex>`). When Family Graph merges two records, the losing id becomes a permanent alias of the winner, so older files still restore. Per-value `[TAG_XXXXXXXXXXXX]` identifiers (5.1-5.3) are unchanged for everything else.
+
+**Scope.** Tabular files only (xlsx, xls, ods, csv) and only when Family Graph is configured. PDF, DOCX, PPTX, scans, and text files make zero Family Graph calls and are anonymized exactly as before; tests prove it.
+
+**Settings (adds to 4.8 and 6.1).** A `[ FAMILY GRAPH - COMMUNITY IDS ]` panel takes the Family Graph URL, an API key, and a category (school, church, other). They are stored in `familygraph.json` in the app root, 0600 and gitignored. The key is never shown again, never returned by the API, and never logged. The key needs only the `roster` scope (issued in Family Graph with `issue-key docanonymizer roster`). Changing the URL's scheme, host, or port requires re-entering the key, so a key never follows a new URL. Routes: `GET/POST/DELETE /api/familygraph` and `POST /api/familygraph/test`.
+
+**Network allowlist (adds to 6.2).** Family Graph is a third permitted destination, and it must be localhost or LAN. Unlike LLM endpoints there is no override for a public URL, because the call carries the whole roster. Proxy environment variables are ignored for these calls.
+
+**Pipeline (adds to 4.4 and 4.9).** After LLM detection the app sends the sheets to Family Graph's roster plan (`POST /api/identity/roster/plan`, a dry run that writes nothing). The preview adds a `COMMUNITY IDS` block with counts and one card per review item: `[ SAME PERSON ]` / `[ NEW PERSON ]` / `[ NOT A PERSON ]` for people, `[ SAME HOUSEHOLD ]` / `[ NEW HOUSEHOLD ]` for households. `[ CONFIRM AND SCRUB ]` stays disabled until every `[?]` is answered. `[ CONTINUE WITHOUT COMMUNITY IDS ]` is an explicit choice. If Family Graph is unreachable the preview says so and offers `[ ASK FAMILY GRAPH AGAIN ]`; it never falls back silently. Session routes: `GET /api/anonymize/<sid>/community`, `POST .../community/decide`, `.../community/skip`, `.../community/retry`.
+
+- A one-column sheet is sent only when its header is a person-name header (Name, Student Name, Full Name, ...). Every person on it becomes a review item, never automatic.
+- Decisions Family Graph reports as stale are dropped and the operator is told why.
+
+**Confirm and scrub (adds to 5.3).** On confirm the app commits to Family Graph first (`POST /api/identity/roster/commit`), then scrubs. Name cells become `[I…]`. Surname cells and free-text mentions keep per-value `[PERSON_…]` tokens. A household column becomes `[F…]`, or a `FAMILY_ID` column is appended (and removed again on exact restore). Emails, phones, and addresses keep per-value tokens. A name kept as original text stays as text in name cells; a kept name sharing a couple or list cell leaves that cell to the normal per-value treatment. Merged cells, formula cells (reported, not rewritten), and blank households (labelled from their members) are handled.
+
+**Retry safety.** Every commit carries `idempotency_key = docanon:<session>:<first 32 hex of the sha256 of the commit body>`. If the outcome is unknown (read timeout, dropped connection, 5xx) the file is frozen. Decisions cannot change, and the only ways on are resending the identical request (Family Graph replays the stored result and writes nothing twice) or cancelling the file. A request that was never sent (connection refused, not configured) does not freeze. If the Family Graph URL or key changed while frozen, the resend is not sent.
+
+**Timeouts (adds to 6.3).**
+```
+FAMILYGRAPH_TIMEOUT_S=10           # health check, [ TEST ], id lookup
+FAMILYGRAPH_ROSTER_TIMEOUT_S=600   # roster plan and commit (large rosters are slow)
+```
+
+**Key file (adds to 5.7).** Community runs add `identity_registry` (each I/F id with kind and display value), `identity_cells` (sheet, row, column, what was written, the original), `identity_columns` (an appended `FAMILY_ID` column), and `community_source` (the Family Graph host name, the import run ids, the category, and the commit time).
+
+**Restore (adds to 5.8).** Exact per-cell restore of the anonymized file uses `identity_cells`; the layout is picked from the uploaded file's own cells, not its filename. AI text restores community ids even when lowercased, un-bracketed, markdown-escaped, or reduced to the bare hex, but only for keys that actually contain community ids.
+
+**Web security (changes 7.3).** Still no login. The server only answers when the Host header is 127.0.0.1, localhost, or ::1 (blocks DNS rebinding), and every state-changing request must be same-origin (Origin or Referer, and Sec-Fetch-Site). `POST /api/familygraph` requires JSON.
+
+**Deployment (changes 8, "networked deployment").** Doc Anonymizer and Family Graph now run together on one local server inside the firewall. Doc Anonymizer still binds 127.0.0.1:5000 and its Host check refuses any other name, so the operator reaches it through an SSH tunnel, not a LAN bind. It remains single-operator.
+
+**Logging (adds to 11).** Community events log counts, HTTP status, and timings only (plan requested, commit requested, commit result, dropped decisions, cells not rewritten). Community ids, names, and candidate data are never logged.
+
+**Other corrections made in this pass.** 4.4 pointed at a preview section 4.11 that does not exist (it is 4.9). The 4.9 highlight example and the 10 success criterion still described v1.3 shared 4-char suffixes; both now match 5.2.
+
+**Tests.** 284 passing at the end of the 2026-09-28 fix pass, up from 193.
 
 ---
 

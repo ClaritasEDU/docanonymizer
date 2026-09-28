@@ -42,7 +42,7 @@ Product builder, not a coder. I bring requirements and product vision; Claude Co
 
 This tool exists specifically to keep sensitive documents off public LLMs. Every architectural decision must reinforce that guarantee.
 
-- **Zero external calls** - the only network traffic allowed is to configured local LLM endpoints
+- **Zero external calls** - the only network traffic allowed is to configured local LLM endpoints and, for spreadsheets, a local or LAN Family Graph (plus GitHub on explicit user action, see rule 12)
 - **Endpoint guard** - warn loudly before saving any non-localhost URL as an endpoint
 - **No logging of document content** - log metadata (file name, char count, PII counts) but never log actual text from the document or the PII values themselves
 - **Temp file hygiene** - files in `/uploads` must be deleted immediately after processing completes or fails, not on a schedule
@@ -98,7 +98,7 @@ Both files are living documents. Keep them current. They are the memory of this 
 - **LLM integration:** Ollama-style and OpenAI-compatible local endpoints via adapter layer
 - **File handling:** pdfplumber, python-docx, openpyxl, python-pptx, LibreOffice (system, optional)
 - **Frontend:** Single HTML page, vanilla JS, no external CSS frameworks or CDNs
-- **Config:** `.env` for environment, `endpoints.json` for LLM backends, `*.key.json` for anonymization keys
+- **Config:** `.env` for environment, `endpoints.json` for LLM backends, `*.key.json` for anonymization keys, `familygraph.json` (0600, gitignored) for the Family Graph URL and API key
 - **No database.** No auth. No cloud dependencies of any kind.
 
 ---
@@ -134,11 +134,12 @@ The aesthetic is terminal-esque, black and white. Think `htop` or a monochrome I
 2. Identifiers are 12-character uppercase hex with at least one letter and one digit, and never digits-E-digits (Excel scientific notation)
 3. Replacement is single-pass, leftmost-longest (longest original wins at a position), and never rewrites inside one of the run's own placeholders (protection is by exact placeholder, never by shape - PII that looks like a token is still replaced). Short numbers (no letters, under 7 digits) match only as whole numbers: not glued to letters (A94), not part of one formatted number (1,945 / 94.5), but each item of a comma list counts. The raw XML pass never writes into coordinates, ids, rsids, or formula references
 4. All replacements must be reversible via the key file - unanonymize must restore exactly, including AI output where the identifiers were lowercased, un-bracketed, markdown-escaped, relabeled, or reduced to the bare hex. Anything that cannot be resolved is reported, never guessed
-5. Key file records: session ID, original filename, endpoint used, model used, full replacement map, entity registry
+5. Key file records: session ID, original filename, endpoint used, model used, full replacement map, entity registry, and for community runs the identity registry, identity cells, identity columns, and community source (Family Graph host name, import run ids, category, commit time)
 6. Preview is mandatory - user must confirm before any file is written. No skip path.
 7. Output file is always freshly constructed - never a modified copy of the original binary
 8. Deep scrub covers all hidden layers: tracked changes, comments, author metadata, full ZIP XML walk for DOCX/XLSX
 9. Download and GitHub push are disabled until the post-scrub verification pass returns zero residual PII
 10. Verification logs pass/fail and match types only - matched PII values are never written to logs
 11. github.json must be in .gitignore - verify this before first commit. It contains PATs.
-12. GitHub API is the only permitted external network call, and only on explicit user action. LLM endpoints must be localhost or LAN only.
+12. GitHub API is the only permitted external network call, and only on explicit user action. LLM endpoints must be localhost or LAN only. The Family Graph URL must be localhost or LAN too, and there is no override (unlike LLM endpoints) because the call carries the whole roster. Proxy environment variables are ignored for Family Graph calls.
+13. Community identifiers (`I` + 16 hex for a person, `F` + 16 hex for a household; legacy 8-hex codes still restore) are minted only by Family Graph, never by Doc Anonymizer. They apply only to tabular files (xlsx, xls, ods, csv) and only when Family Graph is configured - PDFs, DOCX, PPTX, scans, and text make zero Family Graph calls. Every review item must be answered before [ CONFIRM AND SCRUB ] enables; skipping community ids is an explicit [ CONTINUE WITHOUT COMMUNITY IDS ] choice, never a silent fallback. The commit goes to Family Graph before the scrub and carries an idempotency key, so a resend never writes twice. If the outcome is unknown (timeout, dropped connection, 5xx) the file is frozen - decisions cannot change, and the only ways on are resending the identical request or cancelling the file. Changing the Family Graph URL requires re-entering the key, so the key never follows a changed URL, and a frozen resend is refused if the URL or key changed. Community ids, names, and candidate data are never logged - counts, HTTP status, and timings only.

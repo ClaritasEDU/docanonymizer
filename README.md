@@ -75,6 +75,39 @@ The first time the app starts, it writes a default `endpoints.json` pointing at 
 
 ---
 
+## Community ids for spreadsheets (Family Graph)
+
+Rosters and parishioner lists can carry one lifelong id per person (`[I…]`, I plus 16 hex) and per household (`[F…]`, F plus 16 hex), the same id in every file, every year, and every product. Family Graph issues and remembers those ids. Doc Anonymizer never mints one, it asks Family Graph.
+
+This layer applies only to spreadsheets (xlsx, xls, ods, csv) and only when Family Graph is configured. PDFs, DOCX, PPTX, scans, and text files make zero Family Graph calls and are anonymized exactly as before.
+
+**Connect it (one time).** Family Graph runs on the same machine or inside the firewall. Issue a key that carries only the `roster` scope:
+
+```bash
+cd ~/familygraph
+node bin/family-graph.js issue-key docanonymizer roster
+```
+
+Then in Doc Anonymizer click `[ FAMILY GRAPH: OFF ]`, enter the URL (usually `http://127.0.0.1:3500`), paste the key, pick the roster type (SCHOOL, PARISH, OTHER), `[ TEST ]`, `[ SAVE ]`. Settings live in `familygraph.json` (0600, gitignored). The key is never shown again or logged. A non-local URL is refused, with no override, because the call carries the whole roster. Changing the URL requires re-entering the key.
+
+On the Spark server, Doc Anonymizer still listens on 127.0.0.1:5000 and refuses any other Host name, so reach it from your Mac through an SSH tunnel (`ssh -L 5000:127.0.0.1:5000 [user]@[spark-host]`, then open http://127.0.0.1:5000). A LAN name or IP in the browser gets a 403.
+
+**What happens on a roster.**
+
+1. After detection, the rows go to Family Graph as a dry-run plan. Nothing is written there.
+2. The preview shows `COMMUNITY IDS` counts plus a card for each person or household the rules could not settle: `[ SAME PERSON ]` / `[ NEW PERSON ]` / `[ NOT A PERSON ]` (households get SAME / NEW HOUSEHOLD). `[ CONFIRM AND SCRUB ]` stays disabled until every `[?]` is answered.
+3. `[ CONTINUE WITHOUT COMMUNITY IDS ]` is an explicit choice. If Family Graph is unreachable the app says so and never silently falls back.
+4. On confirm, the commit goes to Family Graph first, then the scrub runs. Name cells become `[I…]`, the household column becomes `[F…]` (or a FAMILY_ID column is appended and removed again on restore). Surnames, free-text mentions, emails, phones, and addresses keep their per-value tokens.
+5. The key file records the identity registry, every rewritten cell, and the Family Graph source, so restoring the file puts back exactly what was there and restoring an AI answer turns `[I…]` back into the name.
+
+A one-column sheet is sent only when its header is a name header (Name, Student Name, Full Name), and every person on it becomes a review item.
+
+**Retry safety.** Every commit carries an idempotency key. If the outcome is unknown (timeout, dropped connection, 5xx) the file is frozen: decisions cannot change, and the only ways on are `[ CONFIRM AND SCRUB ]` again, which resends the identical request (Family Graph replays the stored result, nothing is written twice), or `[ CANCEL ]`. If the Family Graph URL or key changed while frozen, the resend is not sent. Decisions Family Graph reports as stale are dropped and the preview says why.
+
+**Timeouts** (seconds, in `.env`): `FAMILYGRAPH_TIMEOUT_S` for quick calls (default 10), `FAMILYGRAPH_ROSTER_TIMEOUT_S` for plan and commit (default 600). A 2,000-row roster planned in about 9 s in testing (longer on a small machine), and Family Graph holds its other requests until it finishes.
+
+---
+
 ## Tests
 
 ```bash
@@ -101,6 +134,7 @@ The test suite mocks the LLM and runs against an isolated temp directory. No net
     extractors.py        # per-format text extraction
     chunker.py           # token-aware chunking
     detector.py          # LLM detection orchestrator
+    backstop.py          # deterministic detection after the LLM (patterns + recall)
     ids.py               # 12-char ID generation + uniqueness ledger
     mapper.py            # entity registry, one unique ID per value, replacement map
     replacer.py          # single-pass replacement engine (used by scrub, verify, preview)
@@ -110,6 +144,8 @@ The test suite mocks the LLM and runs against an isolated temp directory. No net
     key_files.py         # key file save/load/list/import
     unanonymize.py       # file restore pipeline
     github_mgr.py        # GitHub connections + push
+    familygraph.py       # Family Graph client (settings, plan, commit, lookup)
+    community.py         # community ids on spreadsheets (review items, [I…]/[F…] cells)
     pipeline.py          # session orchestrator
   static/
     styles.css           # terminal-monochrome tokens (PRD 12.2)
@@ -118,16 +154,17 @@ The test suite mocks the LLM and runs against an isolated temp directory. No net
     index.html           # single-page app shell
   tests/                 # pytest suite (LLM mocked)
   uploads/  output/  keys/   # runtime data (gitignored); keys/ also holds issued_ids.ledger
-  endpoints.json  github.json  anonymizer.log   # runtime config + log (gitignored)
+  endpoints.json  github.json  familygraph.json  anonymizer.log   # runtime config + log (gitignored)
 ```
 
 ---
 
 ## Privacy contract (non-negotiable)
 
-- The only network traffic permitted is to local LLM endpoints (localhost / RFC1918 / link-local) and, on explicit user action, GitHub.
-- Document text and PII values never appear in `anonymizer.log`. Only metadata (counts, types, timings).
-- `/uploads/` is purged after each session.
+- The only network traffic permitted is to local LLM endpoints (localhost / RFC1918 / link-local), for spreadsheets a local or LAN Family Graph (no override, proxy settings ignored), and, on explicit user action, GitHub.
+- Document text and PII values never appear in `anonymizer.log`. Only metadata (counts, types, timings). Community ids, names, and candidate data are never logged either.
+- Files in `/uploads/` are deleted as soon as processing finishes or fails, and any leftovers are cleared at startup.
+- The app listens on 127.0.0.1 only. Requests with a foreign Host header are refused (DNS rebinding), and every state-changing request must come from the app's own page.
 - `github.json` holds the GitHub PAT and is in `.gitignore`. Never commit it.
 - Download and GitHub push are blocked until the post-scrub verification pass returns zero residual matches.
 
