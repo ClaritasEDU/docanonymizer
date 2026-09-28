@@ -300,6 +300,10 @@ def create_app() -> Flask:
             "session_id": sess.id,
             "detection_complete": sess.detection_complete,
             "progress": sess.detection_progress,
+            "stage": sess.stage,
+            # A Family Graph plan in flight (a large roster: a minute or two).
+            "community_busy": sess.fg_busy,
+            "community_rows": sess.fg_rows if sess.fg_busy else 0,
             "error": sess.error,
         }
         if sess.detection_complete and sess.registry is not None:
@@ -313,7 +317,20 @@ def create_app() -> Flask:
             return jsonify({"error": "session not found"}), 404
         if not sess.detection_complete:
             return jsonify({"error": "detection not complete"}), 409
-        if sess.scrub_steps or sess.verify_result is not None:
+        # One confirm at a time: the Family Graph commit can take minutes, and
+        # a second click (or a browser that gave up and retried) must never
+        # start a second commit or a second scrub.
+        if not sess.lock.acquire(blocking=False):
+            return jsonify({"error": "Family Graph is still working on this file - wait for it to finish",
+                            "community": _cview(sess)}), 409
+        try:
+            return _confirm_locked(sess)
+        finally:
+            sess.lock.release()
+
+    def _confirm_locked(sess):
+        sid = sess.id
+        if sess.scrub_started or sess.scrub_steps or sess.verify_result is not None:
             return jsonify({"error": "already confirmed"}), 409
         payload = request.get_json(silent=True) or {}
         deselected = [d for d in (payload.get("deselected") or []) if isinstance(d, str)]
@@ -322,8 +339,9 @@ def create_app() -> Flask:
 
         # Community identifiers: every review item decided, then Family Graph
         # writes them - BEFORE anything is scrubbed, so the file carries ids
-        # that exist. Nothing degrades silently: if Family Graph is down the
-        # operator must retry or choose to continue without community ids.
+        # that exist. Nothing degrades silently: if Family Graph is down or
+        # too slow the operator must retry or choose to continue without
+        # community ids, and nothing is scrubbed until one of those happens.
         state = sess.community
         if state is not None and state.status in ("ready", "error"):
             if "PERSON" in types:
@@ -331,20 +349,30 @@ def create_app() -> Flask:
                 log.info("session %s community ids skipped: PERSON kept as original", sid)
             elif state.status == "error":
                 return jsonify({"error": f"Family Graph unavailable: {state.error}. Retry, or continue without community ids.",
-                                "community": community_mod.view(state)}), 409
+                                "community": _cview(sess, own_lock=True)}), 409
             else:
                 open_items = community_mod.pending(state)
                 if open_items:
                     return jsonify({"error": f"{len(open_items)} person/household decision(s) still needed",
-                                    "community": community_mod.view(state)}), 409
+                                    "community": _cview(sess, own_lock=True)}), 409
                 try:
                     ok = community_mod.commit_for_session(sess)
                 except familygraph.FamilyGraphError as exc:
-                    log.error("session %s community commit failed: %s", sid, type(exc).__name__)
-                    return jsonify({"error": f"Family Graph: {exc}", "community": community_mod.view(state)}), 502
+                    # commit_for_session logged it; state is unchanged ("ready").
+                    msg = state.commit_error or str(exc)
+                    if not msg.startswith("Family Graph"):
+                        msg = f"Family Graph: {msg}"
+                    return jsonify({"error": msg,
+                                    "community": _cview(sess, own_lock=True)}), (504 if exc.timed_out else 502)
                 if not ok:
                     return jsonify({"error": "Family Graph found new items that need a decision",
-                                    "community": community_mod.view(state)}), 409
+                                    "community": _cview(sess, own_lock=True)}), 409
+        if pipeline.get_session(sid) is not sess:
+            # Cancelled while Family Graph was writing: its upload is gone and
+            # nothing may be written for it.
+            log.warning("session %s confirm dropped: cancelled during the Family Graph commit", sid)
+            return jsonify({"error": "this file was cancelled"}), 410
+        sess.scrub_started = True
         threading.Thread(
             target=pipeline.confirm_and_scrub, args=(sess, deselected, types), daemon=True,
         ).start()
@@ -357,6 +385,8 @@ def create_app() -> Flask:
             return jsonify({"error": "session not found"}), 404
         return jsonify({
             "session_id": sid,
+            "scrub_started": sess.scrub_started,
+            "community_busy": _busy(sess),
             "scrub_steps": sess.scrub_steps,
             "verify_result": sess.verify_result,
             "formula_warnings": sess.formula_warnings,
@@ -380,8 +410,11 @@ def create_app() -> Flask:
             return None, (jsonify({"error": "session not found"}), 404)
         if not sess.detection_complete:
             return None, (jsonify({"error": "detection not complete"}), 409)
-        if sess.scrub_steps or sess.verify_result is not None:
+        if sess.scrub_started or sess.scrub_steps or sess.verify_result is not None:
             return None, (jsonify({"error": "already confirmed"}), 409)
+        if _busy(sess):
+            return None, (jsonify({"error": "Family Graph is still working on this file - wait for it to finish",
+                                   "community": _cview(sess)}), 409)
         return sess, None
 
     @app.get("/api/anonymize/<sid>/community")
@@ -389,7 +422,7 @@ def create_app() -> Flask:
         sess = pipeline.get_session(sid)
         if not sess:
             return jsonify({"error": "session not found"}), 404
-        return jsonify(community_mod.view(sess.community))
+        return jsonify(_cview(sess))
 
     @app.post("/api/anonymize/<sid>/community/decide")
     def community_decide(sid: str):
@@ -425,17 +458,23 @@ def create_app() -> Flask:
         else:
             return jsonify({"error": "nothing to resume - retry instead"}), 409
         log.info("session %s community ids %s by operator", sid, "skipped" if skip else "resumed")
-        return jsonify(community_mod.view(state))
+        return jsonify(_cview(sess))
 
     @app.post("/api/anonymize/<sid>/community/retry")
     def community_retry(sid: str):
         sess, err = _community_session(sid)
         if err:
             return err
-        community_mod.retry(sess)
-        # New guaranteed catches may have been registered - rebuild the preview.
-        sess.preview = None
-        return jsonify(community_mod.view(sess.community))
+        if not sess.lock.acquire(blocking=False):
+            return jsonify({"error": "Family Graph is still working on this file - wait for it to finish",
+                            "community": _cview(sess)}), 409
+        try:
+            community_mod.retry(sess)
+            # New guaranteed catches may have been registered - rebuild the preview.
+            sess.preview = None
+        finally:
+            sess.lock.release()
+        return jsonify(_cview(sess))
 
     # -----------------------------------------------------------------------
     # Family Graph connection
@@ -667,6 +706,20 @@ def create_app() -> Flask:
         return jsonify({"lines": [ln.rstrip("\n") for ln in tail]})
 
     return app
+
+
+def _busy(sess, own_lock: bool = False) -> str:
+    """"plan" / "commit" while a Family Graph call runs; "working" while a
+    confirm or retry holds the session (the moments either side of the call).
+    `own_lock`: the caller holds the lock itself and is answering now."""
+    if sess.fg_busy:
+        return sess.fg_busy
+    return "working" if (not own_lock and sess.lock.locked()) else ""
+
+
+def _cview(sess, own_lock: bool = False) -> dict:
+    """The community view for a session, with any in-flight Family Graph call."""
+    return community_mod.view(sess.community, busy=_busy(sess, own_lock))
 
 
 def _preview_payload(sess) -> dict:

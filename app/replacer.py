@@ -47,11 +47,14 @@ log = get_logger("replacer")
 # regex-residue warning scan. Replacement protection is NOT shape-based: it
 # covers only the exact placeholders in the map, so PII that merely looks
 # like a token ("MRN_000123456789") is still replaced and still verified.
+#
+# Community identifiers ([I…] / [F…]) are deliberately NOT in this shape: the
+# verifier strips only the exact tokens a roster run issued (extra_protected),
+# so a document that merely contains "[I0123456789ABCDEF]" is checked exactly
+# as it was before community ids existed.
 PLACEHOLDER_RE = re.compile(
     r"\[[A-Z]+_(?:[0-9A-F]{12}|[0-9A-F]{4})\]"
     r"|(?<![A-Za-z0-9_])[A-Z]+_[0-9A-F]{12}(?![A-Za-z0-9_])"
-    # Community identifiers from Family Graph: [I…] individual, [F…] family.
-    r"|\[[IF](?:[0-9A-F]{16}|[0-9A-F]{8})\]"
 )
 _BRACKETED_PH_RE = re.compile(r"\[([A-Z]+_(?:[0-9A-F]{12}|[0-9A-F]{4}))\]")
 

@@ -33,7 +33,7 @@ from urllib.parse import urlparse
 import requests
 
 from . import endpoints as endpoints_mod
-from .config import FAMILYGRAPH_FILE, FAMILYGRAPH_TIMEOUT_S
+from .config import FAMILYGRAPH_FILE, FAMILYGRAPH_ROSTER_TIMEOUT_S, FAMILYGRAPH_TIMEOUT_S
 from .logging_setup import get_logger
 
 log = get_logger("familygraph")
@@ -45,12 +45,16 @@ _CONNECT_TIMEOUT_S = 5
 
 class FamilyGraphError(RuntimeError):
     """A call to Family Graph failed. `status` is the HTTP status (0 = no
-    connection); `body` is the parsed JSON body when there is one."""
+    connection); `body` is the parsed JSON body when there is one;
+    `timed_out` is True when Family Graph was reached but did not answer
+    within the read timeout."""
 
-    def __init__(self, message: str, status: int = 0, body: Optional[dict] = None):
+    def __init__(self, message: str, status: int = 0, body: Optional[dict] = None,
+                 timed_out: bool = False):
         super().__init__(message)
         self.status = status
         self.body = body or {}
+        self.timed_out = timed_out
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +160,26 @@ def _session() -> requests.Session:
     return s
 
 
+def _read_timed_out(exc: requests.ConnectionError) -> bool:
+    """requests reports a read timeout hit while the body is downloading as a
+    ConnectionError wrapping urllib3's ReadTimeoutError."""
+    seen = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, requests.Timeout) or type(cur).__name__ == "ReadTimeoutError":
+            return True
+        nxt = cur.args[0] if cur.args and isinstance(cur.args[0], BaseException) else None
+        reason = getattr(cur, "reason", None)
+        cur = nxt or (reason if isinstance(reason, BaseException) else None) or cur.__cause__ or cur.__context__
+    return False
+
+
 def _call(method: str, path: str, body: Optional[dict] = None, timeout: Optional[float] = None) -> tuple[int, dict]:
+    """One HTTP call. `timeout` is the read timeout in seconds; quick calls
+    use the default (FAMILYGRAPH_TIMEOUT_S), roster plan/commit pass
+    FAMILYGRAPH_ROSTER_TIMEOUT_S."""
+    read_timeout = timeout or FAMILYGRAPH_TIMEOUT_S
     s = _read()
     base = s.get("base_url")
     key = s.get("api_key")
@@ -177,15 +200,21 @@ def _call(method: str, path: str, body: Optional[dict] = None, timeout: Optional
         with _session() as sess:
             resp = sess.request(
                 method, f"{base}{path}", json=body, headers=headers,
-                timeout=(_CONNECT_TIMEOUT_S, timeout or FAMILYGRAPH_TIMEOUT_S),
+                timeout=(_CONNECT_TIMEOUT_S, read_timeout),
                 allow_redirects=False,
             )
-    except requests.ConnectionError as exc:
+    except requests.ConnectTimeout as exc:
+        log.warning("family graph unreachable: %s %s (ConnectTimeout after %ds)", method, path, _CONNECT_TIMEOUT_S)
+        raise FamilyGraphError("Family Graph is not reachable - is it running?", 0) from exc
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        elapsed = time.monotonic() - started
+        if isinstance(exc, requests.Timeout) or _read_timed_out(exc):
+            log.warning("family graph timed out: %s %s after %.1fs (read timeout %ss)",
+                        method, path, elapsed, read_timeout)
+            raise FamilyGraphError(
+                f"Family Graph did not answer within {read_timeout:g} seconds", 0, timed_out=True) from exc
         log.warning("family graph unreachable: %s %s (%s)", method, path, type(exc).__name__)
         raise FamilyGraphError("Family Graph is not reachable - is it running?", 0) from exc
-    except requests.Timeout as exc:
-        log.warning("family graph timed out: %s %s", method, path)
-        raise FamilyGraphError("Family Graph did not answer in time", 0) from exc
     elapsed = time.monotonic() - started
     try:
         data = resp.json()
@@ -210,11 +239,11 @@ def _raise_for(status: int, data: dict, what: str) -> None:
 def check() -> dict:
     """Is Family Graph reachable, and does the key work? Never raises."""
     try:
-        status, _ = _call("GET", "/api/health", timeout=10)
+        status, _ = _call("GET", "/api/health")
         if status != 200:
             return {"status": "err", "error": f"health check returned {status}"}
         # Any well-formed id: 404 means authenticated, 401/403 means not.
-        status, _ = _call("GET", "/api/identity/roster/lookup/I0000000000000000", timeout=10)
+        status, _ = _call("GET", "/api/identity/roster/lookup/I0000000000000000")
     except FamilyGraphError as exc:
         return {"status": "err", "error": str(exc)}
     if status in (200, 404):
@@ -227,7 +256,9 @@ def check() -> dict:
 
 
 def plan(body: dict) -> dict:
-    status, data = _call("POST", "/api/identity/roster/plan", body)
+    """Dry run - Family Graph writes nothing. Long read timeout: a large
+    roster takes a while to match."""
+    status, data = _call("POST", "/api/identity/roster/plan", body, timeout=FAMILYGRAPH_ROSTER_TIMEOUT_S)
     if status != 200:
         _raise_for(status, data, "roster plan")
     return data
@@ -236,7 +267,7 @@ def plan(body: dict) -> dict:
 def commit(body: dict) -> tuple[bool, dict]:
     """(True, result) when written; (False, plan) when Family Graph refused
     because review items are still undecided (nothing was written)."""
-    status, data = _call("POST", "/api/identity/roster/commit", body)
+    status, data = _call("POST", "/api/identity/roster/commit", body, timeout=FAMILYGRAPH_ROSTER_TIMEOUT_S)
     if status == 201:
         return True, data
     if status == 409 and data.get("error") == "review_incomplete":

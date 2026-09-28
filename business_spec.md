@@ -152,8 +152,9 @@ The PRD listed six open questions. Three are resolved as built; three are deferr
 14. **Model answers must be complete (2026-09-27).** Local model calls stream and time out only when the model stalls; Ollama gets an explicit context window and a JSON schema; an answer that runs out of room is split and rescanned; an answer that can't be read is a failed scan (retry, then stop), never "no PII".
 15. **Uploads never linger (2026-09-27).** Starting a new file cancels the unfinished one, closing the tab cancels the run, a run abandoned at the preview for 2 hours is discarded, and anything left in /uploads at startup is deleted.
 16. **Preview type toggles (2026-09-27).** One click keeps an entire type as original text across the whole document (for when a model mislabels a whole category).
+17. **Community ids are for spreadsheets only (owner, 2026-09-28).** With Family Graph connected, a roster (xlsx/xls/ods/csv) gets one lifelong id per person (`[I…]`) and household (`[F…]`). PDFs, Word files, slides, and plain text never reach Family Graph and come out exactly as they would with it disconnected: no identity fields in the key, no FAMILY_ID column. Protection of those ids is by the exact tokens a roster run wrote, never by their shape, and the forgiving restore of them (lowercase, bare hex) only switches on when a selected key actually holds community ids - a 16-character hex string in an ordinary document is never touched. A slow Family Graph (a large roster can take a minute or two) is waited for, up to `FAMILYGRAPH_ROSTER_TIMEOUT_S` (600 s); if it still does not answer, nothing is scrubbed and the operator retries or explicitly continues without community ids.
 
 **Deferred to v2:**
 
-17. Optional AES-encrypted key files at rest.
-18. In-place highlight-and-tag in the preview panel (custom terms cover the need for now).
+18. Optional AES-encrypted key files at rest.
+19. In-place highlight-and-tag in the preview panel (custom terms cover the need for now).

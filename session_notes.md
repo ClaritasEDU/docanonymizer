@@ -796,3 +796,28 @@ real problems.
    names inside notes columns before confirming.
 3. Consider a second detection pass on free-text columns only (the one
    residual miss class for small models).
+
+## Session 008 (follow-up) - 2026-09-28 - Family Graph hardening: slow rosters, provisional candidates, tabular-only
+
+### What was built or changed
+
+- Timeouts split. `FAMILYGRAPH_ROSTER_TIMEOUT_S` (default 600 s) for roster plan and commit; `FAMILYGRAPH_TIMEOUT_S` (now 10 s) for health, [ TEST ] and lookup. Both in `app/config.py` and `.env.example`. A read timeout is its own error (`timed_out`), separate from "not reachable", including the case where requests wraps it as a ConnectionError.
+- No partial state on a slow Family Graph. A plan timeout leaves the file in the error state (confirm blocked until retry or explicit opt-out). A commit timeout returns 504, leaves status "ready", starts no scrub, writes no file or key, and says Family Graph may still finish on its side. Confirm and retry hold a per-session lock, so two Family Graph calls for one file never overlap; decisions, skip and retry are refused while one runs. A file cancelled mid-commit is never scrubbed (410).
+- Retry no longer exposes a half-built state: the new plan replaces the old one only when complete, and it is requested WITH the decisions made so far. Decisions the new plan no longer offers are dropped, so the item asks again.
+- Attach targets validated by shape, kind and offer: `I…`/`F…` (any case, sent upper case) or a sheet ref `0:3:1` / `0:3:family` for someone new earlier in this file. A household id for a person, or a person ref for a household, is refused.
+- UI. Every wait is one `[>]` line: extracting, each chunk, the Family Graph plan (with row count), the commit, and ask-again. If the browser gives up on a long confirm (Safari can stop at 60 s), the page asks the server what happened instead of reporting a failure. Buttons that would start another Family Graph call are disabled while one runs. Provisional candidates read "(new in this file, row N)". REVIEW_WHY covers all 29 reasons Family Graph can emit; unknown ones still render. `summary.told_apart` shows as "N told apart automatically"; per-person `told_apart` marks the line in SHOW EVERYONE.
+- One person in two cells of a row (Parent 1 and Parent 2 entered twice) verified end to end: both cells get the same `[I…]`, identity_cells records both, one registry entry, exact restore, AI restore to the name. The registry now keeps the first full spelling rather than the last.
+- Owner rule: community ids touch spreadsheets only. Verified PDF, DOCX, PPTX and TXT make zero Family Graph calls and produce the same output and key shape connected or not. Two leaks fixed: the restorer's community grammar (bare 16-hex, `[I…]`, lowercase) is now used only when a selected key has an identity_registry (before, a document key reported `[I0123…]` as unresolved); and the verifier's warning pre-strip removed any `[I…]`-shaped text, now only the run's exact tokens.
+
+### Decisions / assumptions
+
+- `FAMILYGRAPH_TIMEOUT_S` changed meaning (600 -> 10, quick calls only). It shipped earlier the same day and was never in `.env.example`.
+- A commit that timed out on our side may still complete in Family Graph (its commit is not idempotent per source_ref). Pressing confirm again re-sends it; people already written come back as known. Documented in the error text.
+
+### Tests
+
+209 -> 227. Headless Chromium against a stub Family Graph with 4 s delays: `[>]` during plan and commit, dropped-connection recovery, plan and commit timeouts, no page errors.
+
+### Next steps
+
+1. Family Graph side: make roster commit idempotent per `source_ref` so a retried commit after a client timeout is a no-op.

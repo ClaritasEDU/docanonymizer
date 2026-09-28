@@ -258,6 +258,7 @@ select {
   background: var(--bg-inset); border: 1px solid var(--border);
   padding: 14px;
 }
+#community-progress, #confirm-progress { margin-top: 10px; }
 .step {
   display: flex; gap: 10px;
   font-size: 13px; line-height: 1.7;

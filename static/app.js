@@ -58,23 +58,44 @@
     "everywhere it appears. When you refer to any of them in your answer, copy the " +
     "token exactly as written, brackets included. Do not shorten, merge, or invent tokens.";
 
-  // Plain-words labels for Family Graph's review reasons.
+  // Plain-words labels for every review reason Family Graph can emit. An
+  // unknown reason still shows, with underscores turned into spaces.
   const REVIEW_WHY = {
-    possible_match: "possible match - confirm",
-    several_strong_candidates: "more than one strong match",
-    candidate_archived: "the match is an archived record",
-    household_disagrees: "the household points at someone else",
-    several_household_namesakes: "two people with this name in the household",
-    role_mismatch: "child / adult mismatch",
+    // the name itself
     no_first_name: "no first name",
     placeholder_name: "a placeholder, not a name",
     initial_only: "an initial only",
     looks_like_organization: "looks like an organization, not a person",
-    members_in_different_households: "the people on this row are in different households",
+    same_name_twice_in_household: "same name twice in this household - one person or two?",
+    // matching people
+    possible_match: "possible match - confirm",
+    several_strong_candidates: "more than one strong match",
+    household_disagrees: "the household points at someone else",
+    candidate_archived: "the match is an archived record",
+    several_household_namesakes: "two people with this name in the household",
+    role_mismatch: "child / adult mismatch",
+    // links from earlier imports
+    linked_record_used_twice: "two people here point to the same record",
+    linked_record_archived: "the linked record is archived",
+    linked_record_changed: "the linked record's name or birthdate changed",
+    prior_link_used_twice: "two people here carry the same stored id",
+    prior_link_disagrees: "the stored id belongs to someone who does not match",
+    prior_link_unconfirmed: "nobody in the household confirms the stored id",
+    same_person_as_another_record: "another record is already this person",
+    same_household_as_another_record: "another record is already this household",
+    // households
     members_in_several_households: "these people share more than one household",
+    members_in_different_households: "the people on this row are in different households",
     household_archived: "the household is archived",
     same_address_no_known_members: "same address as an existing household",
+    several_households_at_address: "more than one household with this surname at this address",
+    new_adult_with_known_children: "the children are known, but this adult is new and listed at a different address",
+    linked_household_archived: "the linked household is archived",
+    linked_household_disagrees: "the linked household no longer matches its people",
+    shared_contact_other_surname: "shares an email or phone with a different surname",
+    several_households_share_contact: "this email or phone is in more than one household",
   };
+  const reviewWhy = (r) => REVIEW_WHY[r] || String(r).replace(/_/g, " ");
 
   // ----- DOM helpers -----
   const $ = (id) => document.getElementById(id);
@@ -496,33 +517,7 @@
           renderDetectionSteps([{ glyph: "[!]", text: data.error, kind: "err" }]);
           return;
         }
-        const steps = [];
-        steps.push({ glyph: "[x]", text: "extracting document...", kind: "done" });
-        for (let i = 0; i < (data.progress || []).length; i++) {
-          const p = data.progress[i];
-          steps.push({
-            glyph: "[x]",
-            text: `chunk ${p.index}/${p.total}: ${p.found} pii found`,
-            kind: p.error ? "err" : "done",
-          });
-        }
-        const total = (data.progress || [])[0]?.total || null;
-        const lastIdx = (data.progress || []).length;
-        if (total && lastIdx < total && !data.detection_complete) {
-          steps.push({
-            glyph: "[>]",
-            text: `chunk ${lastIdx + 1}/${total}: detecting pii`,
-            kind: "active", blink: true,
-          });
-          for (let i = lastIdx + 2; i <= total; i++) {
-            steps.push({ glyph: "[ ]", text: `chunk ${i}/${total}: pending`, kind: "pending" });
-          }
-        }
-        if (data.detection_complete) {
-          steps.push({ glyph: "[x]", text: "building replacement map", kind: "done" });
-          steps.push({ glyph: "[x]", text: "preparing preview", kind: "done" });
-        }
-        renderDetectionSteps(steps);
+        renderDetectionSteps(detectionSteps(data));
 
         if (data.detection_complete) {
           clearInterval(state.polling);
@@ -536,8 +531,53 @@
     }, 800);
   }
 
-  function renderDetectionSteps(steps) {
-    const host = $("progress-detection");
+  const ACTIVE = (text) => ({ glyph: "[>]", text, kind: "active", blink: true });
+  const DONE = (text) => ({ glyph: "[x]", text, kind: "done" });
+  const PENDING = (text) => ({ glyph: "[ ]", text, kind: "pending" });
+  const ERR = (text) => ({ glyph: "[!]", text, kind: "err" });
+
+  // Every wait shows exactly one [>] line - including a Family Graph plan,
+  // which can take a minute or two on a large roster.
+  function detectionSteps(data) {
+    const done = !!data.detection_complete;
+    const stage = data.stage || "extracting";
+    const prog = data.progress || [];
+    const steps = [];
+    if (!done && stage === "extracting") {
+      steps.push(ACTIVE("extracting document..."));
+      return steps;
+    }
+    steps.push(DONE("extracting document..."));
+    for (const p of prog) {
+      steps.push({ ...DONE(`chunk ${p.index}/${p.total}: ${p.found} pii found`), ...(p.error ? { glyph: "[!]", kind: "err" } : {}) });
+    }
+    const total = prog[0]?.total || null;
+    const lastIdx = prog.length;
+    if (!done) {
+      if (stage === "detecting" && !total) {
+        steps.push(ACTIVE("detecting pii"));
+      } else if (stage === "detecting" && lastIdx < total) {
+        steps.push(ACTIVE(`chunk ${lastIdx + 1}/${total}: detecting pii`));
+        for (let i = lastIdx + 2; i <= total; i++) steps.push(PENDING(`chunk ${i}/${total}: pending`));
+      } else if (data.community_busy === "plan") {
+        const rows = Number(data.community_rows || 0);
+        steps.push(ACTIVE(`Family Graph: matching ${rows ? rows.toLocaleString() + " roster rows" : "the roster"} to community ids (a large roster can take a minute or two)`));
+      } else {
+        steps.push(ACTIVE("building replacement map"));
+      }
+      return steps;
+    }
+    steps.push(DONE("building replacement map"));
+    const cs = (data.preview && data.preview.community && data.preview.community.status) || "off";
+    if (cs === "ready") steps.push(DONE("Family Graph: community ids planned"));
+    else if (cs === "none") steps.push(DONE("Family Graph: no people found for community ids"));
+    else if (cs === "error") steps.push(ERR("Family Graph: unavailable - see COMMUNITY IDS below"));
+    steps.push(DONE("preparing preview"));
+    return steps;
+  }
+
+  function renderSteps(hostId, steps) {
+    const host = $(hostId);
     host.innerHTML = "";
     for (const s of steps) {
       const div = create("div", { class: `step ${s.kind || "pending"}` });
@@ -548,6 +588,7 @@
       host.append(div);
     }
   }
+  function renderDetectionSteps(steps) { renderSteps("progress-detection", steps); }
 
   function renderPreview(prev) {
     if (!prev) return;
@@ -579,6 +620,10 @@
         "data-tag": span.placeholder.replace(/^\[|\]$/g, "").split("_")[0],
       });
       ph.textContent = span.placeholder;
+      // A redraw (after ASK FAMILY GRAPH AGAIN) keeps the operator's choices visible.
+      if (state.deselected.has(span.original) || state.deselectedTypes.has(ph.dataset.tag)) {
+        ph.classList.add("deselected");
+      }
       ph.addEventListener("click", () => {
         const orig = ph.dataset.original;
         if (state.deselected.has(orig)) {
@@ -623,29 +668,96 @@
     }
   }
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Buttons that start another Family Graph call or change a decision are
+  // disabled while one is running (the server refuses them anyway).
+  function setCommunityBusy(busy) {
+    state.communityBusy = busy;
+    const sel = "#btn-community-retry, #btn-community-skip, #community-review button, #community-all button";
+    document.querySelectorAll(sel).forEach((b) => { b.disabled = busy; });
+    if (busy) $("btn-confirm").disabled = true;
+    else paintConfirm();
+  }
+
   async function confirmScrub() {
     if (!state.sessionId) return;
+    const sid = state.sessionId;
     const btn = $("btn-confirm");
     btn.disabled = true;
     btn.textContent = "[ CONFIRMING... ]";
     hide($("confirm-error"));
+    // Family Graph writes the community ids first, before anything is
+    // scrubbed - a large roster can take a minute or two.
+    const cm = state.community;
+    if (cm && cm.status === "ready" && !state.deselectedTypes.has("PERSON")) {
+      const rows = new Set((cm.items || []).map((i) => `${i.table}:${i.sheet_row}`)).size;
+      renderSteps("confirm-progress", [
+        ACTIVE(`Family Graph: writing community ids for ${rows.toLocaleString()} roster rows (a large roster can take a minute or two)`),
+        PENDING("applying replacements"),
+      ]);
+      show($("confirm-progress"));
+      setCommunityBusy(true);
+    }
     try {
-      // Family Graph writes the community ids here, before anything is
-      // scrubbed. A refusal keeps the operator on the preview.
-      await api(`/api/anonymize/${state.sessionId}/confirm`, {
+      await api(`/api/anonymize/${sid}/confirm`, {
         method: "POST",
         body: JSON.stringify({ deselected: [...state.deselected], deselected_types: [...state.deselectedTypes] }),
       });
     } catch (exc) {
-      btn.textContent = "[ CONFIRM AND SCRUB ]";
-      const err = $("confirm-error");
-      err.textContent = `[!] ${exc.message}`;
-      show(err);
-      if (exc.body && exc.body.community) renderCommunity(exc.body.community);
-      else paintConfirm();
+      if (exc.status === undefined) {
+        // The browser gave up waiting (some stop at 60 s) - the server may
+        // still be working. Ask it what happened instead of guessing.
+        await awaitConfirmOutcome(sid);
+        return;
+      }
+      confirmFailed(exc.message, exc.body && exc.body.community);
       return;
     }
+    startScrubView();
+  }
+
+  function confirmFailed(message, view) {
+    const btn = $("btn-confirm");
     btn.textContent = "[ CONFIRM AND SCRUB ]";
+    hide($("confirm-progress"));
+    const err = $("confirm-error");
+    err.textContent = `[!] ${message}`;
+    show(err);
+    setCommunityBusy(false);
+    if (view) renderCommunity(view);
+    else paintConfirm();
+  }
+
+  async function awaitConfirmOutcome(sid) {
+    for (let i = 0; i < 2400; i++) {             // up to an hour; a real answer ends it sooner
+      await sleep(1500);
+      if (state.sessionId !== sid) return;       // cancelled / new file
+      let r;
+      try { r = await api(`/api/anonymize/${sid}/results`); }
+      catch (exc) {
+        if (exc.status === 404) { confirmFailed("This file's session ended. Upload it again.", null); return; }
+        continue;                                // app briefly unreachable - keep asking
+      }
+      if (r.scrub_started || (r.scrub_steps || []).length || r.verify_result || r.error) {
+        startScrubView();
+        return;
+      }
+      if (r.community_busy) continue;            // Family Graph is still writing
+      let view = null;
+      try { view = await api(`/api/anonymize/${sid}/community`); } catch {}
+      confirmFailed((view && view.commit_error)
+        || "The connection dropped before this app answered. Nothing was scrubbed - press CONFIRM AND SCRUB again.", view);
+      return;
+    }
+    confirmFailed("Still no answer from Family Graph. Nothing was scrubbed - check that it is running, then try again.", null);
+  }
+
+  function startScrubView() {
+    const btn = $("btn-confirm");
+    btn.textContent = "[ CONFIRM AND SCRUB ]";
+    hide($("confirm-progress"));
+    state.communityBusy = false;
     hide($("lbl-preview"));
     hide($("block-preview"));
     show($("lbl-scrub"));
@@ -677,18 +789,7 @@
     }, 600);
   }
 
-  function renderScrubSteps(steps) {
-    const host = $("progress-scrub");
-    host.innerHTML = "";
-    for (const s of steps) {
-      const div = create("div", { class: `step ${s.kind || "pending"}` });
-      div.append(create("span", { class: "glyph" }, [document.createTextNode(s.glyph)]));
-      const t = create("span", { class: "text" }, [document.createTextNode(s.text)]);
-      if (s.blink) t.append(create("span", { class: "blink" }));
-      div.append(t);
-      host.append(div);
-    }
-  }
+  function renderScrubSteps(steps) { renderSteps("progress-scrub", steps); }
 
   function renderResults(r) {
     state.finished = true;
@@ -800,8 +901,9 @@
   function paintConfirm() {
     const btn = $("btn-confirm");
     const n = state.communityPending || 0;
-    btn.disabled = n > 0;
-    btn.title = n > 0 ? `${n} person/household decision(s) needed above` : "";
+    btn.disabled = n > 0 || !!state.communityBusy;
+    btn.title = state.communityBusy ? "Family Graph is still working"
+      : n > 0 ? `${n} person/household decision(s) needed above` : "";
   }
 
   function communityCounts(items, decisions) {
@@ -835,7 +937,7 @@
     const retry = $("btn-community-retry"), skip = $("btn-community-skip"), all = $("btn-community-all");
 
     if (view.status === "error") {
-      err.textContent = `[!] ${view.error || "Family Graph unavailable"}\n    Start Family Graph and ask again, or continue without community ids.`;
+      err.textContent = `[!] ${view.error || "Family Graph unavailable"}\n    Check that Family Graph is running and ask again, or continue without community ids.`;
       show(err); show(retry); show(skip); hide(all);
       skip.textContent = "[ CONTINUE WITHOUT COMMUNITY IDS ]";
       state.communityPending = 1;          // confirm stays blocked until a choice
@@ -868,7 +970,12 @@
     const line = (label, b) => padRight(label, 12) +
       `${String(b.known).padStart(5)} known   ${String(b.new).padStart(5)} new   ` +
       `${String(b.need).padStart(4)} need you${b.decided ? `   ${b.decided} decided` : ""}`;
-    for (const t of [line("PEOPLE", c.person), line("HOUSEHOLDS", c.family)]) {
+    const lines = [line("PEOPLE", c.person), line("HOUSEHOLDS", c.family)];
+    // New people who share a name with someone already known, told apart by
+    // Family Graph's rules without asking (a count only).
+    const toldApart = Number((view.summary && view.summary.told_apart) || 0);
+    if (toldApart > 0) lines.push(padRight("", 12) + `${String(toldApart).padStart(5)} told apart automatically`);
+    for (const t of lines) {
       const d = create("div");
       d.textContent = t;
       sum.append(d);
@@ -883,17 +990,26 @@
     }
     renderEveryone(items, decisions);
     state.communityPending = view.pending || 0;
-    paintConfirm();
+    if (state.communityBusy) setCommunityBusy(true);   // freshly drawn buttons too
+    else paintConfirm();
   }
 
-  function idShort(id) { return id ? `${id.slice(0, 5)}…${id.slice(-4)}` : "(this upload)"; }
+  function idShort(id) { return id ? `${id.slice(0, 5)}…${id.slice(-4)}` : "(new in this file)"; }
 
   // "0:3:1" (Family Graph's key for an earlier person or household on this
   // upload) -> "row 5", the spreadsheet row the operator can see.
   function sheetRowOf(ref) {
     const items = (state.community && state.community.items) || [];
     const hit = items.find((i) => i.key === ref);
-    return hit ? `row ${hit.sheet_row}` : "earlier on this upload";
+    return hit ? `row ${hit.sheet_row}` : "earlier in this file";
+  }
+
+  // Someone first seen earlier in this same file has no id yet (Family Graph
+  // issues it on commit), so a candidate like that is named by its row.
+  function newInFile(ref) {
+    const items = (state.community && state.community.items) || [];
+    const hit = ref ? items.find((i) => i.key === ref) : null;
+    return hit ? `(new in this file, row ${hit.sheet_row})` : "(new in this file)";
   }
 
   function candidateText(cand, kind) {
@@ -925,16 +1041,18 @@
       (item.date_of_birth ? `  born ${item.date_of_birth}` : "");
     card.append(head);
     const why = create("div", { class: "why" });
-    why.textContent = (item.review_reasons || []).map((r) => REVIEW_WHY[r] || r.replace(/_/g, " ")).join(" · ");
+    why.textContent = (item.review_reasons || []).map(reviewWhy).join(" · ");
     card.append(why);
 
     if (decision) {
       const done = create("div", { class: "done" });
+      const t0 = String(decision.target || "").toUpperCase();
       const target = decision.target
-        ? (item.candidates || []).find((c) => (c.community_id || c.sheet_ref) === decision.target)
+        ? (item.candidates || []).find((c) =>
+            [c.community_id, c.sheet_ref].some((r) => r && String(r).toUpperCase() === t0))
         : null;
       done.textContent = decision.action === "attach"
-        ? `-> SAME AS ${target ? candidateText(target, item.kind).who : ""} ${/^[IF]/.test(decision.target) ? idShort(decision.target) : `(${sheetRowOf(decision.target)})`}`
+        ? `-> SAME AS ${target ? candidateText(target, item.kind).who : ""} ${/^[IF]/i.test(decision.target) ? idShort(decision.target) : newInFile(decision.target)}`
         : decision.action === "create" ? `-> A DIFFERENT ${item.kind === "person" ? "PERSON" : "HOUSEHOLD"} (new id)` : "-> NOT A PERSON (no id)";
       const undo = create("button", { type: "button", class: "btn secondary sm", onclick: () => decide(item.key, "undo") });
       undo.textContent = "[ UNDO ]";
@@ -947,11 +1065,17 @@
       const desc = create("span", { class: "desc" });
       const b = create("b");
       b.textContent = t.who;
-      desc.append(b, document.createTextNode(`  ${cand.community_id ? idShort(cand.community_id) : "earlier on this upload"}\n${t.rest}`));
+      desc.append(b, document.createTextNode(`  ${cand.community_id ? idShort(cand.community_id) : newInFile(cand.sheet_ref)}\n${t.rest}`));
+      // No id yet (new earlier in this file): the decision names its row key
+      // ("0:3:1" / "0:3:family") and Family Graph resolves it on commit.
       const ref = cand.community_id || cand.sheet_ref;
-      const same = create("button", { type: "button", class: "btn sm", onclick: () => decide(item.key, "attach", ref) });
-      same.textContent = item.kind === "person" ? "[ SAME PERSON ]" : "[ SAME HOUSEHOLD ]";
-      card.append(create("div", { class: "cand" }, [desc, same]));
+      const parts = [desc];
+      if (ref) {
+        const same = create("button", { type: "button", class: "btn sm", onclick: () => decide(item.key, "attach", ref) });
+        same.textContent = item.kind === "person" ? "[ SAME PERSON ]" : "[ SAME HOUSEHOLD ]";
+        parts.push(same);
+      }
+      card.append(create("div", { class: "cand" }, parts));
     }
     const acts = create("div", { class: "acts" });
     const neu = create("button", { type: "button", class: "btn secondary sm", onclick: () => decide(item.key, "create") });
@@ -977,6 +1101,7 @@
         : i.action === "new" ? "new" : i.action === "review" ? (d ? "decided" : "needs you") : i.action;
       if (i.same_as) status = `same as ${sheetRowOf(i.same_as)}`;
       if (i.matched && i.matched.via === "household") status += " (household)";
+      if (i.told_apart) status += " (told apart)";
       const text = create("span");
       text.textContent = `${glyph} ROW ${String(i.sheet_row).padEnd(5)} ${i.kind === "person" ? "   " : "HH "} ${padRight(i.label, 28)} ${status}`;
       row.append(text, create("span", { class: "grow" }));
@@ -1013,9 +1138,12 @@
     state.preview = null;
     state.community = null;
     state.communityPending = 0;
+    state.communityBusy = false;
     state.deselected.clear();
     state.deselectedTypes.clear();
     hide($("block-community"));
+    hide($("community-progress"));
+    hide($("confirm-progress"));
     hide($("confirm-error"));
     $("btn-confirm").disabled = false;
     $("btn-confirm").textContent = "[ CONFIRM AND SCRUB ]";
@@ -1424,11 +1552,44 @@
 
     // Community review
     $("btn-community-retry").addEventListener("click", async () => {
+      const sid = state.sessionId;
       $("btn-community-retry").textContent = "[ ASKING... ]";
+      renderSteps("community-progress", [
+        ACTIVE("Family Graph: matching this roster again (a large roster can take a minute or two)"),
+      ]);
+      show($("community-progress"));
+      setCommunityBusy(true);
+      let view = null;
       try {
-        renderCommunity(await api(`/api/anonymize/${state.sessionId}/community/retry`, { method: "POST" }));
-      } catch (exc) { alert(`Family Graph: ${exc.message}`); }
+        view = await api(`/api/anonymize/${sid}/community/retry`, { method: "POST" });
+      } catch (exc) {
+        if (exc.status === undefined) {
+          // The browser stopped waiting; the plan may still be running.
+          for (let i = 0; i < 2400 && state.sessionId === sid; i++) {
+            await sleep(1500);
+            try {
+              const v = await api(`/api/anonymize/${sid}/community`);
+              if (!v.busy) { view = v; break; }
+            } catch (e2) { if (e2.status === 404) break; }
+          }
+        } else {
+          view = exc.body && exc.body.community;
+          alert(`Family Graph: ${exc.message}`);
+        }
+      }
+      hide($("community-progress"));
       $("btn-community-retry").textContent = "[ ASK FAMILY GRAPH AGAIN ]";
+      setCommunityBusy(false);
+      if (state.sessionId !== sid) return;
+      if (view) renderCommunity(view);
+      // A new plan can add guaranteed catches - the preview must show them.
+      try {
+        const s = await api(`/api/anonymize/${sid}/status`);
+        if (s.preview && state.sessionId === sid) {
+          state.preview = s.preview;
+          renderPreview(s.preview);
+        }
+      } catch {}
       refreshLog();
     });
     $("btn-community-skip").addEventListener("click", async () => {

@@ -45,9 +45,14 @@ LLM_STALL_TIMEOUT_S = _int("LLM_STALL_TIMEOUT_S", 180)
 OLLAMA_NUM_CTX = _int("OLLAMA_NUM_CTX", 8192)
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-# Family Graph (community identifiers for rosters). A large roster plan can
-# take a while on a small machine; the call fails only after this long.
-FAMILYGRAPH_TIMEOUT_S = _int("FAMILYGRAPH_TIMEOUT_S", 600)
+# Family Graph (community identifiers for rosters). Two read timeouts, in
+# seconds (connecting always gives up after 5):
+#   FAMILYGRAPH_TIMEOUT_S         quick calls - health check, [ TEST ], id lookup.
+#   FAMILYGRAPH_ROSTER_TIMEOUT_S  roster plan and commit. A 2,000-row roster can
+#                                 take 30-90 s on a small machine; the call fails
+#                                 only after this long, with nothing half-done.
+FAMILYGRAPH_TIMEOUT_S = _int("FAMILYGRAPH_TIMEOUT_S", 10)
+FAMILYGRAPH_ROSTER_TIMEOUT_S = _int("FAMILYGRAPH_ROSTER_TIMEOUT_S", 600)
 
 UPLOADS_DIR = ROOT / "uploads"
 OUTPUT_DIR = ROOT / "output"

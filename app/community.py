@@ -73,10 +73,64 @@ class CommunityState:
     decisions: dict = field(default_factory=dict)
     result: Optional[dict] = None                   # the commit response
     registered: int = 0                             # guaranteed catches added to the registry
+    commit_error: Optional[str] = None              # why the last commit did not happen
 
 
 class CommunityError(RuntimeError):
     pass
+
+
+# Decision targets (Family Graph roster contract): a community id, or - for
+# someone first seen earlier in this same upload, who has no id yet - that
+# person's or household's key on this upload.
+_ID_TARGET_RE = re.compile(r"([IF])([0-9A-F]{16}|[0-9A-F]{8})", re.I)
+_PERSON_REF_RE = re.compile(r"([0-9]{1,6}):([0-9]{1,7}):([0-9]{1,3})")
+_FAMILY_REF_RE = re.compile(r"([0-9]{1,6}):([0-9]{1,7}):family", re.I)
+
+
+def normalize_target(target, kind: str) -> Optional[str]:
+    """The canonical form of an attach target for a person or household, or
+    None when it is not one. Ids are case-insensitive (sent upper case);
+    sheet refs are sent exactly as Family Graph keys them ("0:3:1",
+    "0:3:family")."""
+    t = target.strip() if isinstance(target, str) else ""
+    m = _ID_TARGET_RE.fullmatch(t)
+    if m:
+        letter = m.group(1).upper()
+        if letter != ("I" if kind == "person" else "F"):
+            return None
+        return letter + m.group(2).upper()
+    if kind == "person":
+        m = _PERSON_REF_RE.fullmatch(t)
+        return f"{int(m.group(1))}:{int(m.group(2))}:{int(m.group(3))}" if m else None
+    m = _FAMILY_REF_RE.fullmatch(t)
+    return f"{int(m.group(1))}:{int(m.group(2))}:family" if m else None
+
+
+def _offered_targets(item: dict) -> set:
+    """Every target the review offered for this item: each candidate's id
+    and, for someone new earlier in this upload, their sheet ref."""
+    out = set()
+    for c in list(item.get("candidates") or []) + ([item["matched"]] if item.get("matched") else []):
+        for ref in (c.get("community_id"), c.get("sheet_ref")):
+            n = normalize_target(ref, item["kind"])
+            if n:
+                out.add(n)
+    return out
+
+
+def explain(exc: Exception, what: str) -> str:
+    """Operator-facing text for a failed Family Graph call. `what` is "plan"
+    (nothing is ever written) or "commit"."""
+    if isinstance(exc, familygraph.FamilyGraphError) and exc.timed_out:
+        if what == "commit":
+            return (f"{exc} while writing this roster. Nothing was scrubbed and no file was written. "
+                    "Family Graph may still finish on its side - press CONFIRM AND SCRUB again in a "
+                    "minute (anyone it already wrote comes back as known). For a very large roster, "
+                    "raise FAMILYGRAPH_ROSTER_TIMEOUT_S in .env.")
+        return (f"{exc} while matching this roster. Nothing was written. For a very large "
+                "roster, raise FAMILYGRAPH_ROSTER_TIMEOUT_S in .env.")
+    return str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -149,41 +203,62 @@ def _body(sess, state: CommunityState, with_decisions: bool) -> dict:
 # Plan
 # ---------------------------------------------------------------------------
 
-def plan_for_session(sess) -> CommunityState:
-    """Run after detection. Never raises: problems land on state.error and the
-    run carries on (the operator can retry or continue without ids)."""
-    state = CommunityState()
-    sess.community = state
+def plan_for_session(sess, decisions: Optional[dict] = None) -> CommunityState:
+    """Run after detection (and on retry, with the decisions made so far).
+    Never raises: problems land on state.error and the run carries on - the
+    operator must retry or explicitly continue without ids.
+
+    The new state replaces sess.community only when it is complete, so a
+    slow plan never exposes a half-built state (a retry keeps showing the
+    previous one, marked busy)."""
+    state = CommunityState(decisions=dict(decisions or {}))
+    try:
+        _plan_into(sess, state)
+    finally:
+        sess.community = state
+    return state
+
+
+def _plan_into(sess, state: CommunityState) -> None:
     tables = tables_of(sess.extract)
     if tables is None:
         state.reason = "not a spreadsheet"
-        return state
+        return
     if not familygraph.is_configured():
         state.reason = "Family Graph is not connected"
-        return state
+        return
     if sess.allowed_tags and "PERSON" not in sess.allowed_tags:
         state.reason = "names (PERSON) are not being replaced"
-        return state
+        return
     state.category = familygraph.settings().get("category") or "other"
     try:
         state.sheets = build_sheets(tables)
         if not state.sheets:
             state.status, state.reason = "none", "no rows found"
-            return state
+            return
         _run_plan(sess, state)
     except (CommunityError, familygraph.FamilyGraphError) as exc:
         state.status = "error"
-        state.error = str(exc)
-        log.warning("session %s community plan failed: %s", sess.id, type(exc).__name__)
-        return state
+        state.error = explain(exc, "plan")
+        state.plan = None
+        log.warning("session %s community plan failed: %s%s", sess.id, type(exc).__name__,
+                    " (timed out)" if getattr(exc, "timed_out", False) else "")
+        return
     _register_guaranteed_catches(sess, state)
-    return state
 
 
 def _run_plan(sess, state: CommunityState) -> None:
-    data = familygraph.plan(_body(sess, state, with_decisions=True))
+    rows = sum(len(s["rows"]) for s in state.sheets)
+    log.info("session %s community plan requested: sheets=%d rows=%d decisions=%d",
+             sess.id, len(state.sheets), rows, len(state.decisions))
+    sess.fg_rows, sess.fg_busy = rows, "plan"
+    try:
+        data = familygraph.plan(_body(sess, state, with_decisions=True))
+    finally:
+        sess.fg_busy = ""
     state.plan = data
     state.error = None
+    _prune_decisions(sess, state)
     people = sum(len(r.get("persons") or []) for s in data.get("sheets") or [] for r in s.get("rows") or [])
     if not people:
         state.status, state.reason = "none", "no name columns recognized"
@@ -193,20 +268,41 @@ def _run_plan(sess, state: CommunityState) -> None:
     p, f = summ.get("persons") or {}, summ.get("families") or {}
     log.info(
         "session %s community plan: rows=%s persons matched=%s new=%s review=%s "
-        "families matched=%s new=%s review=%s pending=%d",
+        "families matched=%s new=%s review=%s told_apart=%s pending=%d",
         sess.id, summ.get("rows"), p.get("matched"), p.get("new"), p.get("review"),
-        f.get("matched"), f.get("new"), f.get("review"), len(pending(state)),
+        f.get("matched"), f.get("new"), f.get("review"), summ.get("told_apart", 0), len(pending(state)),
     )
 
 
 def retry(sess) -> CommunityState:
-    state = sess.community or CommunityState()
-    keep = dict(state.decisions)
-    state = plan_for_session(sess)
-    # Decisions still apply to the same rows; drop any whose key vanished.
-    valid = {i["key"] for i in _items(state)}
-    state.decisions = {k: v for k, v in keep.items() if k in valid}
-    return state
+    """Ask Family Graph again. Decisions made so far still apply to the same
+    rows and go with the request; any the new plan no longer supports are
+    dropped (the item comes back as needing a decision)."""
+    keep = dict((sess.community or CommunityState()).decisions)
+    return plan_for_session(sess, decisions=keep)
+
+
+def _prune_decisions(sess, state: CommunityState) -> None:
+    """Drop decisions that no longer fit the plan: the item is gone, or an
+    attach target is no longer one of the offered candidates. Never keeps a
+    decision Family Graph would apply to someone the operator did not see."""
+    if not state.decisions:
+        return
+    items = {i["key"]: i for i in _items(state)}
+    kept = {}
+    for key, d in state.decisions.items():
+        item = items.get(key)
+        if item is None:
+            continue
+        if d.get("action") == "attach" and d.get("target") not in _offered_targets(item):
+            continue
+        if d.get("action") == "skip" and item["kind"] != "person":
+            continue
+        kept[key] = d
+    dropped = len(state.decisions) - len(kept)
+    state.decisions = kept
+    if dropped:
+        log.warning("session %s community decisions dropped (no longer offered): %d", sess.id, dropped)
 
 
 def _register_guaranteed_catches(sess, state: CommunityState) -> None:
@@ -315,6 +411,8 @@ def _items(state: CommunityState) -> list:
                     "action": p.get("action"), "community_id": p.get("community_id"),
                     "same_as": p.get("same_as"), "matched": p.get("matched"),
                     "candidates": p.get("candidates") or [], "review_reasons": p.get("review_reasons") or [],
+                    # namesakes Family Graph's rules told apart without asking (a count)
+                    "told_apart": p.get("told_apart") if isinstance(p.get("told_apart"), int) else 0,
                 })
             fam = row.get("family")
             if fam:
@@ -346,19 +444,23 @@ def decide(state: CommunityState, key: str, action: str, target: Optional[str] =
     if action not in allowed:
         raise ValueError(f"action must be one of {', '.join(allowed)}")
     if action == "attach":
-        refs = {c.get("community_id") or c.get("sheet_ref") for c in item["candidates"]}
-        if item.get("matched"):
-            refs.add(item["matched"].get("community_id") or item["matched"].get("sheet_ref"))
-        if not target or target not in refs:
+        norm = normalize_target(target, item["kind"])
+        if norm is None:
+            shape = ("an I… id or a row reference like 0:3:1" if item["kind"] == "person"
+                     else "an F… id or a row reference like 0:3:family")
+            raise ValueError(f"attach target must be {shape}")
+        if norm not in _offered_targets(item):
             raise ValueError("attach must name one of the listed candidates")
-        state.decisions[key] = {"action": "attach", "target": target}
+        state.decisions[key] = {"action": "attach", "target": norm}
     else:
         state.decisions[key] = {"action": action}
 
 
-def view(state: Optional[CommunityState]) -> dict:
+def view(state: Optional[CommunityState], busy: str = "") -> dict:
+    """What the preview shows. `busy` ("plan" / "commit") means a Family
+    Graph call for this session is still running."""
     if state is None:
-        return {"status": "off", "reason": "not planned"}
+        return {"status": "off", "reason": "not planned", "busy": busy}
     out = {
         "status": state.status,
         "reason": state.reason,
@@ -366,6 +468,8 @@ def view(state: Optional[CommunityState]) -> dict:
         "category": state.category,
         "pending": len(pending(state)),
         "decisions": state.decisions,
+        "busy": busy,
+        "commit_error": state.commit_error,
     }
     data = state.result or state.plan
     if data:
@@ -383,9 +487,26 @@ def commit_for_session(sess) -> bool:
     new items need a decision (state.plan now holds them). Raises
     FamilyGraphError when Family Graph can't be reached or says no."""
     state = sess.community
-    committed, data = familygraph.commit(_body(sess, state, with_decisions=True))
+    state.commit_error = None
+    rows = sum(len(s["rows"]) for s in state.sheets)
+    log.info("session %s community commit requested: rows=%d decisions=%d",
+             sess.id, rows, len(state.decisions))
+    sess.fg_rows, sess.fg_busy = rows, "commit"
+    try:
+        committed, data = familygraph.commit(_body(sess, state, with_decisions=True))
+    except familygraph.FamilyGraphError as exc:
+        # Nothing changes here: status stays "ready", no result, no scrub.
+        state.commit_error = explain(exc, "commit")
+        log.error("session %s community commit failed: %s%s", sess.id, type(exc).__name__,
+                  " (timed out)" if exc.timed_out else "")
+        raise
+    finally:
+        sess.fg_busy = ""
     if not committed:
-        state.plan = data
+        if data:                        # keep the last plan if the refusal carried none
+            state.plan = data
+        _prune_decisions(sess, state)
+        state.commit_error = "Family Graph found new items that need a decision"
         log.warning("session %s community commit refused: %d item(s) need a decision",
                     sess.id, len(pending(state)))
         return False
@@ -430,11 +551,19 @@ def overrides_for(sess) -> Overrides:
                 pid = p.get("community_id")
                 if p.get("action") == "skip" or not pid:
                     continue
-                ov.registry[pid] = {
-                    "kind": "person",
-                    "display": " ".join(x for x in (p.get("given_name"), p.get("family_name")) if x),
-                    **({"family": fid} if fid else {}),
-                }
+                # One person can fill several cells: many rows (a parent per
+                # child) or two slots of one row (Parent 1 and Parent 2 the
+                # same human, entered twice). One registry entry; the first
+                # full spelling seen names them, the first household sticks.
+                display = " ".join(x for x in (p.get("given_name"), p.get("family_name")) if x)
+                rec = ov.registry.get(pid)
+                if rec is None:
+                    ov.registry[pid] = {"kind": "person", "display": display, **({"family": fid} if fid else {})}
+                else:
+                    if len(display) > len(rec.get("display") or "") and " " not in (rec.get("display") or ""):
+                        rec["display"] = display
+                    if fid and "family" not in rec:
+                        rec["family"] = fid
                 cell = _name_cell(p.get("name_cells") or [])
                 if cell is None:
                     continue

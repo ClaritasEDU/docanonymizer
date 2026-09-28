@@ -55,6 +55,17 @@ class Session:
     preview: Optional[dict] = None     # built once after detection; polled often
     # Community identifiers from Family Graph (spreadsheets only; community.py).
     community: Optional["community_mod.CommunityState"] = None
+    # "plan" / "commit" while a Family Graph call is in flight (can take
+    # minutes on a large roster) - the UI shows it as the active step.
+    fg_busy: str = ""
+    fg_rows: int = 0                   # roster rows in that call (a count only)
+    # extracting -> detecting -> community -> finishing -> done (status polling)
+    stage: str = ""
+    # Set once, before the scrub worker starts: confirm is never run twice.
+    scrub_started: bool = False
+    # Held by confirm (the Family Graph commit) and community retry, so two
+    # Family Graph calls for one session can never overlap.
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     error: Optional[str] = None
     created_at: float = field(default_factory=time.monotonic)
     detected_at: Optional[float] = None   # when the preview became ready
@@ -190,6 +201,7 @@ def run_extract_and_detect(sess: Session) -> Session:
     Any failure is terminal: the temp upload (and any conversion dir) is
     deleted immediately - PII must not linger on disk after a failed run.
     """
+    sess.stage = "extracting"
     try:
         sess.extract = extract(sess.upload_path)
     except Exception as exc:  # bubble up clean error to UI
@@ -203,6 +215,7 @@ def run_extract_and_detect(sess: Session) -> Session:
     def on_chunk(info: dict) -> None:
         sess.detection_progress.append(info)
 
+    sess.stage = "detecting"
     try:
         sess.registry = detect_pii(
             sess.extract.text,
@@ -228,12 +241,17 @@ def run_extract_and_detect(sess: Session) -> Session:
     _backstop(sess)
 
     # Community identifiers: ask Family Graph who these people are. Never
-    # fails the run - a problem shows in the preview with a retry.
+    # fails the run - a problem shows in the preview with a retry, and
+    # confirm stays blocked until the operator retries or opts out.
+    sess.stage = "community"
     try:
         community_mod.plan_for_session(sess)
     except Exception as exc:  # defensive: the layer is optional, detection is not
         log.exception("session %s community plan crashed: %s", sess.id, type(exc).__name__)
         sess.community = community_mod.CommunityState(status="error", error="community ids unavailable")
+    finally:
+        sess.fg_busy = ""
+    sess.stage = "finishing"
 
     # Overlapping detections ("Patient Jane" + "Jane Smith") would leave a
     # fragment ("Smith") behind whichever wins. Register the overlapping
@@ -250,6 +268,7 @@ def run_extract_and_detect(sess: Session) -> Session:
         log.info("session %s overlapping detections merged: %d", sess.id, len(unions))
 
     sess.detected_at = time.monotonic()
+    sess.stage = "done"
     sess.detection_complete = True
     counts = sess.registry.counts_per_type()
     log.info(
@@ -306,6 +325,7 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None,
         # Already scrubbed - source temp files are gone, nothing to redo.
         log.warning("session %s confirm ignored: already scrubbed", sess.id)
         return sess
+    sess.scrub_started = True
 
     for original in deselected or []:
         sess.registry.drop(original)

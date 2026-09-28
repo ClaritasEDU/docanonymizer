@@ -66,6 +66,9 @@ PATTERNS: dict[str, re.Pattern] = {
 }
 
 _PLACEHOLDER_RE = PLACEHOLDER_RE
+# Candidate spans for the exact community tokens a roster run wrote; a span is
+# stripped only if it IS one of them (membership, never shape).
+_COMMUNITY_SHAPE_RE = re.compile(r"\[?[IF](?:[0-9A-F]{16}|[0-9A-F]{8})\]?")
 _TAG_RE = re.compile(r"<[^>]+>")
 _SHEET_PART_RE = re.compile(r"xl/worksheets/sheet\d*\.xml")
 _V_RE = re.compile(r"<v>[^<]*</v>")
@@ -189,8 +192,14 @@ def verify_output(output_path: Path, replacement_map: dict[str, str],
 
     # Regex residue - warnings only. Strip placeholders first (replaced with a
     # newline so surrounding digits can't fuse into a false phone/card match).
+    # Community ids are stripped only as the exact tokens this run wrote.
     regex_match_types: set[str] = set()
-    scrubbed = _PLACEHOLDER_RE.sub("\n", "\n".join(texts))
+    scrubbed = "\n".join(texts)
+    issued = frozenset(t for t in (extra_protected or ()) if t)
+    if issued:
+        scrubbed = _COMMUNITY_SHAPE_RE.sub(
+            lambda m: "\n" if m.group(0) in issued else m.group(0), scrubbed)
+    scrubbed = _PLACEHOLDER_RE.sub("\n", scrubbed)
     for label, pat in PATTERNS.items():
         for m in pat.finditer(scrubbed):
             v = m.group(0)

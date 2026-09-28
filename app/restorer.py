@@ -69,16 +69,23 @@ _KEY_PLACEHOLDER_RE = re.compile(r"\[([A-Z]+)_([0-9A-F]+)\]")
 #   nb - no brackets: TAG_HEX   TAG\_HEX   __TAG_HEX__ (markdown)   TAG_HEX_email
 #   xh - bare 12-char hex
 _TAG = r"[A-Za-z][A-Za-z_]{1,30}"
-_TOKEN_RE = re.compile(
-    # Community ids first: [I…] / [F…], optionally tag-prefixed or escaped,
-    # then bare I…/F… with 16 hex, then a bare 16-hex (the letter dropped).
+# Community ids: [I…] / [F…], optionally tag-prefixed or escaped, then bare
+# I…/F… with 16 hex, then a bare 16-hex (the letter dropped). Used ONLY when
+# a selected key carries an identity_registry (a roster with community ids):
+# for any other key a 16-hex string or an I…/F…-shaped word is ordinary text
+# and is neither rewritten nor reported.
+_COMMUNITY_ALTS = (
     rf"(?P<cb>\\?\[[ \t]*(?:[A-Za-z][A-Za-z]{{1,30}}\\?_)?(?P<cbl>[IiFf])(?P<cbh>[0-9A-Fa-f]{{16}}|[0-9A-Fa-f]{{8}})[ \t]*\\?\])"
     rf"|(?<![0-9A-Za-z])(?P<cn>(?:[A-Za-z][A-Za-z]{{1,30}}\\?_)?(?P<cnl>[IiFf])(?P<cnh>[0-9A-Fa-f]{{16}}))(?![0-9A-Za-z])"
     rf"|(?<![0-9A-Za-z])(?P<cx>[0-9A-Fa-f]{{16}})(?![0-9A-Za-z])"
-    rf"|(?P<br>\\?\[[ \t]*(?P<bt>{_TAG})\\?_(?P<bh>[0-9A-Fa-f]{{4,16}})[ \t]*\\?\])"
+)
+_VALUE_ALTS = (
+    rf"(?P<br>\\?\[[ \t]*(?P<bt>{_TAG})\\?_(?P<bh>[0-9A-Fa-f]{{4,16}})[ \t]*\\?\])"
     rf"|(?<![0-9A-Za-z])(?P<nb>(?P<nt>{_TAG})\\?_(?P<nh>[0-9A-Fa-f]{{4,16}}))(?![0-9A-Fa-f])"
     rf"|(?<![0-9A-Za-z])(?P<xh>[0-9A-Fa-f]{{{HEX_LEN}}})(?![0-9A-Za-z])"
 )
+_TOKEN_RE = re.compile(_COMMUNITY_ALTS + "|" + _VALUE_ALTS)     # keys with community ids
+_VALUE_TOKEN_RE = re.compile(_VALUE_ALTS)                       # every other key
 _ANY_ID_RE = re.compile(rf"(?=([0-9A-Fa-f]{{{HEX_LEN}}}))")
 _SHEET_ID_RE = re.compile(r"SHEET_([0-9A-F]{12})")
 _COMMUNITY_ID_RE = re.compile(r"([IF])([0-9A-F]{16}|[0-9A-F]{8})")
@@ -239,7 +246,8 @@ class TokenRestorer:
 
     def _resolve(self, m: re.Match) -> tuple[Optional[str], str, dict]:
         """Returns (original or None, key_tag, flags)."""
-        if m.group("cb") is not None or m.group("cn") is not None or m.group("cx") is not None:
+        if "cb" in m.re.groupindex and (
+                m.group("cb") is not None or m.group("cn") is not None or m.group("cx") is not None):
             return self._resolve_community(m)
         if m.group("xh") is not None:
             hx = m.group("xh").upper()
@@ -302,7 +310,8 @@ class TokenRestorer:
                 seen_unresolved.add(tok)
                 report.unresolved.append(tok)
 
-        for m in _TOKEN_RE.finditer(text):
+        grammar = _TOKEN_RE if self.index.community else _VALUE_TOKEN_RE
+        for m in grammar.finditer(text):
             original, key_tag, flags = self._resolve(m)
             if covered is not None and (original is not None or flags.get("report")):
                 covered[m.start():m.end()] = b"\x01" * (m.end() - m.start())
