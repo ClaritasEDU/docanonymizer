@@ -857,3 +857,22 @@ Eight finders (identity, rules, security, robustness, Doc Anonymizer core, priva
 
 1. Deploy on the Spark server next to Family Graph, issue the roster key, paste it into the [ FAMILY GRAPH ] panel, and run one real roster end to end.
 2. Family Graph side: roster plan and commit still run on its request thread, so a 2,000-row roster holds other requests for about 10 s. Moving large jobs to a worker is future work.
+
+---
+
+## Session 008 (follow-up) - 2026-09-28 - Where Doc Anonymizer actually runs
+
+### What was built or changed
+- The Spark server turned out to be a managed Kubernetes box (Family Graph and MissionIQ deployed from HQ out of `ClaritasEDU/edge-ops`). Doc Anonymizer has no image or chart there, so the README and business spec no longer say it runs next to Family Graph on 127.0.0.1. On the managed box it runs on the operator's Mac with a local model and calls Family Graph at `http://[box-ip]:30500`. The hand-built side-by-side setup with an SSH tunnel is kept as the second option.
+- README shows the `kubectl exec` form of `issue-key docanonymizer roster` for the managed box.
+- `docs/community-identity-overview.pdf` redrawn to match (Mac on the left, Spark server on the right).
+
+### Decisions / assumptions
+- Verified in code that the Family Graph URL guard accepts a `10.x` LAN address and still refuses a public one.
+- No code change. The guard, the Host check, and the 127.0.0.1 bind stay exactly as they are.
+
+### Open issues
+- The roster crosses the school LAN as plain HTTP on the way to port 30500. Use it only from a staff network. Moving Doc Anonymizer onto the box (image, chart, site pin) would close this and let it use the box's model; not started.
+
+### Next steps
+1. After the edge-ops branch is merged and Family Graph is upgraded, issue the roster key inside the Family Graph pod, point the [ FAMILY GRAPH ] panel at `http://[box-ip]:30500`, and run one real roster end to end.

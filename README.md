@@ -81,16 +81,25 @@ Rosters and parishioner lists can carry one lifelong id per person (`[I…]`, I 
 
 This layer applies only to spreadsheets (xlsx, xls, ods, csv) and only when Family Graph is configured. PDFs, DOCX, PPTX, scans, and text files make zero Family Graph calls and are anonymized exactly as before.
 
-**Connect it (one time).** Family Graph runs on the same machine or inside the firewall. Issue a key that carries only the `roster` scope:
+**Connect it (one time).** Family Graph runs on the same machine or inside the firewall. Issue a key that carries only the `roster` scope. On a hand-built box:
 
 ```bash
 cd ~/familygraph
 node bin/family-graph.js issue-key docanonymizer roster
 ```
 
-Then in Doc Anonymizer click `[ FAMILY GRAPH: OFF ]`, enter the URL (usually `http://127.0.0.1:3500`), paste the key, pick the roster type (SCHOOL, PARISH, OTHER), `[ TEST ]`, `[ SAVE ]`. Settings live in `familygraph.json` (0600, gitignored). The key is never shown again or logged. A non-local URL is refused, with no override, because the call carries the whole roster. Changing the URL requires re-entering the key.
+On the managed Spark server (Family Graph runs in Kubernetes there), run it inside the Family Graph pod, as root on the server:
 
-On the Spark server, Doc Anonymizer still listens on 127.0.0.1:5000 and refuses any other Host name, so reach it from your Mac through an SSH tunnel (`ssh -L 5000:127.0.0.1:5000 [user]@[spark-host]`, then open http://127.0.0.1:5000). A LAN name or IP in the browser gets a 403.
+```bash
+k3s kubectl -n familygraph exec -it deploy/familygraph -- node bin/family-graph.js issue-key docanonymizer roster
+```
+
+Then in Doc Anonymizer click `[ FAMILY GRAPH: OFF ]`, enter the URL (`http://127.0.0.1:3500` when Family Graph is on the same machine, `http://[box-ip]:30500` for the managed Spark server), paste the key, pick the roster type (SCHOOL, PARISH, OTHER), `[ TEST ]`, `[ SAVE ]`. Settings live in `familygraph.json` (0600, gitignored). The key is never shown again or logged. A non-local URL is refused, with no override, because the call carries the whole roster. Changing the URL requires re-entering the key.
+
+Doc Anonymizer always listens on 127.0.0.1:5000 and refuses any other Host name (a LAN name or IP in the browser gets a 403).
+
+- **Managed Spark server.** Doc Anonymizer is not deployed there; only Family Graph and MissionIQ are. Run Doc Anonymizer on your Mac with a local model (Ollama) and point its Family Graph URL at `http://[box-ip]:30500`. That roster traffic crosses the school network as plain HTTP, so use it only from a staff network. The server's own AI model is not reachable from the LAN at a school site, by design.
+- **Hand-built box** with both apps side by side. Reach Doc Anonymizer from your Mac through an SSH tunnel (`ssh -L 5000:127.0.0.1:5000 [user]@[spark-host]`, then open http://127.0.0.1:5000).
 
 **What happens on a roster.**
 
