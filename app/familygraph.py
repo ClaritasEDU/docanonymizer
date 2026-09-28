@@ -230,7 +230,8 @@ def _raise_for(status: int, data: dict, what: str) -> None:
         raise FamilyGraphError("Family Graph rejected the API key", status, data)
     if status == 403:
         raise FamilyGraphError(
-            f"the API key is missing a scope for {what} (needs pii.read and import)", status, data)
+            f"the API key is missing the roster scope for {what} - issue one with: "
+            "family-graph issue-key docanonymizer roster", status, data)
     if status == 429:
         raise FamilyGraphError("Family Graph is rate limiting - wait a minute and retry", status, data)
     raise FamilyGraphError(f"Family Graph {what} failed ({status}) {detail}".strip(), status, data)
@@ -251,7 +252,8 @@ def check() -> dict:
     if status == 401:
         return {"status": "err", "error": "Family Graph rejected the API key"}
     if status == 403:
-        return {"status": "err", "error": "the API key lacks the pii.read scope"}
+        return {"status": "err", "error": "the API key lacks the roster scope - issue one with: "
+                                          "family-graph issue-key docanonymizer roster"}
     return {"status": "err", "error": f"unexpected response {status} - is this Family Graph with roster support?"}
 
 
