@@ -27,6 +27,7 @@
     <select id="endpoint-select" aria-label="active endpoint"></select>
     <button type="button" class="btn secondary sm" id="btn-toggle-endpoints">[ MANAGE ENDPOINTS ]</button>
     <button type="button" class="btn secondary sm" id="btn-toggle-github">[ MANAGE GITHUB ]</button>
+    <button type="button" class="btn secondary sm" id="btn-toggle-familygraph">[ FAMILY GRAPH: OFF ]</button>
     <button type="button" class="btn secondary sm" id="btn-toggle-theme">[ DARK ]</button>
   </section>
 
@@ -96,6 +97,32 @@
   </section>
 
   <!-- ============================================
+       FAMILY GRAPH PANEL (community ids for rosters)
+       ============================================ -->
+  <section class="panel hidden" id="panel-familygraph">
+    <h3>[ FAMILY GRAPH - COMMUNITY IDS ]</h3>
+    <div class="sub" style="margin-bottom: 10px;">Spreadsheets (school rosters, parish lists) get one permanent id per person <span class="muted">[I…]</span> and per household <span class="muted">[F…]</span>, issued by Family Graph on this machine. The same person keeps the same id in every file. Documents are not affected.</div>
+    <form class="form" id="form-familygraph">
+      <label for="fg-url">FAMILY GRAPH URL</label>
+      <input type="url" id="fg-url" required placeholder="http://127.0.0.1:3500" />
+      <label for="fg-key">API KEY</label>
+      <input type="password" id="fg-key" autocomplete="off" placeholder="sk_... (blank keeps the saved key)" />
+      <label for="fg-category">ROSTER TYPE</label>
+      <select id="fg-category" aria-label="roster type">
+        <option value="school">SCHOOL</option>
+        <option value="church">PARISH</option>
+        <option value="other">OTHER</option>
+      </select>
+      <div class="form-actions">
+        <button type="button" class="btn secondary sm" id="btn-test-fg">[ TEST ]</button>
+        <button type="submit" class="btn sm" id="btn-save-fg">[ SAVE ]</button>
+        <button type="button" class="btn danger sm" id="btn-disconnect-fg">[ DISCONNECT ]</button>
+      </div>
+    </form>
+    <div class="note-plain" id="fg-status" role="status"></div>
+  </section>
+
+  <!-- ============================================
        MODE TABS
        ============================================ -->
   <nav class="tabs" role="tablist" aria-label="mode">
@@ -139,6 +166,20 @@
 
     <div class="section-label hidden" id="lbl-preview">PREVIEW - REVIEW BEFORE SCRUB</div>
     <div class="hidden" id="block-preview">
+      <div class="hidden" id="block-community">
+        <div class="preview-summary"><span><b>COMMUNITY IDS</b> <span class="muted">- who is who, from Family Graph</span></span></div>
+        <div class="results" id="community-summary"></div>
+        <div class="errline hidden" id="community-error" role="alert"></div>
+        <div class="note-plain hidden" id="community-note"></div>
+        <div id="community-review" class="community-review"></div>
+        <div class="preview-actions">
+          <button type="button" class="btn secondary sm" id="btn-community-retry">[ ASK FAMILY GRAPH AGAIN ]</button>
+          <button type="button" class="btn secondary sm" id="btn-community-all" aria-expanded="false">[ SHOW EVERYONE ]</button>
+          <button type="button" class="btn secondary sm" id="btn-community-skip">[ CONTINUE WITHOUT COMMUNITY IDS ]</button>
+        </div>
+        <div class="hidden community-review" id="community-all"></div>
+        <div style="height: 18px;"></div>
+      </div>
       <div class="preview-summary">
         <span><b>DETECTED:</b> <span id="prev-entities">0</span> values</span>
       </div>
@@ -151,6 +192,7 @@
         <span class="grow"></span>
         <span class="preview-hint">Click a placeholder, or a type above, to keep it as original text</span>
       </div>
+      <div class="errline hidden" id="confirm-error" role="alert"></div>
     </div>
 
     <div class="section-label hidden" id="lbl-scrub">SCRUB &amp; VERIFY</div>

@@ -1,0 +1,40 @@
+{
+  "headers": [
+    "Student First Name",
+    "Student Last Name",
+    "Grade",
+    "Parent 1 First Name",
+    "Parent 1 Last Name",
+    "Parent Email",
+    "Notes"
+  ],
+  "rows": [
+    [
+      "Emma",
+      "Smith",
+      "3",
+      "Jane",
+      "Smith",
+      "jane@example.org",
+      "Allergic to peanuts"
+    ],
+    [
+      "Liam",
+      "Smith",
+      "5",
+      "Jane",
+      "Smith",
+      "jane@example.org",
+      ""
+    ],
+    [
+      "Ava",
+      "Garcia",
+      "K",
+      "Marie",
+      "Garcia",
+      "",
+      "Ann picks up on Fridays"
+    ]
+  ]
+}

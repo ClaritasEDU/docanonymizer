@@ -450,6 +450,26 @@ label.btn { user-select: none; }
 }
 
 /* ---------- Misc ---------- */
+/* ---------- Community ids (review items) ---------- */
+.community-review { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.community-item {
+  border: 1px solid var(--border); background: var(--bg-surface);
+  padding: 10px 12px; font-size: 12px;
+}
+.community-item.decided { border-color: var(--text-dim); }
+.community-item .head { color: var(--text-primary); white-space: pre-wrap; }
+.community-item .why { color: var(--warning); margin-top: 2px; }
+.community-item .cand {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  border-top: 1px dashed var(--border); padding-top: 8px; margin-top: 8px;
+}
+.community-item .cand .desc { flex: 1 1 320px; color: var(--text-secondary); white-space: pre-wrap; }
+.community-item .cand .desc b { color: var(--text-primary); font-weight: 700; }
+.community-item .acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.community-item .done { color: var(--success); margin-top: 6px; }
+.community-line { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12px; white-space: pre; }
+.community-line .grow { flex: 1; }
+
 .hidden { display: none !important; }
 .muted { color: var(--text-secondary); }
 .center { text-align: center; }

@@ -53,8 +53,28 @@
   const AI_NOTE =
     "Note: this data has been anonymized. Tokens like [PERSON_3A4F9C2B1D0E] stand in for " +
     "real names, emails, phone numbers, addresses, and other personal details. Each token " +
-    "is unique to one real value. When you refer to any of them in your answer, copy the " +
+    "is unique to one real value. Tokens like [I3A4F9C2B1D0E7F21] are one real person and " +
+    "[F9B0C11D2E3F4A5B6] is one household - the same person or household has the same token " +
+    "everywhere it appears. When you refer to any of them in your answer, copy the " +
     "token exactly as written, brackets included. Do not shorten, merge, or invent tokens.";
+
+  // Plain-words labels for Family Graph's review reasons.
+  const REVIEW_WHY = {
+    possible_match: "possible match - confirm",
+    several_strong_candidates: "more than one strong match",
+    candidate_archived: "the match is an archived record",
+    household_disagrees: "the household points at someone else",
+    several_household_namesakes: "two people with this name in the household",
+    role_mismatch: "child / adult mismatch",
+    no_first_name: "no first name",
+    placeholder_name: "a placeholder, not a name",
+    initial_only: "an initial only",
+    looks_like_organization: "looks like an organization, not a person",
+    members_in_different_households: "the people on this row are in different households",
+    members_in_several_households: "these people share more than one household",
+    household_archived: "the household is archived",
+    same_address_no_known_members: "same address as an existing household",
+  };
 
   // ----- DOM helpers -----
   const $ = (id) => document.getElementById(id);
@@ -533,6 +553,9 @@
     if (!prev) return;
     show($("lbl-preview"));
     show($("block-preview"));
+    hide($("confirm-error"));
+    if (prev.community && prev.community.status !== "off") loadCommunity();
+    else { hide($("block-community")); state.communityPending = 0; paintConfirm(); }
     $("prev-entities").textContent = prev.entities;
     renderTypeToggles(prev.counts || {});
     const kept = prev.kept_amounts || 0;
@@ -602,21 +625,32 @@
 
   async function confirmScrub() {
     if (!state.sessionId) return;
-    hide($("lbl-preview"));
-    hide($("block-preview"));
-    show($("lbl-scrub"));
-    show($("progress-scrub"));
-    renderScrubSteps([{ glyph: "[>]", text: "applying replacements...", kind: "active", blink: true }]);
-
+    const btn = $("btn-confirm");
+    btn.disabled = true;
+    btn.textContent = "[ CONFIRMING... ]";
+    hide($("confirm-error"));
     try {
+      // Family Graph writes the community ids here, before anything is
+      // scrubbed. A refusal keeps the operator on the preview.
       await api(`/api/anonymize/${state.sessionId}/confirm`, {
         method: "POST",
         body: JSON.stringify({ deselected: [...state.deselected], deselected_types: [...state.deselectedTypes] }),
       });
     } catch (exc) {
-      renderScrubSteps([{ glyph: "[!]", text: `confirm failed: ${exc.message}`, kind: "err" }]);
+      btn.textContent = "[ CONFIRM AND SCRUB ]";
+      const err = $("confirm-error");
+      err.textContent = `[!] ${exc.message}`;
+      show(err);
+      if (exc.body && exc.body.community) renderCommunity(exc.body.community);
+      else paintConfirm();
       return;
     }
+    btn.textContent = "[ CONFIRM AND SCRUB ]";
+    hide($("lbl-preview"));
+    hide($("block-preview"));
+    show($("lbl-scrub"));
+    show($("progress-scrub"));
+    renderScrubSteps([{ glyph: "[>]", text: "applying replacements...", kind: "active", blink: true }]);
 
     // poll results
     if (state.polling) clearInterval(state.polling);
@@ -692,6 +726,18 @@
       lines.push({ text: padRight("TOTAL", 12) + `${r.totals.entities} entities    ${r.totals.replacements} replacements` });
       lines.push({ text: rule, cls: "rule" });
     }
+    const cm = r.community;
+    if (cm && cm.status === "committed") {
+      const p = cm.persons || {}, f = cm.families || {};
+      lines.push({ text: "COMMUNITY IDS (FAMILY GRAPH)" });
+      lines.push({ text: padRight("PEOPLE", 12) + `${(p.matched || 0) + (p.review || 0)} known    ${p.new || 0} new    ${p.skipped || 0} skipped` });
+      lines.push({ text: padRight("HOUSEHOLDS", 12) + `${(f.matched || 0) + (f.review || 0)} known    ${f.new || 0} new` });
+      lines.push({ text: `IMPORT RUN: ${(cm.import_runs || []).join(", ") || "-"}`, cls: "rule" });
+      lines.push({ text: rule, cls: "rule" });
+    } else if (cm && cm.status === "skipped") {
+      lines.push({ text: "COMMUNITY IDS: not used for this file", cls: "rule" });
+      lines.push({ text: rule, cls: "rule" });
+    }
     for (const l of lines) {
       const div = create("div", l.cls ? { class: l.cls } : {});
       div.textContent = l.text;
@@ -717,12 +763,262 @@
 
   function padRight(s, n) { return s + " ".repeat(Math.max(0, n - s.length)); }
 
+  // ----- Community ids (Family Graph) -----
+  async function loadFamilyGraph() {
+    try {
+      const s = await api("/api/familygraph");
+      $("btn-toggle-familygraph").textContent = s.configured ? "[ FAMILY GRAPH: ON ]" : "[ FAMILY GRAPH: OFF ]";
+      $("fg-url").value = s.base_url || "http://127.0.0.1:3500";
+      $("fg-key").value = "";
+      $("fg-key").placeholder = s.key_set ? "key saved - leave blank to keep" : "sk_... (from Family Graph)";
+      $("fg-category").value = s.category || "other";
+      $("fg-status").textContent = s.configured
+        ? "Connected. Spreadsheets will get community ids."
+        : "Not connected. Spreadsheets get the normal per-value tokens.";
+      return s;
+    } catch { return null; }
+  }
+
+  async function saveFamilyGraph() {
+    const payload = { base_url: $("fg-url").value.trim(), category: $("fg-category").value };
+    if ($("fg-key").value.trim()) payload.api_key = $("fg-key").value.trim();
+    await api("/api/familygraph", { method: "POST", body: JSON.stringify(payload) });
+    await loadFamilyGraph();
+  }
+
+  async function loadCommunity() {
+    if (!state.sessionId) return;
+    try {
+      renderCommunity(await api(`/api/anonymize/${state.sessionId}/community`));
+    } catch (exc) {
+      const err = $("community-error");
+      err.textContent = `[!] ${exc.message}`;
+      show(err);
+    }
+  }
+
+  function paintConfirm() {
+    const btn = $("btn-confirm");
+    const n = state.communityPending || 0;
+    btn.disabled = n > 0;
+    btn.title = n > 0 ? `${n} person/household decision(s) needed above` : "";
+  }
+
+  function communityCounts(items, decisions) {
+    const c = { person: { known: 0, new: 0, need: 0, decided: 0 }, family: { known: 0, new: 0, need: 0, decided: 0 } };
+    for (const i of items) {
+      const b = c[i.kind];
+      if (i.action === "review") {
+        if (decisions[i.key]) b.decided += 1; else b.need += 1;
+      } else if (i.action === "matched") b.known += 1;
+      else if (i.action === "new") b.new += 1;
+    }
+    return c;
+  }
+
+  function renderCommunity(view) {
+    state.community = view;
+    const block = $("block-community");
+    if (!view || view.status === "off") {
+      hide(block);
+      state.communityPending = 0;
+      paintConfirm();
+      return;
+    }
+    show(block);
+    const err = $("community-error"), note = $("community-note");
+    hide(err); hide(note);
+    $("community-review").innerHTML = "";
+    $("community-all").innerHTML = "";
+    const sum = $("community-summary");
+    sum.innerHTML = "";
+    const retry = $("btn-community-retry"), skip = $("btn-community-skip"), all = $("btn-community-all");
+
+    if (view.status === "error") {
+      err.textContent = `[!] ${view.error || "Family Graph unavailable"}\n    Start Family Graph and ask again, or continue without community ids.`;
+      show(err); show(retry); show(skip); hide(all);
+      skip.textContent = "[ CONTINUE WITHOUT COMMUNITY IDS ]";
+      state.communityPending = 1;          // confirm stays blocked until a choice
+      paintConfirm();
+      return;
+    }
+    if (view.status === "none") {
+      note.textContent = `No people found for community ids (${view.reason || "no name columns"}). The normal tokens apply.`;
+      show(note); hide(retry); hide(skip); hide(all);
+      state.communityPending = 0;
+      paintConfirm();
+      return;
+    }
+    if (view.status === "skipped") {
+      note.textContent = `Continuing without community ids - ${view.reason || "operator choice"}.`;
+      show(note); hide(all); show(retry);
+      skip.textContent = "[ USE COMMUNITY IDS ]";
+      show(skip);
+      state.communityPending = 0;
+      paintConfirm();
+      return;
+    }
+
+    // ready
+    show(retry); show(all); show(skip);
+    skip.textContent = "[ CONTINUE WITHOUT COMMUNITY IDS ]";
+    const items = view.items || [];
+    const decisions = view.decisions || {};
+    const c = communityCounts(items, decisions);
+    const line = (label, b) => padRight(label, 12) +
+      `${String(b.known).padStart(5)} known   ${String(b.new).padStart(5)} new   ` +
+      `${String(b.need).padStart(4)} need you${b.decided ? `   ${b.decided} decided` : ""}`;
+    for (const t of [line("PEOPLE", c.person), line("HOUSEHOLDS", c.family)]) {
+      const d = create("div");
+      d.textContent = t;
+      sum.append(d);
+    }
+    const reviews = items.filter((i) => i.action === "review");
+    const host = $("community-review");
+    for (const item of reviews) host.append(reviewCard(item, decisions[item.key]));
+    if (!reviews.length) {
+      const d = create("div", { class: "note-plain" });
+      d.textContent = "Every person and household was matched or is new. Nothing needs you.";
+      host.append(d);
+    }
+    renderEveryone(items, decisions);
+    state.communityPending = view.pending || 0;
+    paintConfirm();
+  }
+
+  function idShort(id) { return id ? `${id.slice(0, 5)}…${id.slice(-4)}` : "(this upload)"; }
+
+  // "0:3:1" (Family Graph's key for an earlier person or household on this
+  // upload) -> "row 5", the spreadsheet row the operator can see.
+  function sheetRowOf(ref) {
+    const items = (state.community && state.community.items) || [];
+    const hit = items.find((i) => i.key === ref);
+    return hit ? `row ${hit.sheet_row}` : "earlier on this upload";
+  }
+
+  function candidateText(cand, kind) {
+    const who = kind === "person"
+      ? [cand.given_name, cand.family_name, cand.suffix].filter(Boolean).join(" ")
+      : (cand.display_name || "household");
+    const bits = [];
+    if (kind === "person") {
+      if (cand.role) bits.push(cand.role);
+      if (cand.date_of_birth) bits.push(`born ${cand.date_of_birth}`);
+      if (cand.grade) bits.push(`grade ${cand.grade}`);
+      if (cand.family && cand.family.display_name) bits.push(`household: ${cand.family.display_name}`);
+      if (cand.status === "archived") bits.push("ARCHIVED");
+      if (typeof cand.confidence === "number") bits.push(`${Math.round(cand.confidence * 100)}%`);
+      if (cand.reasons && cand.reasons.length) bits.push(cand.reasons.map((x) => x.replace(/_/g, " ")).join(", "));
+    } else {
+      if (cand.status === "archived") bits.push("ARCHIVED");
+      const names = (cand.members || []).map((m) => m.name).filter(Boolean);
+      if (names.length) bits.push(`members: ${names.join(", ")}`);
+    }
+    return { who, rest: bits.join(" · ") };
+  }
+
+  function reviewCard(item, decision) {
+    const card = create("div", { class: `community-item${decision ? " decided" : ""}`, "data-key": item.key });
+    const head = create("div", { class: "head" });
+    const role = item.kind === "person" ? (item.role || "person") : "household";
+    head.textContent = `[${decision ? "x" : "?"}] ROW ${item.sheet_row}  ${item.kind === "person" ? "PERSON" : "HOUSEHOLD"}  ${item.label}  (${role})` +
+      (item.date_of_birth ? `  born ${item.date_of_birth}` : "");
+    card.append(head);
+    const why = create("div", { class: "why" });
+    why.textContent = (item.review_reasons || []).map((r) => REVIEW_WHY[r] || r.replace(/_/g, " ")).join(" · ");
+    card.append(why);
+
+    if (decision) {
+      const done = create("div", { class: "done" });
+      const target = decision.target
+        ? (item.candidates || []).find((c) => (c.community_id || c.sheet_ref) === decision.target)
+        : null;
+      done.textContent = decision.action === "attach"
+        ? `-> SAME AS ${target ? candidateText(target, item.kind).who : ""} ${/^[IF]/.test(decision.target) ? idShort(decision.target) : `(${sheetRowOf(decision.target)})`}`
+        : decision.action === "create" ? `-> A DIFFERENT ${item.kind === "person" ? "PERSON" : "HOUSEHOLD"} (new id)` : "-> NOT A PERSON (no id)";
+      const undo = create("button", { type: "button", class: "btn secondary sm", onclick: () => decide(item.key, "undo") });
+      undo.textContent = "[ UNDO ]";
+      card.append(create("div", { class: "acts" }, [done, undo]));
+      return card;
+    }
+
+    for (const cand of item.candidates || []) {
+      const t = candidateText(cand, item.kind);
+      const desc = create("span", { class: "desc" });
+      const b = create("b");
+      b.textContent = t.who;
+      desc.append(b, document.createTextNode(`  ${cand.community_id ? idShort(cand.community_id) : "earlier on this upload"}\n${t.rest}`));
+      const ref = cand.community_id || cand.sheet_ref;
+      const same = create("button", { type: "button", class: "btn sm", onclick: () => decide(item.key, "attach", ref) });
+      same.textContent = item.kind === "person" ? "[ SAME PERSON ]" : "[ SAME HOUSEHOLD ]";
+      card.append(create("div", { class: "cand" }, [desc, same]));
+    }
+    const acts = create("div", { class: "acts" });
+    const neu = create("button", { type: "button", class: "btn secondary sm", onclick: () => decide(item.key, "create") });
+    neu.textContent = item.kind === "person" ? "[ NEW PERSON ]" : "[ NEW HOUSEHOLD ]";
+    acts.append(neu);
+    if (item.kind === "person") {
+      const skip = create("button", { type: "button", class: "btn secondary sm", onclick: () => decide(item.key, "skip") });
+      skip.textContent = "[ NOT A PERSON ]";
+      acts.append(skip);
+    }
+    card.append(acts);
+    return card;
+  }
+
+  function renderEveryone(items, decisions) {
+    const host = $("community-all");
+    host.innerHTML = "";
+    for (const i of items) {
+      const row = create("div", { class: "community-line" });
+      const d = decisions[i.key];
+      const glyph = i.action === "review" ? (d ? "[x]" : "[?]") : i.action === "matched" ? "[x]" : i.action === "new" ? "[+]" : "[-]";
+      let status = i.action === "matched" ? `known ${idShort(i.community_id)}`
+        : i.action === "new" ? "new" : i.action === "review" ? (d ? "decided" : "needs you") : i.action;
+      if (i.same_as) status = `same as ${sheetRowOf(i.same_as)}`;
+      if (i.matched && i.matched.via === "household") status += " (household)";
+      const text = create("span");
+      text.textContent = `${glyph} ROW ${String(i.sheet_row).padEnd(5)} ${i.kind === "person" ? "   " : "HH "} ${padRight(i.label, 28)} ${status}`;
+      row.append(text, create("span", { class: "grow" }));
+      if (i.kind === "person" && i.action === "matched" && !i.same_as && !d) {
+        const no = create("button", { type: "button", class: "btn secondary sm", onclick: () => decide(i.key, "create") });
+        no.textContent = "[ NOT THE SAME ]";
+        no.title = "Family Graph matched this row to an existing person. Use this if that is wrong.";
+        row.append(no);
+      } else if (d && i.action !== "review") {
+        const undo = create("button", { type: "button", class: "btn secondary sm", onclick: () => decide(i.key, "undo") });
+        undo.textContent = "[ UNDO ]";
+        row.append(undo);
+      }
+      host.append(row);
+    }
+  }
+
+  async function decide(key, action, target) {
+    try {
+      await api(`/api/anonymize/${state.sessionId}/community/decide`, {
+        method: "POST", body: JSON.stringify({ key, action, target }),
+      });
+    } catch (exc) {
+      alert(`Could not record that: ${exc.message}`);
+    }
+    const wasOpen = !$("community-all").classList.contains("hidden");
+    await loadCommunity();
+    if (wasOpen) show($("community-all"));
+  }
+
   function resetAnonymizeFlow() {
     state.sessionId = null;
     state.finished = false;
     state.preview = null;
+    state.community = null;
+    state.communityPending = 0;
     state.deselected.clear();
     state.deselectedTypes.clear();
+    hide($("block-community"));
+    hide($("confirm-error"));
+    $("btn-confirm").disabled = false;
+    $("btn-confirm").textContent = "[ CONFIRM AND SCRUB ]";
     if (state.polling) clearInterval(state.polling);
     state.polling = null;
     hide($("lbl-detection"));
@@ -1020,6 +1316,10 @@
       lines.push({ text: `[!] ${r.legacy_ambiguous} old 4-char ID(s) pointed at more than one value;`, cls: "unresolved" });
       lines.push({ text: `    restored to the longest. Check those names.`, cls: "unresolved" });
     }
+    if (r.community_variants) {
+      lines.push({ text: `[i] ${r.community_variants} person(s) are spelled differently in two keys;`, cls: "" });
+      lines.push({ text: `    the newest key's spelling was used. Same person either way.`, cls: "" });
+    }
     if (r.unresolved_count) {
       lines.push({ text: `[!] ${r.unresolved_count} NOT RESTORED - not in the selected keys, left as-is:`, cls: "failed" });
       const shown = r.unresolved.slice(0, 20);
@@ -1076,16 +1376,76 @@
 
     await loadEndpoints();
     await loadGithub();
+    await loadFamilyGraph();
     await refreshLog();
 
     // Status bar buttons
     $("btn-toggle-endpoints").addEventListener("click", () => {
       $("panel-endpoints").classList.toggle("hidden");
       hide($("panel-github"));
+      hide($("panel-familygraph"));
     });
     $("btn-toggle-github").addEventListener("click", () => {
       $("panel-github").classList.toggle("hidden");
       hide($("panel-endpoints"));
+      hide($("panel-familygraph"));
+    });
+    $("btn-toggle-familygraph").addEventListener("click", () => {
+      $("panel-familygraph").classList.toggle("hidden");
+      hide($("panel-endpoints"));
+      hide($("panel-github"));
+    });
+
+    // Family Graph connection
+    $("form-familygraph").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      try {
+        await saveFamilyGraph();
+        $("fg-status").textContent = "Saved. Press [ TEST ] to check the connection.";
+      } catch (exc) { $("fg-status").textContent = `[!] ${exc.message}`; }
+      refreshLog();
+    });
+    $("btn-test-fg").addEventListener("click", async () => {
+      $("fg-status").textContent = "testing...";
+      try {
+        if ($("fg-key").value.trim() || !(await api("/api/familygraph")).configured) await saveFamilyGraph();
+        const r = await api("/api/familygraph/test", { method: "POST" });
+        $("fg-status").textContent = r.status === "ok"
+          ? "[x] Family Graph answered and accepted the key."
+          : `[!] ${r.error}`;
+      } catch (exc) { $("fg-status").textContent = `[!] ${exc.message}`; }
+      refreshLog();
+    });
+    $("btn-disconnect-fg").addEventListener("click", async () => {
+      if (!confirm("Disconnect Family Graph? Spreadsheets will get the normal per-value tokens.")) return;
+      await api("/api/familygraph", { method: "DELETE" });
+      await loadFamilyGraph();
+    });
+
+    // Community review
+    $("btn-community-retry").addEventListener("click", async () => {
+      $("btn-community-retry").textContent = "[ ASKING... ]";
+      try {
+        renderCommunity(await api(`/api/anonymize/${state.sessionId}/community/retry`, { method: "POST" }));
+      } catch (exc) { alert(`Family Graph: ${exc.message}`); }
+      $("btn-community-retry").textContent = "[ ASK FAMILY GRAPH AGAIN ]";
+      refreshLog();
+    });
+    $("btn-community-skip").addEventListener("click", async () => {
+      const resume = state.community && state.community.status === "skipped";
+      if (!resume && !confirm("Continue without community ids? Names will get the normal per-value tokens and nothing is sent to Family Graph.")) return;
+      try {
+        renderCommunity(await api(`/api/anonymize/${state.sessionId}/community/skip`, {
+          method: "POST", body: JSON.stringify({ skip: !resume }),
+        }));
+      } catch (exc) { alert(exc.message); }
+    });
+    $("btn-community-all").addEventListener("click", () => {
+      const el = $("community-all");
+      el.classList.toggle("hidden");
+      const open = !el.classList.contains("hidden");
+      $("btn-community-all").setAttribute("aria-expanded", String(open));
+      $("btn-community-all").textContent = open ? "[ HIDE EVERYONE ]" : "[ SHOW EVERYONE ]";
     });
     $("endpoint-select").addEventListener("change", async (e) => {
       await api(`/api/endpoints/${e.target.value}/select`, { method: "POST" });

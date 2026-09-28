@@ -1,0 +1,284 @@
+{
+  "error": "review_incomplete",
+  "detail": "x",
+  "plan": {
+    "mode": "commit",
+    "committed": false,
+    "summary": {
+      "sheets": 1,
+      "rows": 3,
+      "persons": {
+        "matched": 1,
+        "new": 4,
+        "review": 1,
+        "skipped": 0
+      },
+      "families": {
+        "matched": 1,
+        "new": 2,
+        "review": 0
+      }
+    },
+    "pending": [
+      "0:2:0"
+    ],
+    "sheets": [
+      {
+        "index": 0,
+        "name": null,
+        "skipped": null,
+        "columns": [
+          "Student First Name",
+          "Student Last Name",
+          "Grade",
+          "Parent 1 First Name",
+          "Parent 1 Last Name",
+          "Parent Email",
+          "Notes"
+        ],
+        "mapping": {
+          "family": null,
+          "persons": [
+            {
+              "role": "parent",
+              "given": 3,
+              "family": 4,
+              "full": null,
+              "list": null,
+              "email": 5,
+              "phone": null,
+              "date_of_birth": null
+            },
+            {
+              "role": "child",
+              "given": 0,
+              "family": 1,
+              "full": null,
+              "list": null,
+              "email": null,
+              "phone": null,
+              "date_of_birth": null
+            }
+          ],
+          "address": {
+            "line1": null,
+            "city": null,
+            "postal": null
+          }
+        },
+        "rows": [
+          {
+            "index": 0,
+            "persons": [
+              {
+                "key": "0:0:0",
+                "slot": 0,
+                "role": "parent",
+                "given_name": "Jane",
+                "family_name": "Smith",
+                "date_of_birth": null,
+                "name_cells": [
+                  {
+                    "col": 3,
+                    "part": "given"
+                  },
+                  {
+                    "col": 4,
+                    "part": "family"
+                  }
+                ],
+                "action": "new",
+                "code_state": "new",
+                "community_id": null
+              },
+              {
+                "key": "0:0:1",
+                "slot": 1,
+                "role": "child",
+                "given_name": "Emma",
+                "family_name": "Smith",
+                "date_of_birth": null,
+                "name_cells": [
+                  {
+                    "col": 0,
+                    "part": "given"
+                  },
+                  {
+                    "col": 1,
+                    "part": "family"
+                  }
+                ],
+                "action": "new",
+                "code_state": "new",
+                "community_id": null
+              }
+            ],
+            "family": {
+              "key": "0:0:family",
+              "display_name": "Smith Family",
+              "cell": null,
+              "action": "new",
+              "code_state": "new",
+              "community_id": null
+            }
+          },
+          {
+            "index": 1,
+            "persons": [
+              {
+                "key": "0:1:0",
+                "slot": 0,
+                "role": "parent",
+                "given_name": "Jane",
+                "family_name": "Smith",
+                "date_of_birth": null,
+                "name_cells": [
+                  {
+                    "col": 3,
+                    "part": "given"
+                  },
+                  {
+                    "col": 4,
+                    "part": "family"
+                  }
+                ],
+                "action": "matched",
+                "matched": {
+                  "community_id": null,
+                  "sheet_ref": "0:0:0",
+                  "status": "active",
+                  "given_name": "Jane",
+                  "family_name": "Smith",
+                  "suffix": null,
+                  "date_of_birth": null,
+                  "role": "adult",
+                  "family": {
+                    "community_id": null,
+                    "sheet_ref": "0:0:family",
+                    "display_name": "Smith Family"
+                  },
+                  "confidence": 0.95,
+                  "reasons": [
+                    "exact_email_match"
+                  ],
+                  "grade": null,
+                  "via": "score"
+                },
+                "code_state": "new",
+                "community_id": null,
+                "same_as": "0:0:0"
+              },
+              {
+                "key": "0:1:1",
+                "slot": 1,
+                "role": "child",
+                "given_name": "Liam",
+                "family_name": "Smith",
+                "date_of_birth": null,
+                "name_cells": [
+                  {
+                    "col": 0,
+                    "part": "given"
+                  },
+                  {
+                    "col": 1,
+                    "part": "family"
+                  }
+                ],
+                "action": "new",
+                "code_state": "new",
+                "community_id": null
+              }
+            ],
+            "family": {
+              "key": "0:1:family",
+              "display_name": "Smith Family",
+              "cell": null,
+              "action": "matched",
+              "code_state": "new",
+              "community_id": null,
+              "same_as": "0:0:family"
+            }
+          },
+          {
+            "index": 2,
+            "persons": [
+              {
+                "key": "0:2:0",
+                "slot": 0,
+                "role": "parent",
+                "given_name": "Marie",
+                "family_name": "Garcia",
+                "date_of_birth": null,
+                "name_cells": [
+                  {
+                    "col": 3,
+                    "part": "given"
+                  },
+                  {
+                    "col": 4,
+                    "part": "family"
+                  }
+                ],
+                "candidates": [
+                  {
+                    "community_id": "I7B840410815389A7",
+                    "sheet_ref": null,
+                    "status": "active",
+                    "given_name": "Maria",
+                    "family_name": "Garcia",
+                    "suffix": null,
+                    "date_of_birth": null,
+                    "role": null,
+                    "family": null,
+                    "confidence": 0.48,
+                    "reasons": [
+                      "exact_last_name",
+                      "nickname_or_short_form"
+                    ],
+                    "grade": null
+                  }
+                ],
+                "review_reasons": [
+                  "possible_match"
+                ],
+                "action": "review",
+                "code_state": "new",
+                "community_id": null
+              },
+              {
+                "key": "0:2:1",
+                "slot": 1,
+                "role": "child",
+                "given_name": "Ava",
+                "family_name": "Garcia",
+                "date_of_birth": null,
+                "name_cells": [
+                  {
+                    "col": 0,
+                    "part": "given"
+                  },
+                  {
+                    "col": 1,
+                    "part": "family"
+                  }
+                ],
+                "action": "new",
+                "code_state": "new",
+                "community_id": null
+              }
+            ],
+            "family": {
+              "key": "0:2:family",
+              "display_name": "Garcia Family",
+              "cell": null,
+              "action": "new",
+              "code_state": "new",
+              "community_id": null
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

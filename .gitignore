@@ -16,6 +16,7 @@ keys/
 anonymizer.log
 endpoints.json
 github.json
+familygraph.json
 
 # Editor / OS
 .DS_Store

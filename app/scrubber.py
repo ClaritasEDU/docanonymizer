@@ -217,12 +217,61 @@ def scrub_text(extract: ExtractResult, replacement_map: MapOrReplacer, out_path:
     )
 
 
-def scrub_csv(extract: ExtractResult, replacement_map: MapOrReplacer, out_path: Path) -> ScrubResult:
+def _override_for(cell_overrides: Optional[dict], key: tuple, current: str):
+    """The replacement for this cell, or None.
+
+    `cell_overrides` maps (sheet, row, col) -> (expected, new): the cell is
+    rewritten to `new` only if it still holds exactly `expected` (None = any
+    value). Anonymize uses it to put community identifiers into name cells;
+    restore uses it to put the exact original text back - and only where the
+    token is still there untouched."""
+    if not cell_overrides:
+        return None
+    hit = cell_overrides.get(key)
+    if hit is None:
+        return None
+    expected, new = hit
+    if expected is not None and current != expected:
+        log.warning("cell override skipped at sheet=%d row=%d col=%d: content changed", *key)
+        return None
+    return new
+
+
+def scrub_csv(extract: ExtractResult, replacement_map: MapOrReplacer, out_path: Path,
+              cell_overrides: Optional[dict] = None,
+              append_columns: Optional[list] = None,
+              remove_columns: Optional[list] = None) -> ScrubResult:
     replacer = as_replacer(replacement_map)
     rows = extract.payload.get("rows") or []
+    # Judge an appended column on the file as it came in - after the token
+    # pass its family ids have already become household names.
+    removable = []
+    for spec in remove_columns or []:
+        if _appended_column_intact(rows, spec):
+            removable.append(spec)
+        else:
+            log.warning("appended %s column not removed: it was edited", spec.get("header"))
     new_rows: list[list[str]] = []
-    for row in rows:
-        new_rows.append([apply(cell, replacer) for cell in row])
+    for r, row in enumerate(rows):
+        out = []
+        for c, cell in enumerate(row):
+            forced = _override_for(cell_overrides, (0, r, c), cell)
+            out.append(forced if forced is not None else apply(cell, replacer))
+        new_rows.append(out)
+    for spec in append_columns or []:
+        col = spec["col"]
+        for r, row in enumerate(new_rows):
+            if r == spec["header_row"]:
+                value = spec["header"]
+            else:
+                value = spec["values"].get(r, "")
+            if len(row) < col:
+                row.extend([""] * (col - len(row)))
+            row.insert(col, value)
+    for spec in sorted(removable, key=lambda s: -s["col"]):
+        for row in new_rows:
+            if len(row) > spec["col"]:
+                del row[spec["col"]]
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerows(new_rows)
@@ -294,14 +343,36 @@ def scrub_docx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
     )
 
 
+def _appended_column_intact(rows: list, spec: dict) -> bool:
+    """Only remove a column we appended if it still is exactly that column:
+    the header in place and every other cell empty or a family token."""
+    from .community import COMMUNITY_TOKEN_RE
+    col = spec["col"]
+    for r, row in enumerate(rows):
+        v = row[col] if col < len(row) else ""
+        v = "" if v is None else str(v)
+        if r == spec["header_row"]:
+            if v != spec["header"]:
+                return False
+        elif v and not COMMUNITY_TOKEN_RE.fullmatch(v):
+            return False
+    return True
+
+
 def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Path,
                deep_clean: bool = True,
-               sheet_restore: Optional[dict[str, str]] = None) -> ScrubResult:
+               sheet_restore: Optional[dict[str, str]] = None,
+               cell_overrides: Optional[dict] = None,
+               append_columns: Optional[list] = None,
+               remove_columns: Optional[list] = None) -> ScrubResult:
     """XLSX scrub: surface replace via openpyxl, ZIP-level deep scrub, formula warnings.
 
     `deep_clean=False` (unanonymize) skips the comment/metadata handlers.
     `sheet_restore` (unanonymize) maps anonymized sheet titles back to the
     originals recorded in the key file.
+    `cell_overrides` / `append_columns` / `remove_columns`: community
+    identifiers (see community.py and _override_for). Coordinates are
+    0-based (sheet index, row, column) as extracted.
     """
     from openpyxl import load_workbook
 
@@ -311,11 +382,28 @@ def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
     shutil.copyfile(working_path, staged)
     wb = load_workbook(str(staged))
 
+    # Judge an appended column on the file as it came in - after the token
+    # pass its family ids have already become household names.
+    removable = []
+    for spec in remove_columns or []:
+        ws0 = wb.worksheets[spec["sheet"]] if spec["sheet"] < len(wb.worksheets) else None
+        grid = [list(r) for r in ws0.iter_rows(values_only=True)] if ws0 is not None else []
+        if ws0 is not None and ws0.max_column == spec["col"] + 1 and _appended_column_intact(grid, spec):
+            removable.append(spec)
+        else:
+            log.warning("appended %s column not removed: it was edited or moved", spec.get("header"))
+
     formula_warnings: list[str] = []
-    for ws in wb.worksheets:
+    for si, ws in enumerate(wb.worksheets):
         for row in ws.iter_rows():
             for cell in row:
                 v = cell.value
+                if cell_overrides:
+                    current = "" if v is None else str(v)
+                    forced = _override_for(cell_overrides, (si, cell.row - 1, cell.column - 1), current)
+                    if forced is not None:
+                        cell.value = forced
+                        continue
                 if v is None:
                     continue
                 if isinstance(v, str):
@@ -346,6 +434,14 @@ def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
     # unique SHEET_<id> if that won't fit). The key file records every rename,
     # so restore is exact. References to the old name in formulas, defined
     # names, and pivot sources are rewritten to match.
+    for spec in append_columns or []:
+        ws = wb.worksheets[spec["sheet"]]
+        ws.cell(row=spec["header_row"] + 1, column=spec["col"] + 1).value = spec["header"]
+        for r, token in spec["values"].items():
+            ws.cell(row=int(r) + 1, column=spec["col"] + 1).value = token
+    for spec in removable:
+        wb.worksheets[spec["sheet"]].delete_cols(spec["col"] + 1)
+
     if sheet_restore:
         renames = {cur: orig for cur, orig in sheet_restore.items() if cur in wb.sheetnames}
     elif deep_clean:

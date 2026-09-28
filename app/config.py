@@ -45,6 +45,9 @@ LLM_STALL_TIMEOUT_S = _int("LLM_STALL_TIMEOUT_S", 180)
 OLLAMA_NUM_CTX = _int("OLLAMA_NUM_CTX", 8192)
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+# Family Graph (community identifiers for rosters). A large roster plan can
+# take a while on a small machine; the call fails only after this long.
+FAMILYGRAPH_TIMEOUT_S = _int("FAMILYGRAPH_TIMEOUT_S", 600)
 
 UPLOADS_DIR = ROOT / "uploads"
 OUTPUT_DIR = ROOT / "output"
@@ -52,6 +55,7 @@ KEYS_DIR = ROOT / "keys"
 LOG_FILE = ROOT / "anonymizer.log"
 ENDPOINTS_FILE = ROOT / "endpoints.json"
 GITHUB_FILE = ROOT / "github.json"
+FAMILYGRAPH_FILE = ROOT / "familygraph.json"   # holds an API key - gitignored
 TEMPLATES_DIR = SOURCE_ROOT / "templates"
 STATIC_DIR = SOURCE_ROOT / "static"
 

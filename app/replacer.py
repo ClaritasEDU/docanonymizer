@@ -50,6 +50,8 @@ log = get_logger("replacer")
 PLACEHOLDER_RE = re.compile(
     r"\[[A-Z]+_(?:[0-9A-F]{12}|[0-9A-F]{4})\]"
     r"|(?<![A-Za-z0-9_])[A-Z]+_[0-9A-F]{12}(?![A-Za-z0-9_])"
+    # Community identifiers from Family Graph: [I…] individual, [F…] family.
+    r"|\[[IF](?:[0-9A-F]{16}|[0-9A-F]{8})\]"
 )
 _BRACKETED_PH_RE = re.compile(r"\[([A-Z]+_(?:[0-9A-F]{12}|[0-9A-F]{4}))\]")
 
@@ -192,17 +194,23 @@ class LiteralReplacer:
     `protect_placeholders` (default on) makes this map's own placeholders
     (bracketed and bare) untouchable, so a pass over already-anonymized text
     can never rewrite part of one.
+
+    `extra_protected` adds exact strings that must never be rewritten - the
+    community identifiers ([I…] / [F…]) written into roster cells. Like the
+    map's own placeholders, protection is by exact string, never by shape.
     """
 
-    def __init__(self, mapping: dict[str, str], protect_placeholders: bool = True):
+    def __init__(self, mapping: dict[str, str], protect_placeholders: bool = True,
+                 extra_protected=None):
         self.mapping = {k: v for k, v in mapping.items() if k}
         self.protect = protect_placeholders
+        self.extra_protected = frozenset(t for t in (extra_protected or ()) if t)
         words = sorted(self.mapping, key=len, reverse=True)
         self._texty = [w for w in words if not is_short_number(w)]
         self._numbers = [w for w in words if is_short_number(w)]
         self._protected: list[str] = []
         if self.protect:
-            ph = set()
+            ph = set(self.extra_protected)
             for v in self.mapping.values():
                 m = _BRACKETED_PH_RE.fullmatch(v)
                 if m:
@@ -281,7 +289,8 @@ class LiteralReplacer:
             esc = xml_escape(original)
             if esc != original:
                 out[esc] = xml_escape(repl)
-        return LiteralReplacer(out, protect_placeholders=self.protect)
+        return LiteralReplacer(out, protect_placeholders=self.protect,
+                               extra_protected=self.extra_protected)
 
 
 def overlap_unions(text: str, originals) -> list[tuple[str, list[str]]]:

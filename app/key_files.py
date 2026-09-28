@@ -14,6 +14,15 @@ Schema:
                                         "linked_to": "<id>" (optional)}},
   "replacement_map":  {"Jane Smith": "[PERSON_3A4F9C2B1D0E]", ...},
   "sheet_titles":     {"ORG_B9442179E0EE": "Smith Family"}   (XLSX only, optional)
+
+  Rosters with community identifiers (optional, 2026-09-28):
+  "identity_registry": {"I3A4F9C2B1D0E7F21": {"kind": "person", "display": "Jane Smith",
+                                               "family": "F9B0C11D2E3F4A5B6"},
+                        "F9B0C11D2E3F4A5B6": {"kind": "family", "display": "Smith Family"}},
+  "identity_cells":    [{"sheet": 0, "row": 4, "col": 1, "written": "[I3A4F...]",
+                         "original": "Jane"}],
+  "identity_columns":  [{"sheet": 0, "col": 11, "header_row": 0, "header": "FAMILY_ID"}],
+  "community_source":  {"familygraph_host": "127.0.0.1", "import_runs": ["imp_..."], ...}
 }
 
 `id_format` is "hex12" for current keys (one unique 12-char ID per value).
@@ -55,6 +64,7 @@ def save_key_file(
     pii_types_scrubbed: list[str],
     registry: EntityRegistry,
     sheet_titles: Optional[dict[str, str]] = None,
+    extra: Optional[dict] = None,
 ) -> Path:
     payload = {
         "session_id": session_id,
@@ -71,12 +81,17 @@ def save_key_file(
     if sheet_titles:
         # anonymized sheet title -> original (restore puts the exact title back)
         payload["sheet_titles"] = dict(sheet_titles)
+    if extra:
+        # Community identifiers (community.key_fields). Never in the ledger:
+        # those ids belong to Family Graph, not to this app's id space.
+        payload.update(extra)
     stem = Path(original_filename).stem or "document"
     name = f"{stem}_{session_id}.key.json"
     path = KEYS_DIR / name
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-    log.info("key file saved: %s ids=%d", path.name, len(registry.entities))
+    log.info("key file saved: %s ids=%d community_ids=%d", path.name, len(registry.entities),
+             len((extra or {}).get("identity_registry") or {}))
     # The IDs are now released - make sure they are never issued again, even
     # if this key file is later moved out of /keys.
     ids.record_issued(ids.ids_in_key_payload(payload))

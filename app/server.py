@@ -23,6 +23,15 @@ Routes:
   GET  /api/anonymize/<sid>/download/file  - download scrubbed file
   GET  /api/anonymize/<sid>/download/key   - download key.json
   POST /api/anonymize/<sid>/cancel    - discard session, delete upload
+  GET  /api/anonymize/<sid>/community - community-id review items (rosters)
+  POST /api/anonymize/<sid>/community/decide - {key, action, target?}
+  POST /api/anonymize/<sid>/community/skip   - {skip: bool} continue without ids
+  POST /api/anonymize/<sid>/community/retry  - ask Family Graph again
+
+  GET  /api/familygraph               - connection settings (key redacted)
+  POST /api/familygraph               - save {base_url, api_key?, category}
+  DEL  /api/familygraph               - disconnect
+  POST /api/familygraph/test          - reachability + key check
 
   POST /api/unanonymize               - restore a file (AI output or anonymized file)
   POST /api/unanonymize/text          - restore pasted text (AI output)
@@ -43,7 +52,9 @@ from typing import Optional
 from flask import Flask, abort, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
+from . import community as community_mod
 from . import endpoints as endpoints_mod
+from . import familygraph
 from . import github_mgr
 from . import pipeline
 from . import unanonymize as unan
@@ -302,10 +313,38 @@ def create_app() -> Flask:
             return jsonify({"error": "session not found"}), 404
         if not sess.detection_complete:
             return jsonify({"error": "detection not complete"}), 409
+        if sess.scrub_steps or sess.verify_result is not None:
+            return jsonify({"error": "already confirmed"}), 409
         payload = request.get_json(silent=True) or {}
         deselected = [d for d in (payload.get("deselected") or []) if isinstance(d, str)]
         types = [t for t in (payload.get("deselected_types") or [])
                  if isinstance(t, str) and t in VALID_TAGS]
+
+        # Community identifiers: every review item decided, then Family Graph
+        # writes them - BEFORE anything is scrubbed, so the file carries ids
+        # that exist. Nothing degrades silently: if Family Graph is down the
+        # operator must retry or choose to continue without community ids.
+        state = sess.community
+        if state is not None and state.status in ("ready", "error"):
+            if "PERSON" in types:
+                state.status, state.reason = "skipped", "names kept as original text"
+                log.info("session %s community ids skipped: PERSON kept as original", sid)
+            elif state.status == "error":
+                return jsonify({"error": f"Family Graph unavailable: {state.error}. Retry, or continue without community ids.",
+                                "community": community_mod.view(state)}), 409
+            else:
+                open_items = community_mod.pending(state)
+                if open_items:
+                    return jsonify({"error": f"{len(open_items)} person/household decision(s) still needed",
+                                    "community": community_mod.view(state)}), 409
+                try:
+                    ok = community_mod.commit_for_session(sess)
+                except familygraph.FamilyGraphError as exc:
+                    log.error("session %s community commit failed: %s", sid, type(exc).__name__)
+                    return jsonify({"error": f"Family Graph: {exc}", "community": community_mod.view(state)}), 502
+                if not ok:
+                    return jsonify({"error": "Family Graph found new items that need a decision",
+                                    "community": community_mod.view(state)}), 409
         threading.Thread(
             target=pipeline.confirm_and_scrub, args=(sess, deselected, types), daemon=True,
         ).start()
@@ -328,8 +367,100 @@ def create_app() -> Flask:
                 "entities": sess.registry.total_entities() if sess.registry else 0,
                 "replacements": sess.registry.total_replacements() if sess.registry else 0,
             },
+            "community": community_mod.summary_for_results(sess.community),
             "error": sess.error,
         })
+
+    # -----------------------------------------------------------------------
+    # Community identifiers (Family Graph) - review items for a session
+    # -----------------------------------------------------------------------
+    def _community_session(sid: str):
+        sess = pipeline.get_session(sid)
+        if not sess:
+            return None, (jsonify({"error": "session not found"}), 404)
+        if not sess.detection_complete:
+            return None, (jsonify({"error": "detection not complete"}), 409)
+        if sess.scrub_steps or sess.verify_result is not None:
+            return None, (jsonify({"error": "already confirmed"}), 409)
+        return sess, None
+
+    @app.get("/api/anonymize/<sid>/community")
+    def community_view(sid: str):
+        sess = pipeline.get_session(sid)
+        if not sess:
+            return jsonify({"error": "session not found"}), 404
+        return jsonify(community_mod.view(sess.community))
+
+    @app.post("/api/anonymize/<sid>/community/decide")
+    def community_decide(sid: str):
+        sess, err = _community_session(sid)
+        if err:
+            return err
+        state = sess.community
+        if state is None or state.status != "ready":
+            return jsonify({"error": "no community review for this file"}), 409
+        payload = request.get_json(silent=True) or {}
+        try:
+            community_mod.decide(state, str(payload.get("key") or ""), str(payload.get("action") or ""),
+                                 payload.get("target") if isinstance(payload.get("target"), str) else None)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        log.info("session %s community decision recorded: action=%s pending=%d",
+                 sid, payload.get("action"), len(community_mod.pending(state)))
+        return jsonify({"pending": len(community_mod.pending(state)), "decisions": state.decisions})
+
+    @app.post("/api/anonymize/<sid>/community/skip")
+    def community_skip(sid: str):
+        sess, err = _community_session(sid)
+        if err:
+            return err
+        state = sess.community
+        if state is None or state.status not in ("ready", "error", "skipped"):
+            return jsonify({"error": "no community ids for this file"}), 409
+        skip = bool((request.get_json(silent=True) or {}).get("skip", True))
+        if skip:
+            state.status, state.reason = "skipped", "operator chose to continue without community ids"
+        elif state.plan:
+            state.status, state.reason = "ready", ""
+        else:
+            return jsonify({"error": "nothing to resume - retry instead"}), 409
+        log.info("session %s community ids %s by operator", sid, "skipped" if skip else "resumed")
+        return jsonify(community_mod.view(state))
+
+    @app.post("/api/anonymize/<sid>/community/retry")
+    def community_retry(sid: str):
+        sess, err = _community_session(sid)
+        if err:
+            return err
+        community_mod.retry(sess)
+        # New guaranteed catches may have been registered - rebuild the preview.
+        sess.preview = None
+        return jsonify(community_mod.view(sess.community))
+
+    # -----------------------------------------------------------------------
+    # Family Graph connection
+    # -----------------------------------------------------------------------
+    @app.get("/api/familygraph")
+    def fg_get():
+        return jsonify(familygraph.redacted())
+
+    @app.post("/api/familygraph")
+    def fg_save():
+        payload = request.get_json(force=True, silent=True) or {}
+        try:
+            saved = familygraph.save(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(saved)
+
+    @app.delete("/api/familygraph")
+    def fg_delete():
+        familygraph.clear()
+        return ("", 204)
+
+    @app.post("/api/familygraph/test")
+    def fg_test():
+        return jsonify(familygraph.check())
 
     @app.get("/api/anonymize/<sid>/download/file")
     def anon_dl_file(sid: str):
@@ -569,6 +700,8 @@ def _preview_payload(sess) -> dict:
         "entities": sess.registry.total_entities(),
         "replacements": sess.registry.total_replacements(),
         "kept_amounts": len(sess.registry.skipped_amounts),
+        # Details come from /community (decisions change them; this is cached).
+        "community": {"status": (sess.community.status if sess.community else "off")},
     }
     return sess.preview
 
@@ -577,9 +710,11 @@ def _log_startup() -> None:
     eps = endpoints_mod.list_endpoints()
     active = endpoints_mod.get_active() or {}
     gh_count = len(github_mgr.list_connections())
+    fg = familygraph.redacted()
     log.info(
-        "startup: port=%d endpoints=%d active=%s github_connections=%d",
+        "startup: port=%d endpoints=%d active=%s github_connections=%d familygraph=%s",
         PORT, len(eps), active.get("id"), gh_count,
+        "connected" if fg["configured"] else "off",
     )
 
 

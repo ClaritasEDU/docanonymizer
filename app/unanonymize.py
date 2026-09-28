@@ -53,6 +53,28 @@ def _unique_path(base: Path) -> Path:
         i += 1
 
 
+def _exact_layout(index: KeyIndex, name: str):
+    """Cell overrides that put roster cells back exactly, for our own
+    anonymized output (`<name>_anon_<session>.xlsx`). A community id restores
+    to a person's name; the cell may have held "Smith, John & Mary" - this
+    puts back exactly that. Only cells that still hold exactly what was
+    written are touched; anything the AI or a person changed falls back to
+    the token restore."""
+    m = _ANON_SUFFIX_RE.search(Path(name).stem)
+    if not m:
+        return None, None
+    layout = index.identity_layout.get(m.group(0).rsplit("_", 1)[-1])
+    if not layout:
+        return None, None
+    overrides = {}
+    for c in layout["cells"]:
+        try:
+            overrides[(int(c["sheet"]), int(c["row"]), int(c["col"]))] = (str(c["written"]), str(c["original"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return overrides, list(layout["columns"])
+
+
 def restore_file(input_path: Path, index: KeyIndex, display_name: str = "") -> RestoreResult:
     """Restore `input_path` using the merged key `index`."""
     if index.size == 0:
@@ -64,6 +86,10 @@ def restore_file(input_path: Path, index: KeyIndex, display_name: str = "") -> R
 
     stem = _ANON_SUFFIX_RE.sub("", Path(display_name or input_path.name).stem) or "document"
     out_path = _unique_path(OUTPUT_DIR / f"{stem}_restored{out_ext}")
+    overrides, columns = _exact_layout(index, display_name or input_path.name)
+    if overrides:
+        log.info("unanonymize: exact roster layout for %d cell(s), %d appended column(s)",
+                 len(overrides), len(columns or []))
 
     restorer = TokenRestorer(index)
     # Tally from the text the operator actually sees, once - the writers make
@@ -79,11 +105,13 @@ def restore_file(input_path: Path, index: KeyIndex, display_name: str = "") -> R
     try:
         if suffix in ("xlsx", "xls", "ods"):
             result = scrub_xlsx(extracted.working_path, restorer, out_path, deep_clean=False,
-                                sheet_restore=index.sheet_titles)
+                                sheet_restore=index.sheet_titles,
+                                cell_overrides=overrides, remove_columns=columns)
         elif suffix in ("docx", "doc", "odt"):
             result = scrub_docx(extracted.working_path, restorer, out_path, deep_clean=False)
         elif suffix == "csv":
-            result = scrub_csv(extracted, restorer, out_path)
+            result = scrub_csv(extracted, restorer, out_path,
+                               cell_overrides=overrides, remove_columns=columns)
         else:  # txt / md / rtf / html / pdf / pptx - text output
             result = scrub_text(extracted, restorer, out_path)
     finally:

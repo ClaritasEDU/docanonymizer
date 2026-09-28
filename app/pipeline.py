@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from . import community as community_mod
 from . import endpoints as endpoints_mod
 from .config import KEYS_DIR, OUTPUT_DIR, UPLOADS_DIR
 from .detector import detect_pii, is_plain_amount
@@ -23,7 +24,7 @@ from .key_files import new_session_id, save_key_file
 from .logging_setup import get_logger
 from .backstop import column_consensus, pattern_hits
 from .mapper import VALID_TAGS, EntityRegistry
-from .replacer import overlap_unions
+from .replacer import LiteralReplacer, overlap_unions
 from .scrubber import scrub_csv, scrub_docx, scrub_text, scrub_xlsx
 from .verifier import verify_output
 
@@ -52,6 +53,8 @@ class Session:
     verify_result: Optional[dict] = None
     formula_warnings: list[str] = field(default_factory=list)
     preview: Optional[dict] = None     # built once after detection; polled often
+    # Community identifiers from Family Graph (spreadsheets only; community.py).
+    community: Optional["community_mod.CommunityState"] = None
     error: Optional[str] = None
     created_at: float = field(default_factory=time.monotonic)
     detected_at: Optional[float] = None   # when the preview became ready
@@ -224,6 +227,14 @@ def run_extract_and_detect(sess: Session) -> Session:
 
     _backstop(sess)
 
+    # Community identifiers: ask Family Graph who these people are. Never
+    # fails the run - a problem shows in the preview with a retry.
+    try:
+        community_mod.plan_for_session(sess)
+    except Exception as exc:  # defensive: the layer is optional, detection is not
+        log.exception("session %s community plan crashed: %s", sess.id, type(exc).__name__)
+        sess.community = community_mod.CommunityState(status="error", error="community ids unavailable")
+
     # Overlapping detections ("Patient Jane" + "Jane Smith") would leave a
     # fragment ("Smith") behind whichever wins. Register the overlapping
     # stretch as one value so it is replaced whole.
@@ -304,7 +315,9 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None,
                  sess.id, ",".join(sorted(deselected_types)), n)
 
     rmap = sess.registry.as_replacement_map()
-    if not rmap:
+    # Community identifiers committed to Family Graph by the confirm route.
+    ov = community_mod.overrides_for(sess)
+    if not rmap and not ov.cells:
         sess.error = "no replacements to apply (registry empty)"
         return sess
 
@@ -314,17 +327,25 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None,
     out_path = OUTPUT_DIR / out_name
 
     sess.scrub_steps.append({"step": "applying replacements", "status": "active"})
-    log.info("session %s scrub start: out=%s", sess.id, out_name)
+    if ov.cells:
+        sess.scrub_steps.append({"step": f"community ids: {len(ov.registry)} people and households",
+                                 "status": "done"})
+    log.info("session %s scrub start: out=%s community_cells=%d", sess.id, out_name, len(ov.cells))
+    # One engine for the whole scrub, with the community tokens protected so
+    # no short value (a grade, a room number) can be written inside one.
+    replacer = LiteralReplacer(rmap, extra_protected=ov.tokens)
 
     try:
         if suffix in ("xlsx", "xls", "ods"):
-            result = scrub_xlsx(sess.extract.working_path, rmap, out_path)
+            result = scrub_xlsx(sess.extract.working_path, replacer, out_path,
+                                cell_overrides=ov.cells, append_columns=ov.append_columns)
         elif suffix in ("docx", "doc", "odt"):
-            result = scrub_docx(sess.extract.working_path, rmap, out_path)
+            result = scrub_docx(sess.extract.working_path, replacer, out_path)
         elif suffix == "csv":
-            result = scrub_csv(sess.extract, rmap, out_path)
+            result = scrub_csv(sess.extract, replacer, out_path,
+                               cell_overrides=ov.cells, append_columns=ov.append_columns)
         else:
-            result = scrub_text(sess.extract, rmap, out_path)
+            result = scrub_text(sess.extract, replacer, out_path)
     except Exception as exc:
         log.error("session %s scrub failed: %s", sess.id, exc)
         sess.output_path = out_path  # so cleanup can remove partials/staged
@@ -341,7 +362,16 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None,
 
     sess.scrub_steps.append({"step": "verification scan running", "status": "active"})
     try:
-        verify = verify_output(result.output_path, rmap)
+        verify = verify_output(result.output_path, rmap, extra_protected=ov.tokens)
+        # Every original a community token replaced must be gone too - a name
+        # cell the model never flagged is covered only by the identity layer.
+        if verify.passed and ov.identity_cells:
+            residue = _community_residue(result.output_path, ov)
+            if residue:
+                log.error("session %s verify: %d community cell original(s) survived", sess.id, residue)
+                verify.passed = False
+                verify.map_match_types = sorted(set(verify.map_match_types) | {"PERSON"})
+                verify.total_matches += residue
         sess.scrub_steps[-1]["status"] = "done" if verify.passed else "err"
         if verify.passed:
             sess.key_path = save_key_file(
@@ -351,6 +381,7 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None,
                 pii_types_scrubbed=sorted(sess.registry.counts_per_type().keys()),
                 registry=sess.registry,
                 sheet_titles=result.sheet_titles,
+                extra=community_mod.key_fields(sess, ov),
             )
     except Exception as exc:
         # An output that can't be verified is never released. Without this,
@@ -385,6 +416,25 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None,
         sess.id, verify.passed, result.output_path.name,
     )
     return sess
+
+
+def _community_residue(output_path: Path, ov) -> int:
+    """How many rewritten roster cells' original names still appear, as a
+    whole word, anywhere in the output. A name cell is covered by its
+    community token even when the model never flagged the name, so the
+    normal map scan can't see this leak: "Ann" left in a notes column.
+    Whole words only - "Ann" inside "Annual" is not the name."""
+    import re as _re
+    originals = sorted({c["original"].strip() for c in ov.identity_cells
+                        if c.get("original") and any(ch.isalpha() for ch in c["original"])},
+                       key=len, reverse=True)
+    if not originals:
+        return 0
+    pat = _re.compile(r"(?<!\w)(?:" + "|".join(_re.escape(o) for o in originals) + r")(?!\w)")
+    text = extract(output_path).text
+    for tok in ov.tokens:
+        text = text.replace(tok, " ")
+    return len(pat.findall(text))
 
 
 def cleanup_upload(sess: Session) -> None:

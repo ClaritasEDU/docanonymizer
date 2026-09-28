@@ -163,8 +163,14 @@ def _deep_zip_text(path: Path) -> str:
     return "\n".join(chunks)
 
 
-def verify_output(output_path: Path, replacement_map: dict[str, str]) -> VerifyResult:
-    """Run the verification pass against the freshly scrubbed file."""
+def verify_output(output_path: Path, replacement_map: dict[str, str],
+                  extra_protected=None) -> VerifyResult:
+    """Run the verification pass against the freshly scrubbed file.
+
+    `extra_protected`: community identifiers written into the file. A short
+    original (a grade "94", a room "A4") can occur inside one by chance; that
+    is not residue.
+    """
     extracted = extract(output_path)
     texts = [extracted.text]
     if output_path.suffix.lower() in _ZIP_SUFFIXES:
@@ -174,7 +180,8 @@ def verify_output(output_path: Path, replacement_map: dict[str, str]) -> VerifyR
     # regions are protected, so only text outside them can count as residue.
     map_match_types: set[str] = set()
     map_total = 0
-    finder = LiteralReplacer(replacement_map, protect_placeholders=True)
+    finder = LiteralReplacer(replacement_map, protect_placeholders=True,
+                             extra_protected=extra_protected)
     for text in texts:
         for _, _, placeholder in finder.find(text):
             map_match_types.add(_tag_of(placeholder))

@@ -26,6 +26,17 @@ Legacy (v1.3) keys used 4-char IDs shared across an entity's tags. Those are
 matched only with their tag present ([PERSON_3A4F] / PERSON_3A4F) - a bare
 4-char hex is far too common in ordinary text to restore on its own.
 
+Community identifiers (2026-09-28): roster cells carry Family Graph ids,
+`[I…]` for an individual and `[F…]` for a household - one id per HUMAN, so
+unlike the per-value ids they restore to the person's name (or the
+household's label), not to one exact spelling. Tolerated forms:
+    [I3A4F9C2B1D0E7F21]  [i3a4f9c2b1d0e7f21]  \\[I3A4F9C2B1D0E7F21\\]
+    I3A4F9C2B1D0E7F21    STUDENT_I3A4F9C2B1D0E7F21    3A4F9C2B1D0E7F21
+The same id in two keys (the same person on two rosters) is not a conflict;
+if the keys spell the name differently the newest key's spelling is used and
+the report counts it. Restoring the anonymized file itself puts each cell's
+exact original text back by position (unanonymize.py), not the name.
+
 Never logs original values. Only counts.
 """
 
@@ -47,6 +58,9 @@ class KeyConflictError(ValueError):
     """Two selected keys give the same identifier different values."""
 
 
+_COMMUNITY_TAG = {"I": "INDIVIDUAL", "F": "FAMILY"}
+
+
 _KEY_PLACEHOLDER_RE = re.compile(r"\[([A-Z]+)_([0-9A-F]+)\]")
 
 # Tolerant token grammar. Alternatives are tried left to right at each
@@ -56,12 +70,18 @@ _KEY_PLACEHOLDER_RE = re.compile(r"\[([A-Z]+)_([0-9A-F]+)\]")
 #   xh - bare 12-char hex
 _TAG = r"[A-Za-z][A-Za-z_]{1,30}"
 _TOKEN_RE = re.compile(
-    rf"(?P<br>\\?\[[ \t]*(?P<bt>{_TAG})\\?_(?P<bh>[0-9A-Fa-f]{{4,16}})[ \t]*\\?\])"
+    # Community ids first: [I…] / [F…], optionally tag-prefixed or escaped,
+    # then bare I…/F… with 16 hex, then a bare 16-hex (the letter dropped).
+    rf"(?P<cb>\\?\[[ \t]*(?:[A-Za-z][A-Za-z]{{1,30}}\\?_)?(?P<cbl>[IiFf])(?P<cbh>[0-9A-Fa-f]{{16}}|[0-9A-Fa-f]{{8}})[ \t]*\\?\])"
+    rf"|(?<![0-9A-Za-z])(?P<cn>(?:[A-Za-z][A-Za-z]{{1,30}}\\?_)?(?P<cnl>[IiFf])(?P<cnh>[0-9A-Fa-f]{{16}}))(?![0-9A-Za-z])"
+    rf"|(?<![0-9A-Za-z])(?P<cx>[0-9A-Fa-f]{{16}})(?![0-9A-Za-z])"
+    rf"|(?P<br>\\?\[[ \t]*(?P<bt>{_TAG})\\?_(?P<bh>[0-9A-Fa-f]{{4,16}})[ \t]*\\?\])"
     rf"|(?<![0-9A-Za-z])(?P<nb>(?P<nt>{_TAG})\\?_(?P<nh>[0-9A-Fa-f]{{4,16}}))(?![0-9A-Fa-f])"
     rf"|(?<![0-9A-Za-z])(?P<xh>[0-9A-Fa-f]{{{HEX_LEN}}})(?![0-9A-Za-z])"
 )
 _ANY_ID_RE = re.compile(rf"(?=([0-9A-Fa-f]{{{HEX_LEN}}}))")
 _SHEET_ID_RE = re.compile(r"SHEET_([0-9A-F]{12})")
+_COMMUNITY_ID_RE = re.compile(r"([IF])([0-9A-F]{16}|[0-9A-F]{8})")
 
 
 @dataclass
@@ -71,10 +91,15 @@ class KeyIndex:
     key_names: list[str] = field(default_factory=list)
     legacy_ambiguous: int = 0      # v1.3 placeholders that pointed at 2+ values
     sheet_titles: dict[str, str] = field(default_factory=dict)   # anonymized -> original
+    # Community ids: HEX (16 or 8, upper) -> (letter I/F, display name)
+    community: dict[str, tuple[str, str]] = field(default_factory=dict)
+    community_variants: int = 0    # same id spelled differently across keys
+    # session id -> {"cells": [...], "columns": [...]} for exact file restores
+    identity_layout: dict[str, dict] = field(default_factory=dict)
 
     @property
     def size(self) -> int:
-        return len(self.by_hex) + len(self.legacy)
+        return len(self.by_hex) + len(self.legacy) + len(self.community)
 
 
 def build_index(keys: Iterable[tuple[str, dict]]) -> KeyIndex:
@@ -87,11 +112,34 @@ def build_index(keys: Iterable[tuple[str, dict]]) -> KeyIndex:
     idx = KeyIndex()
     hex_owner: dict[str, str] = {}
     legacy_owner: dict[tuple[str, str], str] = {}
+    community_when: dict[str, str] = {}
     for name, payload in keys:
         rmap = payload.get("replacement_map") or {}
         if not isinstance(rmap, dict):
             raise ValueError(f"key {name}: replacement_map is not an object")
         idx.key_names.append(name)
+        created = str(payload.get("created_at") or "")
+        registry = payload.get("identity_registry") or {}
+        if isinstance(registry, dict):
+            for cid, rec in registry.items():
+                m = _COMMUNITY_ID_RE.fullmatch(cid) if isinstance(cid, str) else None
+                if not m or not isinstance(rec, dict):
+                    continue
+                hx, display = m.group(2).upper(), str(rec.get("display") or "")
+                prev = idx.community.get(hx)
+                if prev is not None and prev[1] != display:
+                    idx.community_variants += 1
+                    if created < community_when.get(hx, ""):
+                        continue            # an older spelling never wins
+                idx.community[hx] = (m.group(1).upper(), display)
+                community_when[hx] = created
+        sid = payload.get("session_id")
+        cells = payload.get("identity_cells")
+        if isinstance(sid, str) and isinstance(cells, list):
+            idx.identity_layout[sid] = {
+                "cells": [c for c in cells if isinstance(c, dict)],
+                "columns": [c for c in (payload.get("identity_columns") or []) if isinstance(c, dict)],
+            }
         titles = payload.get("sheet_titles") or {}
         if isinstance(titles, dict):
             for new, old in titles.items():
@@ -144,8 +192,10 @@ def build_index(keys: Iterable[tuple[str, dict]]) -> KeyIndex:
                     idx.legacy[k] = original
                     legacy_owner[k] = name
     log.info(
-        "key index built: keys=%d ids=%d legacy_ids=%d legacy_ambiguous=%d",
+        "key index built: keys=%d ids=%d legacy_ids=%d legacy_ambiguous=%d "
+        "community_ids=%d community_variants=%d",
         len(idx.key_names), len(idx.by_hex), len(idx.legacy), idx.legacy_ambiguous,
+        len(idx.community), idx.community_variants,
     )
     return idx
 
@@ -160,6 +210,7 @@ class RestoreReport:
     unresolved_count: int = 0
     residual: int = 0           # file restores: tokens still present after writing
     legacy_ambiguous: int = 0
+    community_variants: int = 0   # one person spelled differently across keys
     keys_used: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -172,6 +223,7 @@ class RestoreReport:
             "unresolved_count": self.unresolved_count,
             "residual": self.residual,
             "legacy_ambiguous": self.legacy_ambiguous,
+            "community_variants": self.community_variants,
             "keys_used": self.keys_used,
         }
 
@@ -187,6 +239,8 @@ class TokenRestorer:
 
     def _resolve(self, m: re.Match) -> tuple[Optional[str], str, dict]:
         """Returns (original or None, key_tag, flags)."""
+        if m.group("cb") is not None or m.group("cn") is not None or m.group("cx") is not None:
+            return self._resolve_community(m)
         if m.group("xh") is not None:
             hx = m.group("xh").upper()
             hit = self.index.by_hex.get(hx)
@@ -213,6 +267,20 @@ class TokenRestorer:
         # was meant to be one of ours.
         report = tag_known and (bracketed or len(hx) >= 8)
         return None, "", {"report": report}
+
+    def _resolve_community(self, m: re.Match) -> tuple[Optional[str], str, dict]:
+        if m.group("cx") is not None:
+            hit = self.index.community.get(m.group("cx").upper())
+            if hit is None:
+                return None, "", {"ignore": True}     # some other 16-hex string
+            return hit[1], _COMMUNITY_TAG[hit[0]], {"untagged": True}
+        bracketed = m.group("cb") is not None
+        letter = (m.group("cbl") if bracketed else m.group("cnl")).upper()
+        hx = (m.group("cbh") if bracketed else m.group("cnh")).upper()
+        hit = self.index.community.get(hx)
+        if hit is None:
+            return None, "", {"report": True}
+        return hit[1], _COMMUNITY_TAG[hit[0]], {"relabeled": hit[0] != letter}
 
     def find(self, text: str) -> list[Span]:
         return self._scan(text, None)
@@ -268,7 +336,8 @@ class TokenRestorer:
 
 def new_report(index: KeyIndex) -> RestoreReport:
     return RestoreReport(keys_used=list(index.key_names),
-                         legacy_ambiguous=index.legacy_ambiguous)
+                         legacy_ambiguous=index.legacy_ambiguous,
+                         community_variants=index.community_variants)
 
 
 def restore_text(text: str, index: KeyIndex) -> tuple[str, RestoreReport]:
