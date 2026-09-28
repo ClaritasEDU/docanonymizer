@@ -31,6 +31,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import requests
+import urllib3
 
 from . import endpoints as endpoints_mod
 from .config import FAMILYGRAPH_FILE, FAMILYGRAPH_ROSTER_TIMEOUT_S, FAMILYGRAPH_TIMEOUT_S
@@ -47,14 +48,17 @@ class FamilyGraphError(RuntimeError):
     """A call to Family Graph failed. `status` is the HTTP status (0 = no
     connection); `body` is the parsed JSON body when there is one;
     `timed_out` is True when Family Graph was reached but did not answer
-    within the read timeout."""
+    within the read timeout. `not_sent` is True when the request provably
+    never reached Family Graph (not configured, bad URL, no connection
+    made), so a commit that fails this way wrote nothing."""
 
     def __init__(self, message: str, status: int = 0, body: Optional[dict] = None,
-                 timed_out: bool = False):
+                 timed_out: bool = False, not_sent: bool = False):
         super().__init__(message)
         self.status = status
         self.body = body or {}
         self.timed_out = timed_out
+        self.not_sent = not_sent
 
 
 # ---------------------------------------------------------------------------
@@ -78,9 +82,14 @@ def _write(data: dict) -> None:
         # Created 0600 from the start: the key is never world-readable, not
         # even for the instant between write and chmod.
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, FAMILYGRAPH_FILE)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, FAMILYGRAPH_FILE)
+        except BaseException:
+            # A half-written tmp file holds the key: never leave it behind.
+            tmp.unlink(missing_ok=True)
+            raise
         try:
             os.chmod(FAMILYGRAPH_FILE, 0o600)
         except OSError:
@@ -131,6 +140,12 @@ def save(payload: dict) -> dict:
         if len(key) < 16 or any(c.isspace() for c in key):
             raise ValueError("that does not look like a Family Graph API key")
     else:
+        # The stored key only ever goes to the server it was entered for. A
+        # new address needs the key typed again, so a changed URL (a typo, or
+        # a page that slipped a request past the browser) can't carry it off.
+        stored = cur.get("base_url")
+        if stored and cur.get("api_key") and _same_server(stored, url) is False:
+            raise ValueError("the Family Graph address changed - enter the API key again")
         key = cur.get("api_key") or ""
     if not key:
         raise ValueError("an API key is required (Family Graph: POST /api/keys)")
@@ -140,6 +155,13 @@ def save(payload: dict) -> dict:
     _write({"base_url": url, "api_key": key, "category": category})
     log.info("family graph settings saved: host=%s category=%s", urlparse(url).hostname, category)
     return redacted()
+
+
+def _same_server(a: str, b: str) -> bool:
+    """Same scheme, host and port (default ports filled in)."""
+    pa, pb = urlparse(a), urlparse(b)
+    port = lambda p: p.port or (443 if p.scheme == "https" else 80)
+    return (pa.scheme, (pa.hostname or "").lower(), port(pa)) == (pb.scheme, (pb.hostname or "").lower(), port(pb))
 
 
 def clear() -> bool:
@@ -175,6 +197,21 @@ def _read_timed_out(exc: requests.ConnectionError) -> bool:
     return False
 
 
+def _never_connected(exc: BaseException) -> bool:
+    """True when requests failed while opening the connection (refused,
+    DNS), before a byte of the request went out."""
+    seen = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, urllib3.exceptions.NewConnectionError):
+            return True
+        nxt = cur.args[0] if cur.args and isinstance(cur.args[0], BaseException) else None
+        reason = getattr(cur, "reason", None)
+        cur = nxt or (reason if isinstance(reason, BaseException) else None) or cur.__cause__ or cur.__context__
+    return False
+
+
 def _call(method: str, path: str, body: Optional[dict] = None, timeout: Optional[float] = None) -> tuple[int, dict]:
     """One HTTP call. `timeout` is the read timeout in seconds; quick calls
     use the default (FAMILYGRAPH_TIMEOUT_S), roster plan/commit pass
@@ -184,12 +221,12 @@ def _call(method: str, path: str, body: Optional[dict] = None, timeout: Optional
     base = s.get("base_url")
     key = s.get("api_key")
     if not base or not key:
-        raise FamilyGraphError("Family Graph is not configured", 0)
+        raise FamilyGraphError("Family Graph is not configured", 0, not_sent=True)
     # Re-checked on every call: a hand-edited settings file gets no pass.
     try:
         base = _validate_url(base)
     except ValueError as exc:
-        raise FamilyGraphError(str(exc), 0) from exc
+        raise FamilyGraphError(str(exc), 0, not_sent=True) from exc
     headers = {
         "Authorization": f"Bearer {key}",
         "x-family-graph-actor": "docanonymizer",
@@ -205,7 +242,7 @@ def _call(method: str, path: str, body: Optional[dict] = None, timeout: Optional
             )
     except requests.ConnectTimeout as exc:
         log.warning("family graph unreachable: %s %s (ConnectTimeout after %ds)", method, path, _CONNECT_TIMEOUT_S)
-        raise FamilyGraphError("Family Graph is not reachable - is it running?", 0) from exc
+        raise FamilyGraphError("Family Graph is not reachable - is it running?", 0, not_sent=True) from exc
     except (requests.Timeout, requests.ConnectionError) as exc:
         elapsed = time.monotonic() - started
         if isinstance(exc, requests.Timeout) or _read_timed_out(exc):
@@ -213,8 +250,12 @@ def _call(method: str, path: str, body: Optional[dict] = None, timeout: Optional
                         method, path, elapsed, read_timeout)
             raise FamilyGraphError(
                 f"Family Graph did not answer within {read_timeout:g} seconds", 0, timed_out=True) from exc
-        log.warning("family graph unreachable: %s %s (%s)", method, path, type(exc).__name__)
-        raise FamilyGraphError("Family Graph is not reachable - is it running?", 0) from exc
+        # Refused or unresolvable: no connection was ever made, so nothing
+        # was sent. A connection dropped after sending is not this.
+        never = _never_connected(exc)
+        log.warning("family graph unreachable: %s %s (%s%s)", method, path, type(exc).__name__,
+                    ", no connection made" if never else "")
+        raise FamilyGraphError("Family Graph is not reachable - is it running?", 0, not_sent=never) from exc
     elapsed = time.monotonic() - started
     try:
         data = resp.json()
@@ -229,6 +270,9 @@ def _raise_for(status: int, data: dict, what: str) -> None:
     if status == 401:
         raise FamilyGraphError("Family Graph rejected the API key", status, data)
     if status == 403:
+        if data.get("error") == "roster_forbidden":
+            raise FamilyGraphError(
+                f"Family Graph refused this key for {what}: {detail}".strip(), status, data)
         raise FamilyGraphError(
             f"the API key is missing the roster scope for {what} - issue one with: "
             "family-graph issue-key docanonymizer roster", status, data)
@@ -267,12 +311,20 @@ def plan(body: dict) -> dict:
 
 
 def commit(body: dict) -> tuple[bool, dict]:
-    """(True, result) when written; (False, plan) when Family Graph refused
-    because review items are still undecided (nothing was written)."""
+    """(True, result) when written - or when this idempotency_key already
+    wrote it (200, "replayed": true, the stored result); (False, plan) when
+    Family Graph refused because review items are still undecided (nothing
+    was written)."""
     status, data = _call("POST", "/api/identity/roster/commit", body, timeout=FAMILYGRAPH_ROSTER_TIMEOUT_S)
-    if status == 201:
+    if status == 201 or (status == 200 and data.get("replayed") is True):
+        if data.get("replayed"):
+            log.info("family graph roster commit replayed: an earlier send of this request was written")
         return True, data
     if status == 409 and data.get("error") == "review_incomplete":
         return False, data.get("plan") or {}
+    if status == 409 and (data.get("error") == "idempotency_conflict" or data.get("code") == "idempotency_conflict"):
+        raise FamilyGraphError(
+            "Family Graph already holds a different commit under this file's request key - "
+            "nothing was written by this send. Cancel this file and upload it again.", status, data)
     _raise_for(status, data, "roster commit")
     return False, {}  # unreachable

@@ -69,6 +69,7 @@
     same_name_twice_in_household: "same name twice in this household - one person or two?",
     // matching people
     possible_match: "possible match - confirm",
+    one_column_list: "a one-column list - confirm this is a person",
     several_strong_candidates: "more than one strong match",
     household_disagrees: "the household points at someone else",
     candidate_archived: "the match is an archived record",
@@ -690,7 +691,7 @@
     // Family Graph writes the community ids first, before anything is
     // scrubbed - a large roster can take a minute or two.
     const cm = state.community;
-    if (cm && cm.status === "ready" && !state.deselectedTypes.has("PERSON")) {
+    if (cm && (cm.status === "ready" || cm.status === "commit_unknown") && !state.deselectedTypes.has("PERSON")) {
       const rows = new Set((cm.items || []).map((i) => `${i.table}:${i.sheet_row}`)).size;
       renderSteps("confirm-progress", [
         ACTIVE(`Family Graph: writing community ids for ${rows.toLocaleString()} roster rows (a large roster can take a minute or two)`),
@@ -746,8 +747,10 @@
       if (r.community_busy) continue;            // Family Graph is still writing
       let view = null;
       try { view = await api(`/api/anonymize/${sid}/community`); } catch {}
+      // Never tell the operator a repeat is harmless here: if a commit went
+      // out, the server has locked this file's choices and says so.
       confirmFailed((view && view.commit_error)
-        || "The connection dropped before this app answered. Nothing was scrubbed - press CONFIRM AND SCRUB again.", view);
+        || "The connection dropped before this app answered. Nothing was scrubbed. Press CONFIRM AND SCRUB to ask again, or cancel the file.", view);
       return;
     }
     confirmFailed("Still no answer from Family Graph. Nothing was scrubbed - check that it is running, then try again.", null);
@@ -829,10 +832,14 @@
     }
     const cm = r.community;
     if (cm && cm.status === "committed") {
-      const p = cm.persons || {}, f = cm.families || {};
+      // Counted by outcome (an id that existed, or one minted now), one per
+      // distinct person - Family Graph's summary files a decided review
+      // item under "review" even when it minted a new id.
+      const p = cm.people || {}, f = cm.households || {};
+      const num = (n) => String(n || 0).padStart(5);
       lines.push({ text: "COMMUNITY IDS (FAMILY GRAPH)" });
-      lines.push({ text: padRight("PEOPLE", 12) + `${(p.matched || 0) + (p.review || 0)} known    ${p.new || 0} new    ${p.skipped || 0} skipped` });
-      lines.push({ text: padRight("HOUSEHOLDS", 12) + `${(f.matched || 0) + (f.review || 0)} known    ${f.new || 0} new` });
+      lines.push({ text: padRight("PEOPLE", 12) + `${num(p.known)} known   ${num(p.new)} new   ${num(p.skipped)} skipped` });
+      lines.push({ text: padRight("HOUSEHOLDS", 12) + `${num(f.known)} known   ${num(f.new)} new` });
       lines.push({ text: `IMPORT RUN: ${(cm.import_runs || []).join(", ") || "-"}`, cls: "rule" });
       lines.push({ text: rule, cls: "rule" });
     } else if (cm && cm.status === "skipped") {
@@ -871,7 +878,7 @@
       $("btn-toggle-familygraph").textContent = s.configured ? "[ FAMILY GRAPH: ON ]" : "[ FAMILY GRAPH: OFF ]";
       $("fg-url").value = s.base_url || "http://127.0.0.1:3500";
       $("fg-key").value = "";
-      $("fg-key").placeholder = s.key_set ? "key saved - leave blank to keep" : "sk_... (from Family Graph)";
+      $("fg-key").placeholder = s.key_set ? "key saved - leave blank to keep (a new URL needs it again)" : "sk_... (from Family Graph)";
       $("fg-category").value = s.category || "other";
       $("fg-status").textContent = s.configured
         ? "Connected. Spreadsheets will get community ids."
@@ -941,6 +948,18 @@
       show(err); show(retry); show(skip); hide(all);
       skip.textContent = "[ CONTINUE WITHOUT COMMUNITY IDS ]";
       state.communityPending = 1;          // confirm stays blocked until a choice
+      paintConfirm();
+      return;
+    }
+    if (view.status === "commit_unknown") {
+      // A commit went out and no answer came back. Family Graph may have
+      // written it, so the choices are locked: the only ways forward are
+      // the same request again (CONFIRM) or cancelling the file.
+      err.textContent = `[!] ${view.commit_error || "Family Graph may already hold this file's commit."}`;
+      show(err); hide(retry); hide(skip); hide(all);
+      note.textContent = "Choices locked. CONFIRM AND SCRUB sends the identical request again; nobody is written twice.";
+      show(note);
+      state.communityPending = 0;
       paintConfirm();
       return;
     }
@@ -1536,7 +1555,11 @@
     $("btn-test-fg").addEventListener("click", async () => {
       $("fg-status").textContent = "testing...";
       try {
-        if ($("fg-key").value.trim() || !(await api("/api/familygraph")).configured) await saveFamilyGraph();
+        // Save first when anything was typed: a new key, or a new address
+        // (which the server only accepts together with the key).
+        const cur = await api("/api/familygraph");
+        const urlChanged = $("fg-url").value.trim().replace(/\/+$/, "") !== (cur.base_url || "");
+        if ($("fg-key").value.trim() || !cur.configured || urlChanged) await saveFamilyGraph();
         const r = await api("/api/familygraph/test", { method: "POST" });
         $("fg-status").textContent = r.status === "ok"
           ? "[x] Family Graph answered and accepted the key."

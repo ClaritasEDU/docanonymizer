@@ -21,7 +21,8 @@ module is the bridge:
      the new items come back to the preview.
   4. Each person's name cell becomes their `[I…]` token (a couple or a list
      of children in one cell becomes their tokens joined). The household
-     column becomes `[F…]`; with no household column, a FAMILY_ID column is
+     column becomes `[F…]`; with no household column (or an empty household
+     cell, such as the covered part of a merged one), a FAMILY_ID column is
      appended. Everything else - surnames, emails, phones, addresses, free
      text - keeps the per-value tokens from the normal pipeline.
   5. The key file records every rewritten cell and its original text, so
@@ -38,6 +39,8 @@ Never logs names, cell values, or identifiers - counts only.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -49,7 +52,12 @@ from .logging_setup import get_logger
 log = get_logger("community")
 
 TABULAR_SUFFIXES = {"xlsx", "xls", "ods", "csv"}
-MAX_ROWS = 20000                 # Family Graph's per-request limit
+# Family Graph's per-request limits (roster.js LIMITS). Checked here too so a
+# big workbook gets a plain message up front instead of a 400 from the server.
+MAX_ROWS = 20000                 # across all sheets
+MAX_SHEETS = 25
+MAX_COLUMNS = 300
+MAX_CELL_CHARS = 4000
 APPENDED_HEADER = "FAMILY_ID"
 
 # The two community token shapes as written into a file.
@@ -64,7 +72,12 @@ _HEADER_WORD_RE = re.compile(
 
 @dataclass
 class CommunityState:
-    status: str = "off"          # off | ready | error | skipped | committed | none
+    # off | ready | error | skipped | committed | none | commit_unknown
+    # commit_unknown: a commit was sent and no answer came back (timeout,
+    # dropped connection, 5xx). Family Graph may have written it. The file's
+    # choices are frozen: only the same request (same idempotency key) may be
+    # sent again, or the file cancelled.
+    status: str = "off"
     reason: str = ""             # why it is off / none
     error: Optional[str] = None
     category: str = "other"
@@ -74,6 +87,14 @@ class CommunityState:
     result: Optional[dict] = None                   # the commit response
     registered: int = 0                             # guaranteed catches added to the registry
     commit_error: Optional[str] = None              # why the last commit did not happen
+    # Name cells the operator kept as original text: key -> {"action": "skip"}.
+    # Sent with the decisions so those people get no community id.
+    kept: dict = field(default_factory=dict)
+    commit_body: Optional[dict] = None              # the exact request, while commit_unknown
+    # Fingerprint of the Family Graph address and key the frozen request went
+    # out under. Family Graph replays only for the same caller, so a resend
+    # under other settings can't be matched to the first send.
+    commit_scope: Optional[str] = None
 
 
 class CommunityError(RuntimeError):
@@ -119,18 +140,58 @@ def _offered_targets(item: dict) -> set:
     return out
 
 
+COMMIT_FROZEN_NOTE = (
+    "This file's choices are now locked. Press CONFIRM AND SCRUB to send the same request "
+    "again - if Family Graph already wrote it, it returns that result instead of writing "
+    "anyone twice - or cancel the file.")
+
+
+SCOPE_CHANGED_NOTE = (
+    "Family Graph's address or API key changed after this file's commit went out, so a resend "
+    "can't be matched to it. Nothing was sent. Cancel this file and upload it again: anyone "
+    "the first send wrote comes back as known, with the same ids.")
+STALE_RESEND_NOTE = (
+    "Family Graph refused the resend because part of this roster looks already written by the "
+    "first send. The choices stay locked. Cancel this file and upload it again: anyone the "
+    "first send wrote comes back as known, with the same ids.")
+
+
+def _settings_scope() -> str:
+    """A fingerprint of the Family Graph address and key (never logged, never
+    stored outside this session)."""
+    s = familygraph.settings()
+    raw = f"{(s.get('base_url') or '').strip().rstrip('/').lower()}\n{s.get('api_key') or ''}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def explain(exc: Exception, what: str) -> str:
     """Operator-facing text for a failed Family Graph call. `what` is "plan"
     (nothing is ever written) or "commit"."""
     if isinstance(exc, familygraph.FamilyGraphError) and exc.timed_out:
         if what == "commit":
             return (f"{exc} while writing this roster. Nothing was scrubbed and no file was written. "
-                    "Family Graph may still finish on its side - press CONFIRM AND SCRUB again in a "
-                    "minute (anyone it already wrote comes back as known). For a very large roster, "
-                    "raise FAMILYGRAPH_ROSTER_TIMEOUT_S in .env.")
+                    f"Family Graph may still finish on its side. {COMMIT_FROZEN_NOTE} "
+                    "For a very large roster, raise FAMILYGRAPH_ROSTER_TIMEOUT_S in .env.")
         return (f"{exc} while matching this roster. Nothing was written. For a very large "
                 "roster, raise FAMILYGRAPH_ROSTER_TIMEOUT_S in .env.")
     return str(exc)
+
+
+def _sentence(exc: Exception) -> str:
+    m = str(exc).strip()
+    return m if m.endswith((".", "?", "!")) else m + "."
+
+
+def outcome_unknown(exc: Exception) -> bool:
+    """True when a commit may have been written even though it failed here:
+    no answer (timeout, connection dropped after sending) or a server error.
+    A clean 4xx means Family Graph answered and wrote nothing, and a request
+    that never left this machine (not configured, bad URL, no connection
+    made) wrote nothing either."""
+    if getattr(exc, "not_sent", False):
+        return False
+    status = getattr(exc, "status", 0) or 0
+    return status == 0 or status >= 500
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +209,20 @@ def tables_of(extract) -> Optional[list]:
     return tables
 
 
+# The only headers that make a one-column list a list of people. A header
+# word alone is not enough there: "Ministry Name", "Room Name" or "Family
+# notes" over a column of text would mint a person per line.
+_PERSON_LIST_HEADER_RE = re.compile(
+    r"(?:(?:student|child|member|parishioner|person|parent|guardian)(?:'s)?\s+)?"
+    r"(?:full\s+|legal\s+)?names?", re.I)
+
+
 def _header_row(table: list) -> Optional[int]:
+    hr = _wide_header_row(table)
+    return hr if hr is not None else _single_column_header(table)
+
+
+def _wide_header_row(table: list) -> Optional[int]:
     first_wide = None
     for i, row in enumerate(table[:25]):
         filled = [c for c in row if (c or "").strip()]
@@ -161,19 +235,32 @@ def _header_row(table: list) -> Optional[int]:
     return first_wide
 
 
+def _single_column_header(table: list) -> Optional[int]:
+    """A one-column list ("Name" over a list of names): the FIRST row whose
+    one cell is exactly a person-name header. A title above it ("Student
+    Roster") is not one, and neither is a data row under it that happens to
+    hold a header word ("Emma Child"). Every person such a sheet yields goes
+    to review (see _items): one column is too little to be certain."""
+    for i, row in enumerate(table[:25]):
+        filled = [c for c in row if (c or "").strip()]
+        if len(filled) == 1 and _PERSON_LIST_HEADER_RE.fullmatch(filled[0].strip()):
+            return i
+    return None
+
+
 def build_sheets(tables: list) -> list:
     sheets = []
-    total = 0
     for ti, table in enumerate(tables):
         if not table:
             continue
-        hr = _header_row(table)
+        hr, one_column = _wide_header_row(table), False
+        if hr is None:
+            hr, one_column = _single_column_header(table), True
         if hr is None:
             continue
         width = max(len(r) for r in table)
         pad = lambda r: [(c if c is not None else "") for c in r] + [""] * (width - len(r))
         row_numbers = list(range(hr + 1, len(table)))
-        total += len(row_numbers)
         sheets.append({
             "table": ti,
             "header_row": hr,
@@ -181,9 +268,25 @@ def build_sheets(tables: list) -> list:
             "headers": pad(table[hr]),
             "rows": [pad(table[r]) for r in row_numbers],
             "row_numbers": row_numbers,
+            "one_column": one_column,
         })
+    if len(sheets) > MAX_SHEETS:
+        # Monthly tabs, totals, lookups: a sheet whose header names no person,
+        # household or contact column can't hold a roster. Drop those first.
+        sheets = [s for s in sheets if any(_HEADER_WORD_RE.search(h or "") for h in s["headers"])]
+        if len(sheets) > MAX_SHEETS:
+            raise CommunityError(f"this file has {len(sheets)} roster sheets; community ids handle "
+                                 f"up to {MAX_SHEETS} per file")
+    total = sum(len(s["row_numbers"]) for s in sheets)
     if total > MAX_ROWS:
         raise CommunityError(f"this file has {total:,} rows; community ids handle up to {MAX_ROWS:,} per file")
+    for s in sheets:
+        if s["width"] > MAX_COLUMNS:
+            raise CommunityError(f"sheet {s['table'] + 1} has {s['width']:,} columns; community ids handle "
+                                 f"up to {MAX_COLUMNS} per sheet")
+        if any(len(c) > MAX_CELL_CHARS for r in [s["headers"]] + s["rows"] for c in r if isinstance(c, str)):
+            raise CommunityError(f"sheet {s['table'] + 1} has a cell longer than {MAX_CELL_CHARS:,} characters; "
+                                 f"community ids handle cells up to {MAX_CELL_CHARS:,}")
     return sheets
 
 
@@ -194,8 +297,19 @@ def _body(sess, state: CommunityState, with_decisions: bool) -> dict:
         "source_ref": f"docanonymizer:{sess.id}",
         "category": state.category,
     }
-    if with_decisions and state.decisions:
-        body["decisions"] = dict(state.decisions)
+    if with_decisions and (state.decisions or state.kept):
+        # A kept name wins over any decision on the same person.
+        body["decisions"] = {**state.decisions, **state.kept}
+    return body
+
+
+def commit_body(sess, state: CommunityState) -> dict:
+    """The commit request with its idempotency key: session id plus a hash
+    of the canonical body, so a resend of the same request is recognized by
+    Family Graph and a different request can never reuse the key."""
+    body = _body(sess, state, with_decisions=True)
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    body["idempotency_key"] = f"docanon:{sess.id}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]}"
     return body
 
 
@@ -277,7 +391,10 @@ def _run_plan(sess, state: CommunityState) -> None:
 def retry(sess) -> CommunityState:
     """Ask Family Graph again. Decisions made so far still apply to the same
     rows and go with the request; any the new plan no longer supports are
-    dropped (the item comes back as needing a decision)."""
+    dropped (the item comes back as needing a decision). Refused while a
+    commit's outcome is unknown: a new plan would change the request."""
+    if sess.community is not None and sess.community.status == "commit_unknown":
+        raise CommunityError("frozen")
     keep = dict((sess.community or CommunityState()).decisions)
     return plan_for_session(sess, decisions=keep)
 
@@ -289,10 +406,15 @@ def _prune_decisions(sess, state: CommunityState) -> None:
     if not state.decisions:
         return
     items = {i["key"]: i for i in _items(state)}
+    # Decisions Family Graph says the data has overtaken (someone else
+    # committed the same person meanwhile, or this file's own earlier
+    # commit already wrote them). Kept, every confirm would resend them and
+    # be refused again with nothing left to decide.
+    stale = set((state.plan or {}).get("stale_decisions") or [])
     kept = {}
     for key, d in state.decisions.items():
         item = items.get(key)
-        if item is None:
+        if item is None or key in stale:
             continue
         if d.get("action") == "attach" and d.get("target") not in _offered_targets(item):
             continue
@@ -369,9 +491,13 @@ def _register_guaranteed_catches(sess, state: CommunityState) -> None:
                 full = " ".join(x for x in (p.get("given_name"), p.get("family_name")) if x)
                 if full and " " in full and full in text:
                     add(full)
-                given = (p.get("given_name") or "").strip()
-                if given and re.search(rf"(?<!\w){re.escape(given)}(?!\w)", other_text):
-                    add(given)
+                # Given name and surname alike: a name that sits only inside a
+                # full-name or list cell ("Emma Smith") is covered there by the
+                # [I...] token, so a bare "Smith" in the notes would ship.
+                for part in (p.get("given_name"), p.get("family_name")):
+                    part = (part or "").strip()
+                    if part and re.search(rf"(?<!\w){re.escape(part)}(?!\w)", other_text):
+                        add(part)
             fam = row.get("family") or {}
             if fam.get("cell"):
                 add(_cell(table, rn, fam["cell"]["col"]))
@@ -399,11 +525,19 @@ def _items(state: CommunityState) -> list:
         meta = state.sheets[si] if si < len(state.sheets) else None
         if meta is None:
             continue
+        # A one-column list could be ministries or rooms under "Name": before
+        # the commit every person on it needs a human, never an automatic
+        # new id or match (Family Graph cannot tell from one column).
+        confirm_each = bool(meta.get("one_column")) and state.result is None
         for row in sheet.get("rows") or []:
             if row.get("skipped"):
                 continue
             sheet_row = meta["row_numbers"][row["index"]] + 1      # 1-based, as in Excel
             for p in row.get("persons") or []:
+                if confirm_each and p.get("action") in ("new", "matched"):
+                    p = {**p, "action": "review",
+                         "candidates": list(p.get("candidates") or []) + ([p["matched"]] if p.get("matched") else []),
+                         "review_reasons": list(p.get("review_reasons") or []) + ["one_column_list"]}
                 out.append({
                     "key": p["key"], "kind": "person", "table": meta["table"], "sheet_row": sheet_row,
                     "label": " ".join(x for x in (p.get("given_name"), p.get("family_name")) if x) or "(no name)",
@@ -429,10 +563,42 @@ def _items(state: CommunityState) -> list:
 def pending(state: Optional[CommunityState]) -> list:
     if state is None or state.status != "ready":
         return []
-    return [i["key"] for i in _items(state) if i["action"] == "review" and i["key"] not in state.decisions]
+    return [i["key"] for i in _items(state)
+            if i["action"] == "review" and i["key"] not in state.decisions and i["key"] not in state.kept]
+
+
+def kept_for(sess, state: CommunityState, deselected) -> dict:
+    """People whose name the operator kept as original text in the preview
+    (clicked its placeholder): their name cell equals a kept value, or their
+    full name does. They are sent as skip decisions, so their cell keeps the
+    text the operator chose and no community id is minted for them. Exact
+    matches only - a kept "Ann" never touches "Ann Lee"."""
+    kept_values = {d.strip() for d in (deselected or []) if isinstance(d, str) and d.strip()}
+    out: dict = {}
+    if not kept_values or not state.plan:
+        return out
+    tables = tables_of(sess.extract) or []
+    for si, sheet in enumerate(state.plan.get("sheets") or []):
+        meta = state.sheets[si] if si < len(state.sheets) else None
+        if meta is None or meta["table"] >= len(tables):
+            continue
+        table = tables[meta["table"]]
+        for row in sheet.get("rows") or []:
+            if row.get("skipped"):
+                continue
+            rn = meta["row_numbers"][row["index"]]
+            for p in row.get("persons") or []:
+                c = _name_cell(p.get("name_cells") or [])
+                cell = _cell(table, rn, c["col"]).strip() if c else ""
+                full = " ".join(x for x in (p.get("given_name"), p.get("family_name")) if x).strip()
+                if (cell and cell in kept_values) or (full and full in kept_values):
+                    out[p["key"]] = {"action": "skip"}
+    return out
 
 
 def decide(state: CommunityState, key: str, action: str, target: Optional[str] = None) -> None:
+    if state.status == "commit_unknown":
+        raise ValueError("a commit for this file may already be written - its choices are locked")
     items = {i["key"]: i for i in _items(state)}
     if key not in items:
         raise ValueError("unknown item")
@@ -485,37 +651,114 @@ def view(state: Optional[CommunityState], busy: str = "") -> dict:
 def commit_for_session(sess) -> bool:
     """True when Family Graph wrote everything. False when it refused because
     new items need a decision (state.plan now holds them). Raises
-    FamilyGraphError when Family Graph can't be reached or says no."""
+    FamilyGraphError when Family Graph can't be reached or says no.
+
+    Every commit carries an idempotency key. When the outcome is unknown
+    (no answer, or a server error) the state becomes "commit_unknown" and
+    the exact request is kept: the next confirm resends it byte for byte,
+    so Family Graph replays what it wrote instead of writing anyone twice."""
     state = sess.community
     state.commit_error = None
+    resend = state.status == "commit_unknown" and state.commit_body is not None
+    body = state.commit_body if resend else commit_body(sess, state)
+    scope = _settings_scope()
+    if resend and state.commit_scope and scope != state.commit_scope:
+        # Family Graph keys its replay by caller: under a new key or address
+        # the resend would be a fresh commit, and a refusal would prove
+        # nothing. Stay frozen; a fresh upload is the certain way out.
+        state.commit_error = SCOPE_CHANGED_NOTE
+        log.error("session %s community resend refused: Family Graph settings changed since the first send",
+                  sess.id)
+        raise familygraph.FamilyGraphError(SCOPE_CHANGED_NOTE, 0, not_sent=True)
     rows = sum(len(s["rows"]) for s in state.sheets)
-    log.info("session %s community commit requested: rows=%d decisions=%d",
-             sess.id, rows, len(state.decisions))
+    log.info("session %s community commit requested: rows=%d decisions=%d kept=%d resend=%s",
+             sess.id, rows, len(state.decisions), len(state.kept), resend)
     sess.fg_rows, sess.fg_busy = rows, "commit"
     try:
-        committed, data = familygraph.commit(_body(sess, state, with_decisions=True))
+        committed, data = familygraph.commit(body)
     except familygraph.FamilyGraphError as exc:
-        # Nothing changes here: status stays "ready", no result, no scrub.
-        state.commit_error = explain(exc, "commit")
-        log.error("session %s community commit failed: %s%s", sess.id, type(exc).__name__,
-                  " (timed out)" if exc.timed_out else "")
+        if resend or outcome_unknown(exc):
+            # Family Graph may hold this commit. Freeze until the same
+            # request gets a real answer, or the operator cancels.
+            if not resend:
+                state.commit_scope = scope
+            state.status, state.commit_body = "commit_unknown", body
+            state.commit_error = (explain(exc, "commit") if exc.timed_out
+                                  else f"{_sentence(exc)} Nothing was scrubbed and no file was written, but Family "
+                                       f"Graph may have written this roster anyway. {COMMIT_FROZEN_NOTE}")
+        else:
+            # A clean refusal (key, scope, rate limit): nothing was written.
+            state.commit_error = explain(exc, "commit")
+        log.error("session %s community commit failed: %s status=%s%s frozen=%s", sess.id, type(exc).__name__,
+                  exc.status, " (timed out)" if exc.timed_out else "", state.status == "commit_unknown")
         raise
     finally:
         sess.fg_busy = ""
     if not committed:
+        stale = (data or {}).get("stale_decisions") or []
+        if resend and stale:
+            # A stale decision can mean this file's first send WAS written
+            # (Family Graph sees a create that repeats an earlier commit).
+            # Unlocking would let the choices change for a written roster.
+            state.commit_error = STALE_RESEND_NOTE
+            log.error("session %s community resend refused with stale decisions: %d - stays frozen",
+                      sess.id, len(stale))
+            raise familygraph.FamilyGraphError(STALE_RESEND_NOTE, 409, {"error": "review_incomplete"})
+        # Family Graph never stores a refusal, and no decision repeats an
+        # earlier commit, so nothing from this file was written: the
+        # operator may decide again.
+        if resend:
+            log.info("session %s community commit unlocked: the resend was refused, nothing was written", sess.id)
+        state.status, state.commit_body, state.commit_scope = "ready", None, None
         if data:                        # keep the last plan if the refusal carried none
             state.plan = data
+        stale = len((state.plan or {}).get("stale_decisions") or [])
         _prune_decisions(sess, state)
-        state.commit_error = "Family Graph found new items that need a decision"
-        log.warning("session %s community commit refused: %d item(s) need a decision",
-                    sess.id, len(pending(state)))
+        if pending(state) or not stale:
+            state.commit_error = "Family Graph found new items that need a decision"
+        else:
+            state.commit_error = ("Family Graph's records changed since you decided, so those answers were "
+                                  "dropped and it matched those people itself. Check the preview and confirm again.")
+        log.warning("session %s community commit refused: %d item(s) need a decision, %d stale decision(s) dropped",
+                    sess.id, len(pending(state)), stale)
         return False
     state.result = data
-    state.status = "committed"
+    state.status, state.commit_body, state.commit_scope = "committed", None, None
     summ = data.get("summary") or {}
-    log.info("session %s community commit: import_runs=%s persons=%s families=%s",
-             sess.id, ",".join(data.get("import_runs") or []), summ.get("persons"), summ.get("families"))
+    log.info("session %s community commit: import_runs=%s persons=%s families=%s replayed=%s",
+             sess.id, ",".join(data.get("import_runs") or []), summ.get("persons"), summ.get("families"),
+             bool(data.get("replayed")))
     return True
+
+
+def outcome_counts(state: Optional[CommunityState]) -> Optional[dict]:
+    """Distinct people and households by what the commit did to them: known
+    (an id that existed before) or new (minted now). Family Graph's summary
+    counts a decided review item as "review" even when it minted an id, so
+    the results table is built from this instead."""
+    if state is None or state.status != "committed" or not state.result:
+        return None
+    people = {"known": set(), "new": set(), "skipped": 0}
+    households = {"known": set(), "new": set()}
+    for sheet in state.result.get("sheets") or []:
+        for row in sheet.get("rows") or []:
+            if row.get("skipped"):
+                continue
+            for p in row.get("persons") or []:
+                if p.get("action") == "skip" or not p.get("community_id"):
+                    people["skipped"] += 1
+                else:
+                    people["new" if p.get("code_state") == "new" else "known"].add(p["community_id"])
+            fam = row.get("family") or {}
+            if fam.get("community_id"):
+                households["new" if fam.get("code_state") == "new" else "known"].add(fam["community_id"])
+    # An id minted earlier in this same commit and then matched is new.
+    people["known"] -= people["new"]
+    households["known"] -= households["new"]
+    return {
+        "people": {"known": len(people["known"]), "new": len(people["new"]), "skipped": people["skipped"]},
+        "households": {"known": len(households["known"]), "new": len(households["new"])},
+    }
 
 
 @dataclass
@@ -526,6 +769,8 @@ class Overrides:
     registry: dict = field(default_factory=dict)       # id -> {kind, display, family?}
     identity_cells: list = field(default_factory=list)
     identity_columns: list = field(default_factory=list)
+    skipped: set = field(default_factory=set)          # cells the scrub could not rewrite
+    left_alone: int = 0                                # shared name cells with a kept person
 
 
 def overrides_for(sess) -> Overrides:
@@ -547,9 +792,17 @@ def overrides_for(sess) -> Overrides:
             fam = row.get("family") or {}
             fid = fam.get("community_id")
             by_cell: dict = {}
+            # Name cells holding someone who gets no id (kept as original
+            # text, or not a person). A couple or list cell like that is
+            # never rewritten to the others' tokens alone - that would delete
+            # the kept name. It keeps the normal per-value treatment.
+            left_alone: set = set()
             for p in row.get("persons") or []:
                 pid = p.get("community_id")
                 if p.get("action") == "skip" or not pid:
+                    c = _name_cell(p.get("name_cells") or [])
+                    if c is not None:
+                        left_alone.add(c["col"])
                     continue
                 # One person can fill several cells: many rows (a parent per
                 # child) or two slots of one row (Parent 1 and Parent 2 the
@@ -569,18 +822,30 @@ def overrides_for(sess) -> Overrides:
                     continue
                 by_cell.setdefault(cell["col"], []).append((p.get("slot", 0), f"[{pid}]", cell["part"]))
             for col, items in by_cell.items():
+                if col in left_alone:
+                    ov.left_alone += 1
+                    continue
                 items.sort()
                 sep = ", " if items[0][2] == "list" else " & "
                 written = sep.join(tok for _, tok, _ in dict.fromkeys(items))
                 _override(ov, ti, rn, col, _cell(table, rn, col), written)
             if fid:
-                ov.registry[fid] = {"kind": "family", "display": fam.get("display_name") or ""}
+                # The first real label names the household; a later row with
+                # none never blanks it (Family Graph sends null when a row has
+                # no household cell and no surname).
+                rec = ov.registry.setdefault(fid, {"kind": "family", "display": ""})
+                if not rec["display"]:
+                    rec["display"] = (fam.get("display_name") or "").strip()
                 token = f"[{fid}]"
-                if fam.get("cell"):
-                    col = fam["cell"]["col"]
-                    if (ti, rn, col) not in ov.cells:
-                        _override(ov, ti, rn, col, _cell(table, rn, col), token)
+                col = (fam.get("cell") or {}).get("col")
+                if col is not None and (ti, rn, col) in ov.cells:
+                    pass
+                elif col is not None and _cell(table, rn, col).strip():
+                    _override(ov, ti, rn, col, _cell(table, rn, col), token)
                 else:
+                    # No household column, or this row's cell is empty (often
+                    # the covered part of a merged "Smith Family" cell, which
+                    # can't be written). The id goes in the appended column.
                     appended[rn] = token
                     ov.tokens.add(token)
         if appended:
@@ -588,9 +853,28 @@ def overrides_for(sess) -> Overrides:
                     "header": APPENDED_HEADER, "values": appended}
             ov.append_columns.append(spec)
             ov.identity_columns.append({k: spec[k] for k in ("sheet", "col", "header_row", "header")})
+    if ov.left_alone:
+        log.info("session %s community name cells left as normal text (a kept person shares them): %d",
+                 sess.id, ov.left_alone)
+    _label_nameless_households(ov)
     for t in list(ov.tokens):
         ov.tokens.add(t.strip("[]"))           # bare form too
     return ov
+
+
+def _label_nameless_households(ov: Overrides) -> None:
+    """A household with no label would restore to "" in an AI answer - its
+    reference silently deleted. Name it after its members instead
+    ("Ann & Ben household"); with no members known, leave it empty and the
+    restorer reports it as unresolved."""
+    for fid, rec in ov.registry.items():
+        if rec.get("kind") != "family" or rec.get("display"):
+            continue
+        members = [r["display"] for r in ov.registry.values()
+                   if r.get("kind") == "person" and r.get("family") == fid and r.get("display")]
+        members = list(dict.fromkeys(members))
+        if members:
+            rec["display"] = " & ".join(members) + " household"
 
 
 def _name_cell(cells: list) -> Optional[dict]:
@@ -616,7 +900,9 @@ def key_fields(sess, ov: Overrides) -> dict:
     base = (familygraph.settings().get("base_url") or "")
     return {
         "identity_registry": ov.registry,
-        "identity_cells": ov.identity_cells,
+        # Only rewrites that happened: restore trusts these coordinates.
+        "identity_cells": [c for c in ov.identity_cells
+                           if (c["sheet"], c["row"], c["col"]) not in ov.skipped],
         "identity_columns": ov.identity_columns,
         "community_source": {
             "familygraph_host": urlparse(base).hostname or "",
@@ -625,6 +911,35 @@ def key_fields(sess, ov: Overrides) -> dict:
             "committed_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         },
     }
+
+
+def note_scrub(sess, ov: Overrides, skipped) -> None:
+    """After the scrub: cells it could not rewrite (a formula, a merged cell)
+    kept their normal per-value treatment and carry no community id. Say so
+    in the steps, and keep them out of the key. They stay in
+    ov.identity_cells so the residue check still looks for their originals."""
+    keys = {tuple(k) for k in skipped or []} & set(ov.cells)
+    if not keys:
+        return
+    ov.skipped |= keys
+    log.warning("session %s community cells not rewritten (formula, merged or changed): %d", sess.id, len(keys))
+    sess.scrub_steps.append({
+        "step": (f"community ids: {len(keys)} roster cell(s) could not take an id (a formula or merged "
+                 "cell) - scrubbed as normal text, no [I...] there"),
+        "status": "err",
+    })
+
+
+def after_commit_note(sess) -> str:
+    """Appended to a scrub failure once Family Graph has committed, so the
+    operator knows the ids are safe and a rerun is the fix."""
+    state = getattr(sess, "community", None)
+    if state is None or state.status != "committed":
+        return ""
+    log.error("session %s scrub failed after the community commit (import runs kept): %d",
+              sess.id, len((state.result or {}).get("import_runs") or []))
+    return (" - Family Graph already saved this roster's ids, so nothing is lost there. Upload the "
+            "file again: everyone it saved comes back as known, with the same ids.")
 
 
 def summary_for_results(state: Optional[CommunityState]) -> Optional[dict]:

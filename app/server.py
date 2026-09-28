@@ -48,6 +48,7 @@ import json
 import threading
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
@@ -90,6 +91,27 @@ def create_app() -> Flask:
     endpoints_mod.ensure_initialized()
     pipeline.purge_stale_uploads()
     _log_startup()
+
+    # -----------------------------------------------------------------------
+    # Same-origin guard. Any web page the operator visits can send a POST to
+    # 127.0.0.1 (a text/plain "simple" request needs no CORS preflight), and
+    # a rebinding host name can make a page's own origin point here. So: the
+    # Host must be this machine, and a state-changing request that carries
+    # browser origin headers must come from this app's own page. A request
+    # with none of them is not from a browser page (curl, tests).
+    # -----------------------------------------------------------------------
+    @app.before_request
+    def same_origin_only():
+        if _host_name(request.host) not in _LOCAL_HOSTS:
+            log.warning("request refused: foreign Host header on %s %s", request.method, request.path)
+            return jsonify({"error": "this app only answers on 127.0.0.1 / localhost"}), 403
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return None
+        why = _cross_site_reason(request)
+        if why:
+            log.warning("request refused: cross-site %s %s (%s)", request.method, request.path, why)
+            return jsonify({"error": "cross-site request refused"}), 403
+        return None
 
     # -----------------------------------------------------------------------
     # UI
@@ -324,6 +346,9 @@ def create_app() -> Flask:
             return jsonify({"error": "Family Graph is still working on this file - wait for it to finish",
                             "community": _cview(sess)}), 409
         try:
+            if pipeline.get_session(sid) is not sess:
+                return jsonify({"error": "this file was cancelled"}), 410
+            pipeline.touch(sess)
             return _confirm_locked(sess)
         finally:
             sess.lock.release()
@@ -343,14 +368,26 @@ def create_app() -> Flask:
         # too slow the operator must retry or choose to continue without
         # community ids, and nothing is scrubbed until one of those happens.
         state = sess.community
-        if state is not None and state.status in ("ready", "error"):
-            if "PERSON" in types:
+        if state is not None and state.status == "commit_unknown":
+            # A commit may already be written. Only the same request may go
+            # out again, so nothing that would change it is accepted.
+            if "PERSON" in types or community_mod.kept_for(sess, state, deselected) != state.kept:
+                return jsonify({"error": "A commit for this file may already be in Family Graph, so its choices "
+                                         "are locked. Confirm with the same names kept as before, or cancel the file.",
+                                "community": _cview(sess, own_lock=True)}), 409
+        if state is not None and state.status in ("ready", "error", "commit_unknown"):
+            if "PERSON" in types and state.status != "commit_unknown":
                 state.status, state.reason = "skipped", "names kept as original text"
                 log.info("session %s community ids skipped: PERSON kept as original", sid)
             elif state.status == "error":
                 return jsonify({"error": f"Family Graph unavailable: {state.error}. Retry, or continue without community ids.",
                                 "community": _cview(sess, own_lock=True)}), 409
             else:
+                if state.status == "ready":
+                    # Names kept as original text get no community id.
+                    state.kept = community_mod.kept_for(sess, state, deselected)
+                    if state.kept:
+                        log.info("session %s community ids skipped for kept names: %d", sid, len(state.kept))
                 open_items = community_mod.pending(state)
                 if open_items:
                     return jsonify({"error": f"{len(open_items)} person/household decision(s) still needed",
@@ -358,7 +395,8 @@ def create_app() -> Flask:
                 try:
                     ok = community_mod.commit_for_session(sess)
                 except familygraph.FamilyGraphError as exc:
-                    # commit_for_session logged it; state is unchanged ("ready").
+                    # commit_for_session logged it. State is "ready" after a
+                    # clean refusal, "commit_unknown" when it may be written.
                     msg = state.commit_error or str(exc)
                     if not msg.startswith("Family Graph"):
                         msg = f"Family Graph: {msg}"
@@ -397,7 +435,7 @@ def create_app() -> Flask:
                 "entities": sess.registry.total_entities() if sess.registry else 0,
                 "replacements": sess.registry.total_replacements() if sess.registry else 0,
             },
-            "community": community_mod.summary_for_results(sess.community),
+            "community": _community_results(sess),
             "error": sess.error,
         })
 
@@ -430,6 +468,10 @@ def create_app() -> Flask:
         if err:
             return err
         state = sess.community
+        pipeline.touch(sess)
+        if state is not None and state.status == "commit_unknown":
+            return jsonify({"error": "a commit for this file may already be in Family Graph - its choices are "
+                                     "locked. Confirm again or cancel the file.", "community": _cview(sess)}), 409
         if state is None or state.status != "ready":
             return jsonify({"error": "no community review for this file"}), 409
         payload = request.get_json(silent=True) or {}
@@ -448,6 +490,10 @@ def create_app() -> Flask:
         if err:
             return err
         state = sess.community
+        pipeline.touch(sess)
+        if state is not None and state.status == "commit_unknown":
+            return jsonify({"error": "a commit for this file may already be in Family Graph - confirm again "
+                                     "or cancel the file", "community": _cview(sess)}), 409
         if state is None or state.status not in ("ready", "error", "skipped"):
             return jsonify({"error": "no community ids for this file"}), 409
         skip = bool((request.get_json(silent=True) or {}).get("skip", True))
@@ -465,6 +511,10 @@ def create_app() -> Flask:
         sess, err = _community_session(sid)
         if err:
             return err
+        pipeline.touch(sess)
+        if sess.community is not None and sess.community.status == "commit_unknown":
+            return jsonify({"error": "a commit for this file may already be in Family Graph - confirm again "
+                                     "or cancel the file", "community": _cview(sess)}), 409
         if not sess.lock.acquire(blocking=False):
             return jsonify({"error": "Family Graph is still working on this file - wait for it to finish",
                             "community": _cview(sess)}), 409
@@ -485,7 +535,13 @@ def create_app() -> Flask:
 
     @app.post("/api/familygraph")
     def fg_save():
-        payload = request.get_json(force=True, silent=True) or {}
+        # JSON only: a form or text/plain body is what a cross-site page can
+        # send without a preflight.
+        if not request.is_json:
+            return jsonify({"error": "send settings as application/json"}), 415
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "settings must be a JSON object"}), 400
         try:
             saved = familygraph.save(payload)
         except ValueError as exc:
@@ -706,6 +762,57 @@ def create_app() -> Flask:
         return jsonify({"lines": [ln.rstrip("\n") for ln in tail]})
 
     return app
+
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_name(netloc: str) -> str:
+    """The host name of a Host header or an origin's netloc, lower case."""
+    try:
+        return (urlparse("//" + (netloc or "")).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _cross_site_reason(req) -> str:
+    """Why a state-changing request looks cross-site, or "" when it doesn't.
+    Origin (or Referer) must name exactly this app's scheme-less host:port;
+    Sec-Fetch-Site must be same-origin (or none: typed by the user)."""
+    own = (req.host or "").lower()
+    origin = req.headers.get("Origin")
+    if origin is not None:
+        if origin.strip().lower() == "null":
+            return "opaque origin"
+        try:
+            o = urlparse(origin.strip())
+        except ValueError:
+            return "bad origin"
+        if o.scheme not in ("http", "https") or o.netloc.lower() != own:
+            return "origin mismatch"
+    else:
+        referer = req.headers.get("Referer")
+        if referer:
+            try:
+                r = urlparse(referer)
+            except ValueError:
+                return "bad referer"
+            if r.netloc.lower() != own:
+                return "referer mismatch"
+    site = req.headers.get("Sec-Fetch-Site")
+    if site and site.lower() not in ("same-origin", "none"):
+        return f"sec-fetch-site {site.lower()}"
+    return ""
+
+
+def _community_results(sess) -> Optional[dict]:
+    """The results-table summary, with people and households counted by
+    what the commit did to them (not by Family Graph's verdict)."""
+    out = community_mod.summary_for_results(sess.community)
+    counts = community_mod.outcome_counts(sess.community)
+    if out is not None and counts:
+        out.update(counts)
+    return out
 
 
 def _busy(sess, own_lock: bool = False) -> str:

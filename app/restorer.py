@@ -32,6 +32,9 @@ unlike the per-value ids they restore to the person's name (or the
 household's label), not to one exact spelling. Tolerated forms:
     [I3A4F9C2B1D0E7F21]  [i3a4f9c2b1d0e7f21]  \\[I3A4F9C2B1D0E7F21\\]
     I3A4F9C2B1D0E7F21    STUDENT_I3A4F9C2B1D0E7F21    3A4F9C2B1D0E7F21
+    FAMILY_9B0C11D2E3F4A5B6    [PERSON_3A4F9C2B1D0E7F21]   (letter dropped, any label)
+A household saved with no label is reported unresolved, never restored to
+an empty string.
 The same id in two keys (the same person on two rosters) is not a conflict;
 if the keys spell the name differently the newest key's spelling is used and
 the report counts it. Restoring the anonymized file itself puts each cell's
@@ -87,6 +90,7 @@ _VALUE_ALTS = (
 _TOKEN_RE = re.compile(_COMMUNITY_ALTS + "|" + _VALUE_ALTS)     # keys with community ids
 _VALUE_TOKEN_RE = re.compile(_VALUE_ALTS)                       # every other key
 _ANY_ID_RE = re.compile(rf"(?=([0-9A-Fa-f]{{{HEX_LEN}}}))")
+_ANY_COMMUNITY_HEX_RE = re.compile(r"(?=([0-9A-Fa-f]{16}))")
 _SHEET_ID_RE = re.compile(r"SHEET_([0-9A-F]{12})")
 _COMMUNITY_ID_RE = re.compile(r"([IF])([0-9A-F]{16}|[0-9A-F]{8})")
 
@@ -132,12 +136,15 @@ def build_index(keys: Iterable[tuple[str, dict]]) -> KeyIndex:
                 m = _COMMUNITY_ID_RE.fullmatch(cid) if isinstance(cid, str) else None
                 if not m or not isinstance(rec, dict):
                     continue
-                hx, display = m.group(2).upper(), str(rec.get("display") or "")
+                hx, display = m.group(2).upper(), str(rec.get("display") or "").strip()
                 prev = idx.community.get(hx)
                 if prev is not None and prev[1] != display:
-                    idx.community_variants += 1
-                    if created < community_when.get(hx, ""):
-                        continue            # an older spelling never wins
+                    if not display:
+                        continue            # no label never replaces a real one
+                    if prev[1]:
+                        idx.community_variants += 1
+                        if created < community_when.get(hx, ""):
+                            continue        # an older spelling never wins
                 idx.community[hx] = (m.group(1).upper(), display)
                 community_when[hx] = created
         sid = payload.get("session_id")
@@ -261,6 +268,10 @@ class TokenRestorer:
         hx = (m.group("bh") if bracketed else m.group("nh")).upper()
         tag_known = tag in VALID_TAGS
 
+        if self.index.community and len(hx) in (16, 8) and hx in self.index.community:
+            # A community id relabeled with its I/F dropped: FAMILY_9B0C...,
+            # [PERSON_3A4F...]. The hex alone names one human or household.
+            return self._community_hit(self.index.community[hx], relabeled=True)
         if len(hx) == HEX_LEN:
             hit = self.index.by_hex.get(hx)
             if hit is not None:
@@ -272,23 +283,32 @@ class TokenRestorer:
                 return original, tag, {}
             return None, "", {"report": bracketed and tag_known}
         # Wrong length: a truncated or padded ID. Report it if it clearly
-        # was meant to be one of ours.
-        report = tag_known and (bracketed or len(hx) >= 8)
+        # was meant to be one of ours - with community ids in the key, any
+        # tagged 16-hex is (whatever label the AI chose).
+        report = (tag_known and (bracketed or len(hx) >= 8)) or (bool(self.index.community) and len(hx) == 16)
         return None, "", {"report": report}
+
+    @staticmethod
+    def _community_hit(hit: tuple[str, str], **flags) -> tuple[Optional[str], str, dict]:
+        # A household saved with no label must not restore to "" - that would
+        # delete the reference from the AI answer and count it as restored.
+        if not hit[1]:
+            return None, "", {"report": True}
+        return hit[1], _COMMUNITY_TAG[hit[0]], flags
 
     def _resolve_community(self, m: re.Match) -> tuple[Optional[str], str, dict]:
         if m.group("cx") is not None:
             hit = self.index.community.get(m.group("cx").upper())
             if hit is None:
                 return None, "", {"ignore": True}     # some other 16-hex string
-            return hit[1], _COMMUNITY_TAG[hit[0]], {"untagged": True}
+            return self._community_hit(hit, untagged=True)
         bracketed = m.group("cb") is not None
         letter = (m.group("cbl") if bracketed else m.group("cnl")).upper()
         hx = (m.group("cbh") if bracketed else m.group("cnh")).upper()
         hit = self.index.community.get(hx)
         if hit is None:
             return None, "", {"report": True}
-        return hit[1], _COMMUNITY_TAG[hit[0]], {"relabeled": hit[0] != letter}
+        return self._community_hit(hit, relabeled=hit[0] != letter)
 
     def find(self, text: str) -> list[Span]:
         return self._scan(text, None)
@@ -337,6 +357,13 @@ class TokenRestorer:
                     continue
                 covered[p0:p0 + HEX_LEN] = b"\x01" * HEX_LEN
                 note_unresolved(m.group(1))
+            if self.index.community:
+                for m in _ANY_COMMUNITY_HEX_RE.finditer(text):
+                    p0 = m.start()
+                    if covered[p0] or m.group(1).upper() not in self.index.community:
+                        continue
+                    covered[p0:p0 + 16] = b"\x01" * 16
+                    note_unresolved(m.group(1))
         return spans
 
     def for_raw_xml(self) -> "TokenRestorer":

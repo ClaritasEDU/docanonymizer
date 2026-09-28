@@ -12,7 +12,8 @@ that the keys could resolve but that is still present is counted as
 
 Output filename: `{input_name}_restored.{ext}` (an `_anon_<session>` suffix
 from our own anonymized files is dropped, so `donors_anon_ab12cd34.xlsx`
-restores to `donors_restored.xlsx`).
+restores to `donors_restored.xlsx`). The filename is cosmetic: the exact
+roster layout is chosen from the file's cells, never its name.
 """
 
 from __future__ import annotations
@@ -31,7 +32,9 @@ from .scrubber import scrub_csv, scrub_docx, scrub_text, scrub_xlsx
 
 log = get_logger("unanon")
 
-_ANON_SUFFIX_RE = re.compile(r"_anon_[0-9a-f]{8}$")
+# Our own suffix, plus the copy suffix a browser adds to a second download
+# ("x_anon_ab12cd34 (1).csv" arrives as "x_anon_ab12cd34_1.csv").
+_ANON_SUFFIX_RE = re.compile(r"_anon_([0-9a-f]{8})(?:_\d+)?$")
 
 
 @dataclass
@@ -53,26 +56,58 @@ def _unique_path(base: Path) -> Path:
         i += 1
 
 
-def _exact_layout(index: KeyIndex, name: str):
+def _tables(extracted) -> list:
+    tables = extracted.payload.get("tables")
+    if tables is None and extracted.payload.get("rows") is not None:
+        tables = [extracted.payload["rows"]]
+    return tables or []
+
+
+def _cell_text(tables: list, key: tuple) -> str:
+    t, r, c = key
+    if t >= len(tables) or r >= len(tables[t]) or c >= len(tables[t][r]):
+        return ""
+    v = tables[t][r][c]
+    return "" if v is None else str(v)
+
+
+def _exact_layout(index: KeyIndex, name: str, tables: list):
     """Cell overrides that put roster cells back exactly, for our own
-    anonymized output (`<name>_anon_<session>.xlsx`). A community id restores
-    to a person's name; the cell may have held "Smith, John & Mary" - this
-    puts back exactly that. Only cells that still hold exactly what was
-    written are touched; anything the AI or a person changed falls back to
-    the token restore."""
+    anonymized output. A community id restores to a person's name; the cell
+    may have held "Smith, John & Mary" - this puts back exactly that. Only
+    cells that still hold exactly what was written are touched; anything the
+    AI or a person changed falls back to the token restore.
+
+    The layout is picked by the file's own cells, not its name: a renamed
+    download ("roster_anon_ab12cd34 (1).csv", "final.csv") restores exactly
+    too. The key whose written tokens sit at the most of their recorded
+    coordinates wins; the filename only breaks a tie. Two keys that fit
+    equally but disagree on an original are never guessed between."""
+    scored = []
+    for sid, layout in index.identity_layout.items():
+        overrides = {}
+        for c in layout["cells"]:
+            try:
+                overrides[(int(c["sheet"]), int(c["row"]), int(c["col"]))] = (str(c["written"]), str(c["original"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        hits = {k: v for k, v in overrides.items() if _cell_text(tables, k) == v[0]}
+        if hits:
+            scored.append((len(hits), sid, overrides, hits, list(layout["columns"])))
+    if not scored:
+        return None, None
+    best = max(s[0] for s in scored)
+    top = [s for s in scored if s[0] == best]
     m = _ANON_SUFFIX_RE.search(Path(name).stem)
-    if not m:
-        return None, None
-    layout = index.identity_layout.get(m.group(0).rsplit("_", 1)[-1])
-    if not layout:
-        return None, None
-    overrides = {}
-    for c in layout["cells"]:
-        try:
-            overrides[(int(c["sheet"]), int(c["row"]), int(c["col"]))] = (str(c["written"]), str(c["original"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return overrides, list(layout["columns"])
+    named = next((s for s in top if m and s[1] == m.group(1)), None)
+    if named is None and len(top) > 1:
+        first = top[0]
+        if any(s[3] != first[3] or s[4] != first[4] for s in top[1:]):
+            log.warning("unanonymize: %d keys fit this file's roster cells equally and disagree; "
+                        "roster cells restored by name instead", len(top))
+            return None, None
+    pick = named or top[0]
+    return pick[2], pick[4]
 
 
 def restore_file(input_path: Path, index: KeyIndex, display_name: str = "") -> RestoreResult:
@@ -86,7 +121,7 @@ def restore_file(input_path: Path, index: KeyIndex, display_name: str = "") -> R
 
     stem = _ANON_SUFFIX_RE.sub("", Path(display_name or input_path.name).stem) or "document"
     out_path = _unique_path(OUTPUT_DIR / f"{stem}_restored{out_ext}")
-    overrides, columns = _exact_layout(index, display_name or input_path.name)
+    overrides, columns = _exact_layout(index, display_name or input_path.name, _tables(extracted))
     if overrides:
         log.info("unanonymize: exact roster layout for %d cell(s), %d appended column(s)",
                  len(overrides), len(columns or []))

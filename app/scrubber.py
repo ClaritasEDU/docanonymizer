@@ -66,6 +66,9 @@ class ScrubResult:
     # XLSX: anonymized sheet title -> original title, stored in the key file
     # so restore puts the exact title back (titles are length-limited).
     sheet_titles: dict[str, str] = field(default_factory=dict)
+    # Community cell overrides the scrub could not apply (a formula, a merged
+    # cell, changed content). The key must not claim those rewrites happened.
+    overrides_skipped: list[tuple] = field(default_factory=list)
 
 
 def apply_replacements_text(text: str, replacement_map: MapOrReplacer) -> str:
@@ -217,14 +220,15 @@ def scrub_text(extract: ExtractResult, replacement_map: MapOrReplacer, out_path:
     )
 
 
-def _override_for(cell_overrides: Optional[dict], key: tuple, current: str):
+def _override_for(cell_overrides: Optional[dict], key: tuple, current: str,
+                  skipped: Optional[list] = None):
     """The replacement for this cell, or None.
 
     `cell_overrides` maps (sheet, row, col) -> (expected, new): the cell is
     rewritten to `new` only if it still holds exactly `expected` (None = any
     value). Anonymize uses it to put community identifiers into name cells;
     restore uses it to put the exact original text back - and only where the
-    token is still there untouched."""
+    token is still there untouched. A skip is appended to `skipped`."""
     if not cell_overrides:
         return None
     hit = cell_overrides.get(key)
@@ -233,6 +237,8 @@ def _override_for(cell_overrides: Optional[dict], key: tuple, current: str):
     expected, new = hit
     if expected is not None and current != expected:
         log.warning("cell override skipped at sheet=%d row=%d col=%d: content changed", *key)
+        if skipped is not None:
+            skipped.append(key)
         return None
     return new
 
@@ -251,11 +257,12 @@ def scrub_csv(extract: ExtractResult, replacement_map: MapOrReplacer, out_path: 
             removable.append(spec)
         else:
             log.warning("appended %s column not removed: it was edited", spec.get("header"))
+    skipped: list[tuple] = []
     new_rows: list[list[str]] = []
     for r, row in enumerate(rows):
         out = []
         for c, cell in enumerate(row):
-            forced = _override_for(cell_overrides, (0, r, c), cell)
+            forced = _override_for(cell_overrides, (0, r, c), cell, skipped)
             out.append(forced if forced is not None else apply(cell, replacer))
         new_rows.append(out)
     for spec in append_columns or []:
@@ -265,6 +272,11 @@ def scrub_csv(extract: ExtractResult, replacement_map: MapOrReplacer, out_path: 
                 value = spec["header"]
             else:
                 value = spec["values"].get(r, "")
+            # Only rows that get a value are padded out to the column. A blank
+            # line or a short "Total,3" row stays as it was, so the restore
+            # (which only deletes the column) is byte-exact.
+            if not value and len(row) <= col:
+                continue
             if len(row) < col:
                 row.extend([""] * (col - len(row)))
             row.insert(col, value)
@@ -279,6 +291,7 @@ def scrub_csv(extract: ExtractResult, replacement_map: MapOrReplacer, out_path: 
         output_path=out_path,
         layers_cleaned=["cells"],
         bytes_written=out_path.stat().st_size,
+        overrides_skipped=skipped,
     )
 
 
@@ -375,6 +388,7 @@ def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
     0-based (sheet index, row, column) as extracted.
     """
     from openpyxl import load_workbook
+    from openpyxl.cell.cell import MergedCell
 
     replacer = as_replacer(replacement_map)
 
@@ -394,14 +408,22 @@ def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
             log.warning("appended %s column not removed: it was edited or moved", spec.get("header"))
 
     formula_warnings: list[str] = []
+    skipped: list[tuple] = []
     for si, ws in enumerate(wb.worksheets):
         for row in ws.iter_rows():
             for cell in row:
                 v = cell.value
                 if cell_overrides:
+                    key = (si, cell.row - 1, cell.column - 1)
                     current = "" if v is None else str(v)
-                    forced = _override_for(cell_overrides, (si, cell.row - 1, cell.column - 1), current)
+                    forced = _override_for(cell_overrides, key, current, skipped)
                     if forced is not None:
+                        if isinstance(cell, MergedCell):
+                            # The covered part of a merged range is read-only.
+                            # A crash here came after Family Graph committed.
+                            log.warning("cell override skipped at sheet=%d row=%d col=%d: merged cell", *key)
+                            skipped.append(key)
+                            continue
                         cell.value = forced
                         continue
                 if v is None:
@@ -436,9 +458,13 @@ def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
     # names, and pivot sources are rewritten to match.
     for spec in append_columns or []:
         ws = wb.worksheets[spec["sheet"]]
-        ws.cell(row=spec["header_row"] + 1, column=spec["col"] + 1).value = spec["header"]
-        for r, token in spec["values"].items():
-            ws.cell(row=int(r) + 1, column=spec["col"] + 1).value = token
+        for r, value in [(spec["header_row"], spec["header"])] + list(spec["values"].items()):
+            target = ws.cell(row=int(r) + 1, column=spec["col"] + 1)
+            if isinstance(target, MergedCell):
+                log.warning("appended %s cell skipped at sheet=%d row=%d: merged cell",
+                            spec.get("header"), spec["sheet"], int(r))
+                continue
+            target.value = value
     for spec in removable:
         wb.worksheets[spec["sheet"]].delete_cols(spec["col"] + 1)
 
@@ -481,6 +507,7 @@ def scrub_xlsx(working_path: Path, replacement_map: MapOrReplacer, out_path: Pat
         formula_warnings=formula_warnings,
         bytes_written=out_path.stat().st_size,
         sheet_titles={new: old for old, new in renames.items()} if deep_clean else {},
+        overrides_skipped=skipped,
     )
 
 

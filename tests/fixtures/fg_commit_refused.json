@@ -1,6 +1,6 @@
 {
   "error": "review_incomplete",
-  "detail": "x",
+  "detail": "1 item(s) still need a decision; nothing was written",
   "plan": {
     "mode": "commit",
     "committed": false,
@@ -17,11 +17,18 @@
         "matched": 1,
         "new": 2,
         "review": 0
-      }
+      },
+      "crosswalk": {
+        "created": 0,
+        "unchanged": 0,
+        "relinked": 0
+      },
+      "told_apart": 0
     },
     "pending": [
       "0:2:0"
     ],
+    "stale_decisions": [],
     "sheets": [
       {
         "index": 0,
@@ -159,7 +166,9 @@
                   },
                   "confidence": 0.95,
                   "reasons": [
-                    "exact_email_match"
+                    "exact_email_match",
+                    "exact_last_name",
+                    "exact_first_name"
                   ],
                   "grade": null,
                   "via": "score"
@@ -195,6 +204,7 @@
               "display_name": "Smith Family",
               "cell": null,
               "action": "matched",
+              "via": "members",
               "code_state": "new",
               "community_id": null,
               "same_as": "0:0:family"
@@ -222,7 +232,7 @@
                 ],
                 "candidates": [
                   {
-                    "community_id": "I7B840410815389A7",
+                    "community_id": "I3D64A614E078EA15",
                     "sheet_ref": null,
                     "status": "active",
                     "given_name": "Maria",

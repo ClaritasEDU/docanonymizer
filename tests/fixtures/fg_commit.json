@@ -14,9 +14,16 @@
       "matched": 1,
       "new": 2,
       "review": 0
-    }
+    },
+    "crosswalk": {
+      "created": 0,
+      "unchanged": 0,
+      "relinked": 0
+    },
+    "told_apart": 0
   },
   "pending": [],
+  "stale_decisions": [],
   "sheets": [
     {
       "index": 0,
@@ -84,7 +91,7 @@
               ],
               "action": "new",
               "code_state": "new",
-              "community_id": "I153422DFDD5CA946"
+              "community_id": "IE188FEF1CC595D4B"
             },
             {
               "key": "0:0:1",
@@ -105,7 +112,7 @@
               ],
               "action": "new",
               "code_state": "new",
-              "community_id": "I4AD4825DB3958878"
+              "community_id": "I7B5C82EB1A6BC04C"
             }
           ],
           "family": {
@@ -114,7 +121,7 @@
             "cell": null,
             "action": "new",
             "code_state": "new",
-            "community_id": "F3D6B57AFBDADAEBD"
+            "community_id": "F14D3E829315E33DD"
           }
         },
         {
@@ -139,7 +146,7 @@
               ],
               "action": "matched",
               "matched": {
-                "community_id": "I153422DFDD5CA946",
+                "community_id": "IE188FEF1CC595D4B",
                 "sheet_ref": "0:0:0",
                 "status": "active",
                 "given_name": "Jane",
@@ -148,19 +155,21 @@
                 "date_of_birth": null,
                 "role": "adult",
                 "family": {
-                  "community_id": "F3D6B57AFBDADAEBD",
+                  "community_id": "F14D3E829315E33DD",
                   "sheet_ref": "0:0:family",
                   "display_name": "Smith Family"
                 },
                 "confidence": 0.95,
                 "reasons": [
-                  "exact_email_match"
+                  "exact_email_match",
+                  "exact_last_name",
+                  "exact_first_name"
                 ],
                 "grade": null,
                 "via": "score"
               },
               "code_state": "new",
-              "community_id": "I153422DFDD5CA946",
+              "community_id": "IE188FEF1CC595D4B",
               "same_as": "0:0:0"
             },
             {
@@ -182,7 +191,7 @@
               ],
               "action": "new",
               "code_state": "new",
-              "community_id": "IE73AAC749C2913BA"
+              "community_id": "I96392E9F14A8B9F4"
             }
           ],
           "family": {
@@ -190,8 +199,9 @@
             "display_name": "Smith Family",
             "cell": null,
             "action": "matched",
+            "via": "members",
             "code_state": "new",
-            "community_id": "F3D6B57AFBDADAEBD",
+            "community_id": "F14D3E829315E33DD",
             "same_as": "0:0:family"
           }
         },
@@ -217,7 +227,7 @@
               ],
               "candidates": [
                 {
-                  "community_id": "I7B840410815389A7",
+                  "community_id": "I3D64A614E078EA15",
                   "sheet_ref": null,
                   "status": "active",
                   "given_name": "Maria",
@@ -240,7 +250,7 @@
               "decided": true,
               "action": "review",
               "code_state": "existing",
-              "community_id": "I7B840410815389A7"
+              "community_id": "I3D64A614E078EA15"
             },
             {
               "key": "0:2:1",
@@ -261,7 +271,7 @@
               ],
               "action": "new",
               "code_state": "new",
-              "community_id": "I77C8C5C16567B8B3"
+              "community_id": "I2178BCD5BB07474D"
             }
           ],
           "family": {
@@ -270,14 +280,14 @@
             "cell": null,
             "action": "new",
             "code_state": "new",
-            "community_id": "FB63F4C7E988BE81B"
+            "community_id": "F9DA93B882AC7C6D3"
           }
         }
       ],
-      "import_run": "imp_2e9441a33fed03a7"
+      "import_run": "imp_a9c4e0d073eaef3a"
     }
   ],
   "import_runs": [
-    "imp_2e9441a33fed03a7"
+    "imp_a9c4e0d073eaef3a"
   ]
 }

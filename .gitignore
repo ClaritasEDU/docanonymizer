@@ -17,6 +17,9 @@ anonymizer.log
 endpoints.json
 github.json
 familygraph.json
+# Atomic-write temp files of the settings above: they hold the same keys
+# and PATs if a save is interrupted.
+*.tmp
 
 # Editor / OS
 .DS_Store

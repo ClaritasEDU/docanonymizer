@@ -590,7 +590,9 @@ def test_a_commit_timeout_leaves_no_partial_state(fg, monkeypatch):
     body = r.get_json()
     assert "did not answer within 1 seconds" in body["error"] and "Nothing was scrubbed" in body["error"]
     view = body["community"]
-    assert view["status"] == "ready" and view["busy"] == "" and "did not answer" in view["commit_error"]
+    # Family Graph may have written it: the choices are locked until the same
+    # request is sent again (tests/test_community_flow_fixes.py).
+    assert view["status"] == "commit_unknown" and view["busy"] == "" and "did not answer" in view["commit_error"]
     assert view["decisions"] == {DECISION["key"]: {"action": "attach", "target": DECISION["target"]}}
     res = c.get(f"/api/anonymize/{sid}/results").get_json()
     assert res["scrub_steps"] == [] and not res["scrub_started"] and res["verify_result"] is None

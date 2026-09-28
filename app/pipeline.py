@@ -69,6 +69,9 @@ class Session:
     error: Optional[str] = None
     created_at: float = field(default_factory=time.monotonic)
     detected_at: Optional[float] = None   # when the preview became ready
+    # Last operator action on this file (a review decision, retry, skip,
+    # confirm). Idle time for expiry counts from the later of the two.
+    last_activity: Optional[float] = None
 
 
 def new_session(upload_path: Path, original_filename: str, allowed_tags: list[str],
@@ -101,23 +104,54 @@ def get_session(sid: str) -> Optional[Session]:
 ABANDONED_AFTER_S = 2 * 60 * 60
 
 
+def touch(sess: Session) -> None:
+    """The operator did something with this file - it is not abandoned."""
+    sess.last_activity = time.monotonic()
+
+
+def _idle(s: Session, now: float, max_idle_s: float, own_lock: bool = False) -> bool:
+    # Never while a Family Graph call or a confirm holds the file: a long
+    # review ends in a commit that may run for minutes, and discarding it
+    # then loses the output of ids Family Graph has just written.
+    if (s.lock.locked() and not own_lock) or s.fg_busy or s.scrub_started:
+        return False
+    last = s.detected_at if s.last_activity is None else max(s.detected_at, s.last_activity)
+    return now - last > max_idle_s
+
+
 def expire_abandoned(max_idle_s: float = ABANDONED_AFTER_S) -> int:
-    """Discard sessions waiting at the preview for longer than `max_idle_s`.
+    """Discard sessions left at the preview for longer than `max_idle_s`
+    since detection finished or the operator last acted on them.
 
     Only sessions whose detection finished and that were never confirmed -
-    a detection still running (slow LLM, huge file) is never touched.
+    a detection still running (slow LLM, huge file) is never touched, and
+    neither is a file with a Family Graph call or confirm in flight.
     """
-    now = time.monotonic()
+    def stale(s: Session, now: float, own_lock: bool = False) -> bool:
+        return (s.detected_at is not None and s.verify_result is None
+                and s.error is None and not s.scrub_steps and _idle(s, now, max_idle_s, own_lock))
+
     with _SESSIONS_LOCK:
-        stale = [s.id for s in _SESSIONS.values()
-                 if s.detected_at is not None and s.verify_result is None
-                 and s.error is None and not s.scrub_steps
-                 and now - s.detected_at > max_idle_s]
-    for sid in stale:
-        discard_session(sid)
-    if stale:
-        log.info("abandoned sessions discarded: %d", len(stale))
-    return len(stale)
+        candidates = [s for s in _SESSIONS.values() if stale(s, time.monotonic())]
+    discarded = 0
+    for sess in candidates:
+        # Take the file's own lock first, so a confirm that starts right now
+        # either wins (and the file is kept) or finds the file gone.
+        if not sess.lock.acquire(blocking=False):
+            continue
+        try:
+            with _SESSIONS_LOCK:
+                if _SESSIONS.get(sess.id) is not sess or not stale(sess, time.monotonic(), own_lock=True):
+                    continue
+                _SESSIONS.pop(sess.id)
+        finally:
+            sess.lock.release()
+        cleanup_session_files(sess, remove_output=True)
+        log.info("session discarded: id=%s", sess.id)
+        discarded += 1
+    if discarded:
+        log.info("abandoned sessions discarded: %d", discarded)
+    return discarded
 
 
 def purge_stale_uploads() -> int:
@@ -371,7 +405,7 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None,
         sess.output_path = out_path  # so cleanup can remove partials/staged
         cleanup_session_files(sess, remove_output=True)
         sess.output_path = None
-        sess.error = f"scrub failed: {exc}"
+        sess.error = f"scrub failed: {exc}" + community_mod.after_commit_note(sess)
         return sess
 
     sess.scrub_steps[-1]["status"] = "done"
@@ -379,6 +413,7 @@ def confirm_and_scrub(sess: Session, deselected: Optional[list[str]] = None,
         sess.scrub_steps.append({"step": f"deep scrub: {layer}", "status": "done"})
     sess.formula_warnings = result.formula_warnings
     sess.output_path = result.output_path
+    community_mod.note_scrub(sess, ov, result.overrides_skipped)
 
     sess.scrub_steps.append({"step": "verification scan running", "status": "active"})
     try:
